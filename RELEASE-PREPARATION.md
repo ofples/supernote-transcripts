@@ -1,0 +1,37 @@
+# Independent components — release preparation
+
+## Candidate versions
+
+| Component | Source | Candidate | Installation boundary |
+| --- | --- | --- | --- |
+| Supernote Transcripts | `ofples/supernote-transcripts` | 0.11.3 | Standalone plugin; no theme or reader requirement |
+| MD Reader fork | `ofples/obsidian-md-reader` | 2.1.2 | Optional pagination; replaces upstream under the same `md-reader` ID |
+| Paper | `ofples/obsidian-paper` | Independently versioned | Optional theme |
+| Sidebar | Paper repository, separate plugin | Independently versioned | Optional navigation; normal Markdown fallback without a reader |
+
+The user-facing package can group these components, while each remains separately selectable. Sidebar is a fourth technical component rather than theme JavaScript.
+
+## Agreed ownership
+
+- Reader implementation and reader-owned styles live in the canonical MD Reader fork.
+- Transcripts owns recognition, original notebook navigation and its versioned optional rendering API.
+- Paper owns theme appearance and Sidebar. Its distribution consumes a pinned, integrity-checked canonical reader snapshot, with explicit network updates and an offline build.
+- A package must not install/enable components automatically or distribute personal settings/reading positions. In particular, it must not overwrite `data.json` or change recognition/provider preferences.
+
+See [the integration contract and fallback matrix](INTEGRATION.md).
+
+## Verified source checks
+
+- Transcripts 0.11.3: 404 tests pass; TypeScript check and production build pass.
+- Canonical Reader 2.1.2 at `2c05d4b0a8d2ec2dcb3e7be6b553947302efdbe3`: 123 logic and 113 UI checks pass.
+- A headless Chromium check combines the actual Reader chapter renderer with the actual Transcripts adapter, without Paper or Sidebar. It checks inline chips, provider unload, disabled and unsupported adapters, and partial-render errors with ordinary Markdown fallback.
+
+Run the opt-in combined check with `node scripts/check-optional-reader-integration.mjs`. It uses the sibling reader checkout by default; pass `--reader /path/to/main.js` or set `MD_READER_PATH` to select another candidate. Playwright must be available locally or through `PLAYWRIGHT_MODULE_ROOT`; `CHROME_EXECUTABLE_PATH` can select an installed Chromium browser. These are test tools, not plugin runtime dependencies.
+
+## Release gates
+
+Source and fixture checks cover optional provider absence, disabled/legacy/incompatible adapters, errors and partial rendering, lifecycle refresh and Sidebar failure. They do not establish that a new build is installed or that every theme/device combination has passed visual verification.
+
+Keep public release tags, repository visibility changes and device deployment separate from this preparation. Paper/Sidebar's original-code license must be selected before public distribution; MD Reader's MIT, Transcripts' GPL-3.0-or-later and the fonts' SIL OFL notices remain separate.
+
+Previously installed versions are Transcripts 0.11.2 and MD Reader 2.1.1. The pending handwriting-edit/native Cloud upload and foreground desktop page-viewer checks from [workflow validation](VALIDATION.md) are still open; this source restructuring does not claim to complete them.

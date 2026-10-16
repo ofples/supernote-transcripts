@@ -1,5 +1,11 @@
 # Supernote Transcripts
 
+## 0.11.3 release candidate — optional companions
+
+Transcripts remains usable without Paper, Sidebar or a reader fork. The candidate publishes a versioned optional page-link adapter and safely refreshes compatible readers when it loads, unloads or page links change. Missing or failing reader hooks cannot interrupt normal Reading/Live Preview.
+
+See [component ownership and fallback behavior](INTEGRATION.md) and [release preparation](RELEASE-PREPARATION.md). This candidate has not replaced the installed 0.11.2 build or been tagged for release.
+
 ## Version 0.11.2 — desktop workflow and easier pairing
 
 Installed and active on desktop Vedas and Nomad. Source gates pass 398 tests, TypeScript checking and build. Live Satsang validation completed 12 changed-page Sol requests and one 39-page cleanup; the cleaned Markdown reached desktop through Obsidian Sync. Remaining physical handwriting, native Cloud upload and foreground desktop viewer checks are documented in [VALIDATION.md](VALIDATION.md).

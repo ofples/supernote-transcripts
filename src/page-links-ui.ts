@@ -17,6 +17,10 @@ export interface ReaderPageLinkSection {
 }
 
 export interface ReaderPageLinksApi {
+  /** Stable cross-plugin contract version. Additive fields do not require a version bump. */
+  apiVersion: 1;
+  /** Optional features exposed by this API version. */
+  capabilities: readonly ["renderSection"];
   enabled(): boolean;
   /** Render a reader chapter with validated chips. Returns false when it is not a managed transcript. */
   renderSection(section: ReaderPageLinkSection): Promise<boolean>;
@@ -300,14 +304,31 @@ export function installPageLinks(plugin: Plugin, onOpen: PageLinkOpen, enabled: 
   plugin.registerEditorExtension([pageLinkField, editorTracker]);
 
   const integration: ReaderPageLinksApi = {
+    apiVersion: 1,
+    capabilities: ["renderSection"],
     enabled,
     renderSection: section => renderReaderPageLinkSection(plugin, onOpen, enabled, section),
   };
   const pluginWithApi = plugin as PluginWithReaderPageLinks;
+  const notifyReader = () => {
+    const reader = (plugin.app as typeof plugin.app & { plugins?: { plugins?: Record<string, { refreshTranscriptLinks?: () => unknown }> } })
+      .plugins?.plugins?.["md-reader"];
+    if (typeof reader?.refreshTranscriptLinks !== "function") return;
+    try {
+      const result = reader.refreshTranscriptLinks();
+      if (result && typeof (result as { then?: unknown }).then === "function") {
+        void Promise.resolve(result).catch(() => { /* Optional reader notification failed. */ });
+      }
+    } catch { /* Optional reader notification failed. */ }
+  };
   pluginWithApi.pageLinks = integration;
   plugin.register(() => {
-    if (pluginWithApi.pageLinks === integration) delete pluginWithApi.pageLinks;
+    if (pluginWithApi.pageLinks === integration) {
+      delete pluginWithApi.pageLinks;
+      notifyReader();
+    }
   });
+  notifyReader();
 
   plugin.registerMarkdownPostProcessor(async (el, ctx) => {
     if (el.closest("[data-st-page-links-render]") || el.hasAttribute("data-st-page-links-render")) return;
@@ -390,9 +411,7 @@ export function installPageLinks(plugin: Plugin, onOpen: PageLinkOpen, enabled: 
       const leaves = plugin.app.workspace.getLeavesOfType("markdown") as unknown as Array<{ view: MarkdownView }>;
       for (const view of editorViews) view.dispatch({ effects: refreshPageLinks.of() });
       for (const leaf of leaves) leaf.view.previewMode.rerender(true);
-      const reader = (plugin.app as typeof plugin.app & { plugins?: { plugins?: Record<string, { refreshTranscriptLinks?: () => void }> } })
-        .plugins?.plugins?.["md-reader"];
-      reader?.refreshTranscriptLinks?.();
+      notifyReader();
     },
   };
 }

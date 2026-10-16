@@ -145,11 +145,108 @@ test("reader chips open the validated stable page and plugin unload removes the 
   assert.equal(localPlugin.pageLinks, undefined);
 });
 
+test("pageLinks publishes a versioned, capability-described contract", () => {
+  installPageLinks(plugin, async () => {}, () => enabled);
+  assert.equal(plugin.pageLinks.apiVersion, 1);
+  assert.deepEqual(plugin.pageLinks.capabilities, ["renderSection"]);
+  assert.equal(typeof plugin.pageLinks.enabled, "function");
+  assert.equal(typeof plugin.pageLinks.renderSection, "function");
+});
+
+test("page-link refresh works without a reader or with an upstream reader lacking the optional hook", () => {
+  const originalPlugins = plugin.app.plugins;
+  plugin.app.plugins = undefined;
+  assert.doesNotThrow(() => installPageLinks(plugin, async () => {}, () => enabled).refresh());
+  plugin.app.plugins = { plugins: { "md-reader": {} } };
+  assert.doesNotThrow(() => installPageLinks(plugin, async () => {}, () => enabled).refresh());
+  plugin.app.plugins = originalPlugins;
+});
+
+test("page-link refresh tolerates an incompatible hook and a throwing optional reader notification", () => {
+  const originalPlugins = plugin.app.plugins;
+  plugin.app.plugins = { plugins: { "md-reader": { refreshTranscriptLinks: "unsupported-api" } } };
+  assert.doesNotThrow(() => installPageLinks(plugin, async () => {}, () => enabled).refresh());
+  let refreshed = 0;
+  plugin.app.plugins = { plugins: { "md-reader": { refreshTranscriptLinks() { refreshed++; } } } };
+  installPageLinks(plugin, async () => {}, () => enabled).refresh();
+  assert.equal(refreshed, 2); // Provider install and explicit refresh each notify once.
+  plugin.app.plugins = { plugins: { "md-reader": { refreshTranscriptLinks() { throw new Error("reader failure"); } } } };
+  assert.doesNotThrow(() => installPageLinks(plugin, async () => {}, () => enabled).refresh());
+  plugin.app.plugins = originalPlugins;
+});
+
+test("late provider install and unload notify a loaded reader after API state changes", () => {
+  const originalPlugins = plugin.app.plugins;
+  const observations = [];
+  const localPlugin = {
+    ...plugin,
+    app: { ...plugin.app, plugins: { plugins: { "md-reader": { refreshTranscriptLinks() {
+      observations.push(localPlugin.pageLinks !== undefined);
+    } } } } },
+    register(callback) { cleanups.push(callback); },
+  };
+  const controller = installPageLinks(localPlugin, async () => {}, () => enabled);
+  assert.deepEqual(observations, [true]);
+  assert.ok(localPlugin.pageLinks);
+
+  // A newer provider may replace this one before unload; stale cleanup must
+  // preserve it and must not emit a false unavailable transition.
+  const newerProvider = { apiVersion: 1, capabilities: ["renderSection"] };
+  localPlugin.pageLinks = newerProvider;
+  const cleanup = cleanups.pop();
+  cleanup();
+  assert.equal(localPlugin.pageLinks, newerProvider);
+  assert.deepEqual(observations, [true]);
+
+  const secondPlugin = {
+    ...plugin,
+    app: { ...localPlugin.app, plugins: { plugins: { "md-reader": { refreshTranscriptLinks() {
+      observations.push(secondPlugin.pageLinks !== undefined);
+    } } } } },
+    register(callback) { this.cleanup = callback; },
+  };
+  installPageLinks(secondPlugin, async () => {}, () => enabled);
+  assert.equal(observations.at(-1), true);
+  secondPlugin.cleanup();
+  assert.equal(secondPlugin.pageLinks, undefined);
+  assert.equal(observations.at(-1), false);
+  plugin.app.plugins = originalPlugins;
+});
+
 test("page-link refresh invalidates open MD Reader chapters through its optional hook", () => {
   let refreshed = 0;
   plugin.app.plugins = { plugins: { "md-reader": { refreshTranscriptLinks() { refreshed++; } } } };
   const controller = installPageLinks(plugin, async () => {}, () => enabled);
   controller.refresh();
-  assert.equal(refreshed, 1);
+  assert.equal(refreshed, 2);
   delete plugin.app.plugins;
+});
+
+test("reader refresh observes page-link disable and re-enable transitions", () => {
+  const originalPlugins = plugin.app.plugins;
+  const observedEnabled = [];
+  let linksEnabled = true;
+  plugin.app.plugins = { plugins: { "md-reader": { refreshTranscriptLinks() {
+    observedEnabled.push(plugin.pageLinks?.enabled() ?? false);
+  } } } };
+  const controller = installPageLinks(plugin, async () => {}, () => linksEnabled);
+  linksEnabled = false;
+  controller.refresh();
+  linksEnabled = true;
+  controller.refresh();
+  assert.deepEqual(observedEnabled, [true, false, true]);
+  plugin.app.plugins = originalPlugins;
+});
+
+test("async reader refresh rejection is contained", async () => {
+  const originalPlugins = plugin.app.plugins;
+  let unhandled;
+  const recordUnhandled = error => { unhandled = error; };
+  process.on("unhandledRejection", recordUnhandled);
+  plugin.app.plugins = { plugins: { "md-reader": { refreshTranscriptLinks() { return Promise.reject(new Error("async reader failure")); } } } };
+  installPageLinks(plugin, async () => {}, () => enabled).refresh();
+  await new Promise(resolve => setImmediate(resolve));
+  process.off("unhandledRejection", recordUnhandled);
+  assert.equal(unhandled, undefined);
+  plugin.app.plugins = originalPlugins;
 });
