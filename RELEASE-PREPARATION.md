@@ -33,6 +33,6 @@ Run the opt-in combined check with `node scripts/check-optional-reader-integrati
 
 Source and fixture checks cover optional provider absence, disabled/legacy/incompatible adapters, errors and partial rendering, lifecycle refresh and Sidebar failure. They do not establish that a new build is installed or that every theme/device combination has passed visual verification.
 
-Keep public release tags, repository visibility changes and device deployment separate from this preparation. Paper/Sidebar's original-code license must be selected before public distribution; MD Reader's MIT, Transcripts' GPL-3.0-or-later and the fonts' SIL OFL notices remain separate.
+Keep public release tags, repository visibility changes and device deployment separate from this preparation. The user selected MIT for Paper/Sidebar's original code on 2026-10-16; the Paper repository owns that license implementation and its distribution notices. MD Reader's MIT attribution, Transcripts' GPL-3.0-or-later and the fonts' SIL OFL notices remain separate.
 
 Previously installed versions are Transcripts 0.11.2 and MD Reader 2.1.1. The pending handwriting-edit/native Cloud upload and foreground desktop page-viewer checks from [workflow validation](VALIDATION.md) are still open; this source restructuring does not claim to complete them.
