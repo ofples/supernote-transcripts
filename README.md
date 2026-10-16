@@ -2,13 +2,15 @@
 
 ## Version 0.11.2 — desktop workflow and easier pairing
 
+Installed and active on desktop Vedas and Nomad. Source gates pass 398 tests, TypeScript checking and build. Live Satsang validation completed 12 changed-page Sol requests and one 39-page cleanup; the cleaned Markdown reached desktop through Obsidian Sync. Remaining physical handwriting, native Cloud upload and foreground desktop viewer checks are documented in [VALIDATION.md](VALIDATION.md).
+
 Pairing now uses a shorter 20-character code and a **Discover** button next to the Nomad's desktop address input. Discovery uses an expiring, non-secret locator in the synced vault and verifies the desktop over private Wi-Fi. Manual entry and older codes remain supported.
 
 A newly configured device can reuse the exact recognized pages behind a received transcript, including pages recognized with different earlier model settings and a whole-document cleanup. Reuse requires matching publication receipts, source page fingerprints and immutable result hashes. Conflicting current local results remain protected.
 
 See [desktop Cloud Sync setup and the Nomad workflow](DESKTOP-WORKFLOW.md). The local setup uses `Supernote` for original files, excluded from Obsidian Sync, and `Supernote Transcripts` for synced Markdown and shared results. Source, deployment and live workflow evidence are recorded separately in [VALIDATION.md](VALIDATION.md).
 
-## Version 0.11.1 — simpler settings and connection recovery
+## Previous version 0.11.1 — simpler settings and connection recovery
 
 Active on desktop Vedas and Nomad; source tests and live settings checks passed. Both workers remain paused, with no recognition requests during validation.
 
