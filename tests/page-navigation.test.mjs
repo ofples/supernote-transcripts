@@ -45,6 +45,17 @@ test("stable page id follows current ordinal after insert and reorder", async ()
   assert.deepEqual(f.calls.read, [output]);
 });
 
+test("desktop mode validates an absolute local notebook source", async () => {
+  const desktopSource = "C:/Users/reader/Vault/Research/notes.note";
+  const f = fixture({ sourcePath: desktopSource, descriptors: [
+    { id: "native:target", number: 3, fingerprint: "target" },
+  ] });
+  f.options.platform = "desktop";
+  const result = await resolveNotePage({ outputPath: output, pageId: "native:target", displayNumber: 3 }, f.options);
+  assert.deepEqual(result, { path: desktopSource, page: 3, pageId: "native:target" });
+  assert.deepEqual(f.calls.open, [desktopSource]);
+});
+
 test("removed ids, duplicate ids, and duplicate content identities fail closed", async () => {
   for (const descriptors of [
     [{ id: "native:other", number: 1, fingerprint: "x" }],

@@ -11,6 +11,21 @@ export function pagesFromRange(value, total) {
     );
   return Array.from({ length: end - start + 1 }, (_, i) => start + i);
 }
+/** Explicit re-recognition accepts lists/ranges; bounds prevent huge expansion. */
+export function selectedPageNumbers(value, total) {
+  if (!Number.isSafeInteger(total) || total < 1 || total > 100000 || typeof value !== "string" || value.length > 10000)
+    throw Error("Choose pages from a readable notebook.");
+  const selected = new Set();
+  for (const part of value.replace(/[–—]/g, "-").split(",")) {
+    const m = /^\s*(\d+)(?:\s*-\s*(\d+))?\s*$/.exec(part);
+    if (!m) throw Error("Enter pages such as 3, 8-12.");
+    const start = Number(m[1]), end = Number(m[2] ?? m[1]);
+    if (!Number.isSafeInteger(start) || !Number.isSafeInteger(end) || start < 1 || end < start || end > total)
+      throw Error(`Choose pages between 1 and ${total}.`);
+    for (let n = start; n <= end; n++) selected.add(n);
+  }
+  return [...selected].sort((a, b) => a - b);
+}
 export function outputPath(folder, relative) {
   if (
     !folder ||

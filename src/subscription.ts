@@ -305,12 +305,12 @@ export class ChatGPTSession {
     if (r.status !== 200) throw Error("ChatGPT model list unavailable. Custom models remain selectable.");
     return catalogModels(r.json).map((m: any) => ({ id: m.slug, name: m.name }));
   }
-  async recognize(model: string, image: string, instructions: string, beforeSend: () => boolean | Promise<boolean>, options?: { images: {label:string;image:string}[]; reasoningEffort?:string; maxOutputTokens:number }) {
+  async recognize(model: string, image: string, instructions: string, beforeSend: () => boolean | Promise<boolean>, options?: { images: {label:string;image:string}[]; reasoningEffort?:string; maxOutputTokens:number; textOnly?:boolean }) {
     if (typeof model !== "string" || !model.trim() || /[\u0000-\u001f]/.test(model) ||
         typeof instructions !== "string" || typeof beforeSend !== "function")
       throw new RecognitionFailure("provider", "Invalid subscription page request configuration.", { scope: "source" });
     for(const item of options?.images??[{label:"",image}])if(typeof item.label!=="string"||typeof item.image!=="string"||!/^data:image\/png;base64,[A-Za-z0-9+/]+={0,2}$/.test(item.image)||item.image.length>16000000)throw new RecognitionFailure("render","Invalid subscription page request image.");
-    if (typeof image !== "string" || !/^data:image\/png;base64,[A-Za-z0-9+/]+={0,2}$/.test(image) || image.length > 16000000)
+    if (options?.textOnly !== true && (typeof image !== "string" || !/^data:image\/png;base64,[A-Za-z0-9+/]+={0,2}$/.test(image) || image.length > 16000000))
       throw new RecognitionFailure("render", "Invalid subscription page request image. Retry this page or skip it.");
     // Build/serialize before reserving so validation cannot consume a reservation.
     const body = JSON.stringify({ model, store: false, stream: true, ...(options?{max_output_tokens:options.maxOutputTokens,...(options.reasoningEffort?{reasoning:{effort:options.reasoningEffort}}:{})}:{}), input: [{ role: "user", content: [

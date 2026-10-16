@@ -5,6 +5,8 @@ import {
 } from "supernote-typescript";
 import { encodeDataURL, Image, ImageColorModel } from "image-js";
 import { visibleSequence } from "./reader-support/visibility";
+// @ts-ignore JavaScript helper is kept directly executable by node:test.
+import { extractDeviceOcr, MAX_RECOGNITION_BLOCK_BYTES } from "./reader-support/device-ocr.mjs";
 import { excludedRelative } from "./reconcile.mjs";
 import type { ReadOnlySource, OpenNotebook } from "./types";
 import {
@@ -333,6 +335,47 @@ export async function openByteNotebook(
         if ((await readRevision()) !== revision)
           throw new Error("Notebook changed while rendering.");
         return image;
+      });
+      tail = job.catch(() => {});
+      return job;
+    },
+    readOcr: (number: number) => {
+      const job = tail.then(async () => {
+        if (closed) throw new Error("Notebook was closed.");
+        const p = index.pages[number - 1];
+        if (!p || !Number.isInteger(number))
+          throw new Error("Page number is outside this notebook.");
+        let ocrAddress: number;
+        try {
+          ocrAddress = address(p.meta.RECOGNTEXT);
+        } catch {
+          return undefined;
+        }
+        if (!ocrAddress) return undefined;
+        if ((await readRevision()) !== revision)
+          throw new Error("Notebook changed before reading recognition text.");
+        if (ocrAddress < 24 || ocrAddress + 4 > source.size) return undefined;
+        let text: string | undefined;
+        const expected = new Map<number, string>(p.checks);
+        try {
+          await source.scan([...expected.keys(), ocrAddress], async (a, bytes) => {
+            if (expected.has(a) && (await sha(bytes)) !== expected.get(a)) {
+              const error = new Error("Notebook content changed after indexing. Save it in Notes and retry this notebook.");
+              error.name = "SourceChangedError";
+              throw error;
+            }
+            if (a === ocrAddress) {
+              if (bytes.length > MAX_RECOGNITION_BLOCK_BYTES) return;
+              text = extractDeviceOcr(bytes);
+            }
+          });
+        } catch (error) {
+          if ((error as Error)?.name === "SourceChangedError") throw error;
+          return undefined;
+        }
+        if ((await readRevision()) !== revision)
+          throw new Error("Notebook changed while reading recognition text.");
+        return text;
       });
       tail = job.catch(() => {});
       return job;

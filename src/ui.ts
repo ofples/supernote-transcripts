@@ -6,7 +6,7 @@ import {
   PluginSettingTab,
   setIcon,
 } from "obsidian";
-import type { Controller, FolderRule, Profile } from "./types";
+import type { Controller, FolderRule, Profile, QueueEstimate } from "./types";
 import {
   browserBreadcrumbs,
   browserEntryType,
@@ -192,7 +192,7 @@ class MirrorsModal extends Modal {
   private off?: () => void;
   private screen: Screen = "home";
   private detailReturnScreen: "home" | "queue" = "home";
-  private settingsReturnScreen: "home" | "queue" = "home";
+  private settingsReturnScreen: Screen = "home";
   private body!: HTMLElement;
   private footer!: HTMLElement;
   private heading!: HTMLElement;
@@ -209,9 +209,12 @@ class MirrorsModal extends Modal {
   private costDraft?: CostSettings;
   private costReturnScreen: "home" | "queue" | "settings" = "home";
   private outputPickerPath = "";
+  private outputFolderSearch = "";
+  private outputFolderName = "";
   private editorRule?: FolderRule;
   private editorProfile?: Profile;
   private editorBaseId = "";
+  private editorUsesGeneral = true;
   private editorGuidanceOpen = false;
   private prompt = "";
   private glossaries: string[] = [];
@@ -268,7 +271,9 @@ class MirrorsModal extends Modal {
   private viewWindow?: Window;
   private keyboardHiddenHeight = 0;
   private range = "";
-  private force = false;
+  private outdatedOnly = false;
+  private cleanupBusySource = "";
+  private cleanupSaveCopy = false;
   constructor(
     app: App,
     private c: Controller,
@@ -305,7 +310,7 @@ class MirrorsModal extends Modal {
       head,
       "settings",
       "Settings",
-      () => this.showSettings(),
+      () => this.screen === "settings" ? this.goBack() : this.showSettings(),
       "st-head-action",
     );
     iconButton(head, "x", "Close mirrors", () => this.close(), "st-close");
@@ -359,6 +364,10 @@ class MirrorsModal extends Modal {
     this.screen = "home";
     this.render();
   }
+  private async openOutputAndClose(path: string) {
+    await this.c.openOutput(path);
+    this.close();
+  }
   private saveConfigQueued() {
     const save = () => this.c.saveConfig();
     const pending = this.configSaveQueue.then(save, save);
@@ -411,7 +420,7 @@ class MirrorsModal extends Modal {
     this.render();
   }
   private showSettings() {
-    this.settingsReturnScreen = this.screen === "queue" ? "queue" : "home";
+    this.settingsReturnScreen = this.screen === "settings" ? "home" : this.screen;
     const controller = this.c as Controller & {
       provider?: "api" | "subscription";
       concurrency?: number;
@@ -436,7 +445,13 @@ class MirrorsModal extends Modal {
   }
   private render() {
     this.back.hidden = this.screen === "home";
-    this.headAction.hidden = !["home", "queue"].includes(this.screen);
+    this.headAction.hidden = false;
+    const inSettings = this.screen === "settings";
+    this.headAction.classList.toggle("is-active", inSettings);
+    this.headAction.setAttribute("aria-pressed", String(inSettings));
+    this.headAction.setAttribute("aria-label", inSettings ? "Close settings" : "Settings");
+    this.headAction.title = inSettings ? "Close settings" : "Settings";
+    setIcon(this.headAction, "settings");
     const costHead =
       this.modalEl.querySelector<HTMLButtonElement>(".st-cost-head");
     if (costHead)
@@ -924,7 +939,16 @@ class MirrorsModal extends Modal {
           );
         }
         this.queueProgress(copy, q.working.source);
-        this.renderQueueEstimate(copy, q.working.source);
+        const cleanupInProgress = /cleanup/i.test(q.working.stage);
+        if (cleanupInProgress) {
+          const cleanupEstimate = (this.c as Controller & { cleanupEstimate?: (source: string) => QueueEstimate }).cleanupEstimate?.(q.working.source);
+          const estimate = cleanupEstimate
+            ? `${cleanupEstimate.pages} pages · ${cleanupEstimate.requests} request${cleanupEstimate.requests === 1 ? "" : "s"}`
+            : "one text-only request";
+          el(copy, "p", `Document cleanup · saved transcript text only · ${estimate}`, "st-caption st-cleanup-progress");
+        } else {
+          this.renderQueueEstimate(copy, q.working.source);
+        }
         const state = this.c.store.notebooks[q.working.source];
         if (state) {
           const pausing =
@@ -1525,6 +1549,7 @@ class MirrorsModal extends Modal {
       this.c.config.profiles.find((p) => p.id === rule.profileId) ??
       this.c.config.profiles[0];
     this.editorBaseId = this.editorProfile?.id ?? "";
+    this.editorUsesGeneral = this.editorBaseId === (this.c.config.profiles.find((p) => p.id === "general")?.id ?? "general");
     this.prompt = this.editorProfile?.prompt ?? "";
     this.glossaries = [...(this.editorProfile?.glossaries ?? [])];
     this.modelDraft = this.editorProfile?.model ?? "";
@@ -1586,13 +1611,16 @@ class MirrorsModal extends Modal {
       "Output folder",
       r.output,
       (v) => (r.output = v),
-      "Transcripts are saved in this vault folder. Enter a new folder path or choose an existing folder.",
+      "Choose a vault folder or enter a new path.",
     );
     btn(
       outputChoice,
       "Choose existing folder",
       () => {
         this.outputPickerPath = "";
+        this.outputFolderSearch = "";
+        this.outputFolderName = "";
+        this.browserError = "";
         this.screen = "output-folders";
         this.render();
       },
@@ -1600,8 +1628,43 @@ class MirrorsModal extends Modal {
     );
     const transcription = el(root, "section", undefined, "st-form-section st-recognition-section");
     el(transcription, "h2", "Recognition", "st-section-heading");
-    this.modelPicker(transcription, "Model", this.modelDraft, (v) => (this.modelDraft = v));
-    this.qualitySlider(transcription, this.qualityDraft, (value) => { this.qualityDraft = value; }, () => this.modelDraft, () => this.endpointDraft, (this.c as Controller & { provider?: string }).provider === "subscription", this.c.costs.settings.maxOutputTokens);
+    const ruleWithAutomatic = r as FolderRule & { autoRecognize?: boolean };
+    this.toggle(
+      transcription,
+      "Automatically recognize new and changed pages",
+      ruleWithAutomatic.autoRecognize !== false,
+      (value) => { ruleWithAutomatic.autoRecognize = value; },
+      this.c.autoEnabled
+        ? "Automatic updates are enabled on this device. Turn this off for manual updates only."
+        : "Automatic updates are off on this device. Manual Update remains available.",
+    );
+    const sourceProfile = el(transcription, "section", undefined, "st-source-profile-mode");
+    this.toggle(
+      sourceProfile,
+      "Use source-specific recognition settings",
+      !this.editorUsesGeneral,
+      (value) => {
+        if (value) {
+          this.editorUsesGeneral = false;
+        } else {
+          const general = this.c.config.profiles.find((profile) => profile.id === "general");
+          if (!general) return new Notice("The General recognition profile is unavailable.");
+          this.editorUsesGeneral = true;
+          this.editorProfile = general;
+          this.editorBaseId = general.id;
+          this.prompt = general.prompt;
+          this.glossaries = [...general.glossaries];
+          this.modelDraft = general.model;
+          this.endpointDraft = general.endpoint;
+          this.qualityDraft = general.quality ?? "fast";
+        }
+        this.render();
+      },
+      "Off uses your default model, quality and reference files.",
+    );
+    const sourceOverrides = el(sourceProfile, "div", undefined, "st-source-profile-overrides");
+    this.modelPicker(sourceOverrides, "Model", this.modelDraft, (v) => (this.modelDraft = v));
+    this.qualitySlider(sourceOverrides, this.qualityDraft, (value) => { this.qualityDraft = value; }, () => this.modelDraft, () => this.endpointDraft, (this.c as Controller & { provider?: string }).provider === "subscription", this.c.costs.settings.maxOutputTokens);
     const instructions = el(
       transcription,
       "details",
@@ -1613,8 +1676,8 @@ class MirrorsModal extends Modal {
       this.editorGuidanceOpen = instructions.open;
     });
     const instructionSummary = this.glossaries.length
-      ? `Instructions and glossary · ${this.glossaries.length} ${this.glossaries.length === 1 ? "file" : "files"}`
-      : "Instructions and glossary (optional)";
+      ? `Instructions and reference files · ${this.glossaries.length} ${this.glossaries.length === 1 ? "file" : "files"}`
+      : "Instructions and reference files (optional)";
     el(
       instructions,
       "summary",
@@ -1631,10 +1694,17 @@ class MirrorsModal extends Modal {
     if (this.glossaries.length) this.showGlossaries(gl);
     btn(
       glossary,
-      "Choose glossary files",
+      "Choose reference files",
       () => this.openGlossaryPicker(),
       "st-button st-text-button",
     );
+
+    if (this.editorUsesGeneral) {
+      sourceOverrides.classList.add("st-inactive");
+      (Array.from(sourceOverrides.querySelectorAll("input, select, textarea, button")) as Array<HTMLInputElement | HTMLSelectElement | HTMLTextAreaElement | HTMLButtonElement>).forEach((control) => { control.disabled = true; });
+      instructions.classList.add("st-inactive");
+      (Array.from(instructions.querySelectorAll("input, select, textarea, button")) as Array<HTMLInputElement | HTMLSelectElement | HTMLTextAreaElement | HTMLButtonElement>).forEach((control) => { control.disabled = true; });
+    }
 
     const advanced = el(root, "details", undefined, "st-source-advanced");
     el(advanced, "summary", "Advanced source settings");
@@ -1664,19 +1734,6 @@ class MirrorsModal extends Modal {
     );
     const management = el(advanced, "section", undefined, "st-advanced-group st-source-management");
     el(management, "h3", "Manage source", "st-field-heading");
-    btn(management, "Use General recognition settings", () => {
-      const p = this.c.config.profiles.find((x) => x.id === "general");
-      if (!p) return;
-      this.editorProfile = p;
-      this.editorBaseId = p.id;
-      this.prompt = p.prompt;
-      this.glossaries = [...p.glossaries];
-      this.modelDraft = p.model;
-      this.endpointDraft = p.endpoint;
-      this.qualityDraft = p.quality ?? "fast";
-      this.render();
-    });
-    el(management, "p", "Replace this source’s recognition choices with the General profile.", "st-caption");
     const actions = el(this.footer, "div", undefined, "st-actions");
     btn(actions, "Cancel", () => this.goHome(), "st-button st-text-button");
     btn(actions, "Save", () => void this.saveRule(), "st-button st-primary");
@@ -1927,12 +1984,14 @@ class MirrorsModal extends Modal {
       try {
         r.source = validateSource(r.source);
         r.output = validateDestination(r.output.trim());
+        const generalProfileId = this.c.config.profiles.find((profile) => profile.id === "general")?.id ?? "general";
         const custom =
           this.prompt !== p.prompt ||
           JSON.stringify(this.glossaries) !== JSON.stringify(p.glossaries) ||
           this.modelDraft !== p.model ||
           this.endpointDraft !== p.endpoint ||
-          this.qualityDraft !== (p.quality ?? "fast");
+          this.qualityDraft !== (p.quality ?? "fast") ||
+          (!this.editorUsesGeneral && this.editorBaseId === generalProfileId);
         if (custom) {
           const profile = {
             ...p,
@@ -2027,6 +2086,7 @@ class MirrorsModal extends Modal {
     this.editorGuidanceOpen = false;
     this.editorProfile = p;
     this.editorBaseId = p.id;
+    this.editorUsesGeneral = p.id === (this.c.config.profiles.find((profile) => profile.id === "general")?.id ?? "general");
     this.prompt = p.prompt;
     this.glossaries = [...p.glossaries];
     this.modelDraft = p.model;
@@ -2317,9 +2377,10 @@ class MirrorsModal extends Modal {
               }
               void this.quickAddSource(entry.path);
             },
-            `st-button ${mirroredBy ? "st-text-button" : "st-browser-mirror"}`,
+            `st-button st-browser-source-action ${mirroredBy ? "st-browser-configure" : "st-browser-mirror"}`,
           );
           if (!mirroredBy) setText(action, "Mirror");
+          else action.setAttribute("aria-current", "true");
           action.title = mirroredBy
             ? `Configure ${base(mirroredBy.source)}`
             : `Add ${entry.name.replace(/\.note$/i, "")} as a mirror`;
@@ -2340,21 +2401,30 @@ class MirrorsModal extends Modal {
       undefined,
       "st-browser st-output-browser",
     );
-    el(root, "p", this.outputPickerPath || "Vault", "st-breadcrumb");
-    if (this.outputPickerPath)
-      btn(
-        root,
-        "Parent folder",
-        () => {
-          this.outputPickerPath = this.outputPickerPath.slice(
-            0,
-            this.outputPickerPath.lastIndexOf("/"),
-          );
-          this.render();
-        },
-        "st-button st-text-button",
-      );
-    const error = el(root, "p", "", "st-error");
+    const breadcrumbs = el(root, "nav", undefined, "st-browser-breadcrumbs");
+    breadcrumbs.setAttribute("aria-label", "Output folder path");
+    const parts = this.outputPickerPath.split("/").filter(Boolean);
+    const crumb = btn(breadcrumbs, "Vault", () => {
+      this.outputPickerPath = "";
+      this.render();
+    }, "st-browser-crumb");
+    crumb.setAttribute("aria-current", parts.length ? "false" : "location");
+    for (let index = 0; index < parts.length; index++) {
+      el(breadcrumbs, "span", "›", "st-browser-separator");
+      const path = parts.slice(0, index + 1).join("/");
+      const item = index === parts.length - 1
+        ? el(breadcrumbs, "span", parts[index], "st-browser-current")
+        : btn(breadcrumbs, parts[index], () => { this.outputPickerPath = path; this.render(); }, "st-browser-crumb");
+      if (index === parts.length - 1) item.setAttribute("aria-current", "location");
+    }
+    const search = this.input(root, "Find a folder", this.outputFolderSearch, "search", (value) => { this.outputFolderSearch = value; });
+    search.placeholder = "Filter folders in this location";
+    const newFolder = el(root, "div", undefined, "st-new-folder");
+    const newFolderInput = this.input(newFolder, "New folder name", this.outputFolderName, "text", (value) => { this.outputFolderName = value; });
+    newFolderInput.placeholder = "Create in the current location";
+    btn(newFolder, "Create folder", () => { void this.createOutputFolder(); }, "st-button st-text-button");
+    el(newFolder, "small", "Creating a folder writes it to this vault immediately.", "st-caption");
+    const error = el(root, "p", this.browserError, "st-error");
     const list = el(root, "div", undefined, "st-browser-list");
     const actions = el(this.footer, "div", undefined, "st-actions");
     btn(
@@ -2381,49 +2451,79 @@ class MirrorsModal extends Modal {
     choose.title = this.outputPickerPath
       ? "Use this existing vault folder"
       : "Choose a folder inside the vault";
-    try {
-      const result = await this.app.vault.adapter.list(this.outputPickerPath);
-      if (token !== this.browserToken || this.screen !== "output-folders")
-        return;
-      const folders = [...new Set(result.folders)]
-        .filter(
-          (folder) => !folder.split("/").some((part) => part.startsWith(".")),
-        )
-        .sort((a, b) => a.localeCompare(b));
-      for (const folder of folders) {
-        const path =
-          !this.outputPickerPath ||
-          folder.startsWith(`${this.outputPickerPath}/`)
-            ? folder
-            : `${this.outputPickerPath}/${folder}`;
+    let allFolders: string[] = [];
+    const drawFolders = (folders: string[]) => {
+      list.empty();
+      const query = this.outputFolderSearch.trim().toLocaleLowerCase();
+      const visibleFolders = folders.filter((folder) => {
+        const path = !this.outputPickerPath || folder.startsWith(`${this.outputPickerPath}/`)
+          ? folder
+          : `${this.outputPickerPath}/${folder}`;
+        const name = path.slice(path.lastIndexOf("/") + 1) || path;
+        return !query || name.toLocaleLowerCase().includes(query) || path.toLocaleLowerCase().includes(query);
+      });
+      for (const folder of visibleFolders) {
+        const path = !this.outputPickerPath || folder.startsWith(`${this.outputPickerPath}/`)
+          ? folder
+          : `${this.outputPickerPath}/${folder}`;
         const name = path.slice(path.lastIndexOf("/") + 1) || path;
         const entry = btn(
           list,
           "",
-          () => {
-            this.outputPickerPath = path;
-            this.render();
-          },
+          () => { this.outputPickerPath = path; this.outputFolderSearch = ""; this.render(); },
           "st-browser-entry",
         );
         const glyph = el(entry, "span", undefined, "st-source-icon");
         glyph.setAttribute("aria-hidden", "true");
         setIcon(glyph, "folder");
-        el(entry, "span", name);
+        el(entry, "span", name, "st-browser-entry-name");
         const arrow = el(entry, "span", undefined, "st-entry-arrow");
         arrow.setAttribute("aria-hidden", "true");
         setIcon(arrow, "chevron-right");
       }
-      if (!folders.length)
-        el(
-          list,
-          "p",
-          "No existing subfolders here. You can enter a new path in the source settings.",
-          "st-empty",
-        );
+      if (!visibleFolders.length)
+        el(list, "p", query ? "No matching folders here." : "No existing subfolders here. You can create one above.", "st-empty");
+    };
+    search.addEventListener("input", () => drawFolders(allFolders));
+    try {
+      const result = await this.app.vault.adapter.list(this.outputPickerPath);
+      if (token !== this.browserToken || this.screen !== "output-folders")
+        return;
+      allFolders = [...new Set(result.folders)]
+        .filter(
+          (folder) => !folder.split("/").some((part) => part.startsWith(".")),
+        )
+        .sort((a, b) => a.localeCompare(b));
+      drawFolders(allFolders);
     } catch (e) {
       if (token === this.browserToken && this.screen === "output-folders")
         setText(error, `Could not list vault folders: ${err(e)}`);
+    }
+  }
+  private async createOutputFolder() {
+    const name = this.outputFolderName.trim();
+    const windowsReserved = /^(con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\..*)?$/i.test(name);
+    if (!name || name === "." || name === ".." || /[<>:"|?*\\/\u0000-\u001f]/.test(name) || /[. ]$/.test(name) || name.startsWith(".") || windowsReserved) {
+      this.browserError = "Enter a normal folder name without slashes, hidden-folder prefixes, or reserved path characters.";
+      this.render();
+      return;
+    }
+    const path = [this.outputPickerPath, name].filter(Boolean).join("/");
+    try {
+      validateDestination(path);
+      if (this.app.vault.getAbstractFileByPath(path))
+        throw new Error("A file or folder with that name already exists here.");
+      await this.app.vault.createFolder(path);
+      if (this.screen !== "output-folders") return;
+      this.outputPickerPath = path;
+      this.outputFolderName = "";
+      this.outputFolderSearch = "";
+      this.browserError = "";
+      this.render();
+    } catch (error) {
+      if (this.screen !== "output-folders") return;
+      this.browserError = `Could not create folder: ${err(error)}`;
+      this.render();
     }
   }
   private chooseFolder() {
@@ -3460,29 +3560,112 @@ class MirrorsModal extends Modal {
     btn(
       this.footer,
       "Open transcript",
-      () => safe(this.c.openOutput(state.output)),
+      () => safe(this.openOutputAndClose(state.output)),
       "st-button st-primary",
     );
-    const more = el(controls, "details");
-    el(more, "summary", "Pages and preview");
+    const operationController = this.c as Controller & {
+      cleanupDocument?: (source: string, options?: { saveCopy?: boolean }) => Promise<void>;
+      cleanupEstimate?: (source: string) => QueueEstimate;
+      reprocessPages?: (source: string, range: string, outdatedOnly?: boolean) => Promise<void>;
+    };
+    const cleanupSection = el(controls, "section", undefined, "st-detail-task st-cleanup-task");
+    el(cleanupSection, "h2", "Clean up document", "st-section-heading");
+    el(cleanupSection, "p", "Clean formatting and transcription errors across the complete document, preserving your wording. One text-only request, with high reasoning where supported.", "st-caption");
+    const cleanupMetadata = (state as typeof state & { cleanup?: { updatedAt?: string; model?: string; quality?: string; stale?: boolean } }).cleanup;
+    if (cleanupMetadata) {
+      const when = cleanupMetadata.updatedAt ? new Date(cleanupMetadata.updatedAt).toLocaleString() : "date unavailable";
+      const details = [cleanupMetadata.model, cleanupMetadata.quality, when].filter(Boolean).join(" · ");
+      el(cleanupSection, "p", `Previous cleanup${cleanupMetadata.stale ? " · source text changed" : ""}: ${details}`, "st-caption");
+    }
+    const cleanupEstimate = operationController.cleanupEstimate?.(state.source);
+    if (cleanupEstimate && cleanupEstimate.pages > 0) {
+      const parts = [`${cleanupEstimate.pages} page${cleanupEstimate.pages === 1 ? "" : "s"}`, `${cleanupEstimate.requests} request${cleanupEstimate.requests === 1 ? "" : "s"}`];
+      if ((this.c as Controller & { provider?: string }).provider === "subscription") {
+        if (cleanupEstimate.seconds !== undefined) parts.push(`about ${this.duration(cleanupEstimate.seconds)}`);
+        const usage = this.c.subscriptionUsage;
+        const left = Math.max(0, usage.dailyLimit - usage.todayRequests);
+        parts.push(`${left} of ${usage.dailyLimit} plugin requests left today`);
+      } else {
+        if (cleanupEstimate.usd !== undefined) parts.push(`about $${cleanupEstimate.usd.toFixed(4)}`);
+        if (cleanupEstimate.reservationUsd !== undefined && cleanupEstimate.reservationUsd > 0)
+          parts.push(`up to $${cleanupEstimate.reservationUsd.toFixed(4)} reserved`);
+      }
+      el(cleanupSection, "p", `Estimated cleanup: ${parts.join(" · ")}${cleanupEstimate.provisional ? " · provisional" : ""}`, "st-caption st-queue-estimate");
+    }
+    if ((this.c as Controller & { provider?: string }).provider === "subscription") {
+      el(cleanupSection, "p", "Provider: ChatGPT subscription · allowance is managed by ChatGPT; the plugin count is not plan quota.", "st-caption");
+    } else {
+      const limits = this.c.costs.settings;
+      const spent = this.c.costs.day.spentUsd + this.c.costs.day.heldUsd;
+      const monthTotal = this.c.costs.month.spentUsd + this.c.costs.month.heldUsd;
+      el(cleanupSection, "p", `API budget: $${spent.toFixed(4)} of $${limits.dailyUsd.toFixed(2)} today · ${this.c.costs.day.requests}/${limits.dailyRequests} requests today · $${monthTotal.toFixed(4)} of $${limits.monthlyUsd.toFixed(2)} this month · $${limits.runUsd.toFixed(2)} run cap.`, "st-caption");
+    }
+    this.toggle(
+      cleanupSection,
+      "Save cleaned text as a separate copy",
+      this.cleanupSaveCopy,
+      (value) => { this.cleanupSaveCopy = value; },
+      "Off replaces the current transcript after preserving its previous version in history.",
+    );
+    const cleanupButton = btn(cleanupSection, this.cleanupBusySource === state.source ? "Cleaning up…" : "Clean up document", () => { void this.runDocumentCleanup(state.source); }, "st-button st-primary");
+    const cleanupReady=state.desired.length>0&&state.desired.every(p=>state.pages[p.id]?.fingerprint===p.fingerprint);
+    cleanupButton.disabled = !operationController.cleanupDocument || !!this.c.progress.stateBlocked || !aiOn(this.c) || this.c.progress.running || !cleanupReady || this.cleanupBusySource === state.source;
+    if(!cleanupReady)el(cleanupSection,"p","Finish AI recognition for every page before cleaning the complete document. Device OCR remains readable meanwhile.","st-caption");
+    if (!operationController.cleanupDocument)
+      el(cleanupSection, "p", "Document cleanup is not available in this runtime yet.", "st-caption st-inactive");
+    else if (!aiOn(this.c))
+      el(cleanupSection, "p", "Turn on AI recognition in Settings before requesting cleanup.", "st-caption st-inactive");
+    else if (this.c.progress.stateBlocked)
+      el(cleanupSection, "p", this.stateBlockedMessage(), "st-caption st-attention-reason");
+
+    const reprocessSection = el(controls, "section", undefined, "st-detail-task st-reprocess-task");
+    el(reprocessSection, "h2", "Re-recognize pages", "st-section-heading");
+    el(reprocessSection, "p", "Choose page numbers or ranges. This explicit action sends the selected page images for recognition and may use provider credit.", "st-caption");
+    let updateSelectionEstimate=()=>{};
     const range = this.input(
-      more,
-      "Page or range",
+      reprocessSection,
+      "Pages",
       this.range,
       "text",
-      (v) => (this.range = v),
-      "Up to 10 pages",
+      (v) => {this.range = v;updateSelectionEstimate();},
+      "1, 3-5, 12",
     );
-    const forceToggle = this.toggle(
-      more,
-      "Force reprocess selected pages",
-      this.force,
-      (v) => (this.force = v),
-      "Recognizes saved pages again and uses API credit.",
+    range.placeholder = "For example: 1, 3-5, 12";
+    this.toggle(
+      reprocessSection,
+      "Only pages with outdated recognition",
+      this.outdatedOnly,
+      (value) => { this.outdatedOnly = value;updateSelectionEstimate(); },
+      "When off, every selected page is recognized again.",
     );
-    forceToggle.disabled = !!this.c.progress.stateBlocked;
-    btn(more, "Preview", () => {
-      const n = Number(range.value.split("-")[0]);
+    const selectionEstimate=el(reprocessSection,"p",undefined,"st-caption st-selection-estimate");
+    updateSelectionEstimate=()=>{
+      try {
+        const estimate=this.c.reprocessEstimate?.(state.source,this.range,this.outdatedOnly);
+        setText(selectionEstimate,estimate?`${estimate.pages} selected pages · ${estimate.requests} requests${this.c.provider==="api"&&estimate.usd!==undefined?` · about $${estimate.usd.toFixed(4)}`:""}${estimate.provisional?" · provisional estimate":""}`:"Enter pages to estimate this operation.");
+      }catch(error){setText(selectionEstimate,err(error));}
+    };
+    updateSelectionEstimate();
+    const reprocessButton = btn(reprocessSection, aiOn(this.c) ? "Re-recognize selected pages" : "AI recognition is off", () => {
+      if (this.c.progress.stateBlocked) return new Notice(this.stateBlockedMessage());
+      if (!this.range.trim()&&!this.outdatedOnly) return new Notice("Enter one or more page numbers or ranges.");
+      if (!operationController.reprocessPages) return new Notice("Page re-recognition is not available in this runtime yet.");
+      safe(operationController.reprocessPages(state.source, this.range, this.outdatedOnly));
+    }, "st-button st-primary");
+    reprocessButton.disabled = !operationController.reprocessPages || !!this.c.progress.stateBlocked || !aiOn(this.c) || this.c.progress.running;
+
+    const previewDetails = el(controls, "details", undefined, "st-detail-preview");
+    el(previewDetails, "summary", "Preview a page");
+    const previewRange = this.input(
+      previewDetails,
+      "Page number",
+      this.range.split(/[,-]/)[0] ?? "",
+      "number",
+      () => {},
+      "Page to preview",
+    );
+    btn(previewDetails, "Preview", () => {
+      const n = Number(previewRange.value);
       if (!Number.isInteger(n) || n < 1)
         return new Notice("Enter a page number or range.");
       safe(
@@ -3491,15 +3674,6 @@ class MirrorsModal extends Modal {
           .then((image) => new ImageModal(this.app, image).open()),
       );
     });
-    const processSelection = btn(more, aiOn(this.c) ? "Process selection" : "Check selection", () => {
-      if (this.c.progress.stateBlocked) {
-        new Notice(this.stateBlockedMessage());
-        return;
-      }
-      if (!range.value.trim()) return new Notice("Enter a page or range.");
-      safe(this.c.manual(state.source, range.value, this.force));
-    });
-    processSelection.disabled = !!this.c.progress.stateBlocked;
     const advanced = el(controls, "details", undefined, "st-notebook-advanced");
     el(advanced, "summary", "Advanced options");
     btn(
@@ -3510,7 +3684,7 @@ class MirrorsModal extends Modal {
       },
       "st-button st-text-button",
     );
-    const technical = el(more, "details");
+    const technical = el(controls, "details", undefined, "st-notebook-technical");
     el(technical, "summary", "Technical details");
     el(technical, "p", `Source: ${state.source}`, "st-caption");
     el(technical, "p", `Output: ${state.output}`, "st-caption");
@@ -3520,6 +3694,64 @@ class MirrorsModal extends Modal {
       `Revision ${state.revision || "not indexed"} · saved ${state.lastSaved || "never"}`,
       "st-caption",
     );
+    const recognitionHistory = el(technical, "details", undefined, "st-recognition-history");
+    el(recognitionHistory, "summary", "Page recognition history");
+    const recognizedPages = state.desired.filter((page) => {
+      const saved = state.pages[page.id];
+      return saved?.fingerprint === page.fingerprint && !!saved.recognition;
+    });
+    if (recognizedPages.length) {
+      const list = el(recognitionHistory, "ul", undefined, "st-recognition-history-list");
+      for (const page of recognizedPages) {
+        const metadata = state.pages[page.id].recognition!;
+        const date = Number.isNaN(Date.parse(metadata.recognizedAt))
+          ? metadata.recognizedAt
+          : new Date(metadata.recognizedAt).toLocaleString();
+        el(
+          list,
+          "li",
+          `Page ${page.number}: ${metadata.model} · ${metadata.provider} · ${metadata.quality} · ${date}`,
+          "st-caption",
+        );
+      }
+    } else {
+      el(recognitionHistory, "p", "No saved page recognition details yet.", "st-caption");
+    }
+    const deviceOcrPages = Object.values(state.deviceOcr ?? {}).filter((page) =>
+      state.desired.some((descriptor) => descriptor.fingerprint === page.fingerprint),
+    ).length;
+    if (deviceOcrPages) {
+      el(technical, "p", `Device OCR is available for ${deviceOcrPages} page${deviceOcrPages === 1 ? "" : "s"}; it is separate from saved AI recognition.`, "st-caption");
+    }
+  }
+  private async runDocumentCleanup(source: string) {
+    const controller = this.c as Controller & {
+      cleanupDocument?: (source: string, options?: { saveCopy?: boolean }) => Promise<void>;
+    };
+    if (!controller.cleanupDocument) {
+      new Notice("Document cleanup is not available in this runtime yet.");
+      return;
+    }
+    if (this.c.progress.stateBlocked) {
+      new Notice(this.stateBlockedMessage());
+      return;
+    }
+    if (!aiOn(this.c)) {
+      new Notice("Turn on AI recognition in Settings before requesting cleanup.");
+      return;
+    }
+    if (this.cleanupBusySource) return;
+    this.cleanupBusySource = source;
+    if (this.screen === "detail" && this.selectedSource === source) this.render();
+    try {
+      await controller.cleanupDocument(source, { saveCopy: this.cleanupSaveCopy });
+      new Notice(this.cleanupSaveCopy ? "Cleaned transcript saved as a separate copy." : "Transcript cleanup completed; the previous version is in history.");
+    } catch (error) {
+      new Notice(`Could not clean up this transcript: ${err(error)}. Review the source and budget, then retry.`);
+    } finally {
+      if (this.cleanupBusySource === source) this.cleanupBusySource = "";
+      if (this.screen === "detail" && this.selectedSource === source) this.render();
+    }
   }
   private refreshPageIssues(state: Controller["store"]["notebooks"][string]) {
     const root = this.pageIssuesLive;
@@ -3679,13 +3911,13 @@ class MirrorsModal extends Modal {
         el(result, "p", "Saved recognition was restored to the mirror.", "st-summary-title");
         if (this.recoveryResult.backup) {
           el(result, "p", `Your edited version was backed up at ${this.recoveryResult.backup}`, "st-caption");
-          btn(result, "Open backup", () => safe(this.c.openOutput(this.recoveryResult!.backup!)), "st-button st-text-button");
+          btn(result, "Open backup", () => safe(this.openOutputAndClose(this.recoveryResult!.backup!)), "st-button st-text-button");
         }
       } else {
         el(result, "p", "Your edits remain at the original path. A new mirror was created.", "st-summary-title");
       }
       el(result, "p", `Mirror: ${this.recoveryResult.output}`, "st-caption st-recovery-path");
-      btn(result, "Open mirror", () => safe(this.c.openOutput(this.recoveryResult!.output)), "st-button st-text-button");
+      btn(result, "Open mirror", () => safe(this.openOutputAndClose(this.recoveryResult!.output)), "st-button st-text-button");
       btn(this.footer, "Back to notebook", () => {
         this.screen = "detail";
         this.render();

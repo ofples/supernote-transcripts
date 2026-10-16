@@ -1,4 +1,4 @@
-import { editorInfoField, editorLivePreviewField, MarkdownRenderer, MarkdownRenderChild, MarkdownView, TFile, type Plugin } from "obsidian";
+import { editorInfoField, editorLivePreviewField, MarkdownRenderer, MarkdownRenderChild, MarkdownView, TFile, type Component, type Plugin } from "obsidian";
 import { Decoration, EditorView, ViewPlugin, WidgetType } from "@codemirror/view";
 import { RangeSetBuilder, StateEffect, StateField, type EditorState } from "@codemirror/state";
 import { pageMarkerGroups, pageMarkerTableAnchor, parsePageLinkToken, parsePageMarkers } from "./page-links.mjs";
@@ -6,6 +6,23 @@ import { isManagedTranscript } from "./page-navigation";
 
 export type PageLinkOpen = (outputPath: string, pageId: string, displayNumber: number) => Promise<void>;
 const refreshPageLinks = StateEffect.define<void>();
+
+export interface ReaderPageLinkSection {
+  element: HTMLElement;
+  sourcePath: string;
+  markdown: string;
+  /** One zero-based source-file line per rendered line; null marks inserted separators. */
+  sourceLineMap: Array<number | null>;
+  component: Component;
+}
+
+export interface ReaderPageLinksApi {
+  enabled(): boolean;
+  /** Render a reader chapter with validated chips. Returns false when it is not a managed transcript. */
+  renderSection(section: ReaderPageLinkSection): Promise<boolean>;
+}
+
+type PluginWithReaderPageLinks = Plugin & { pageLinks?: ReaderPageLinksApi };
 
 function pageButton(number: number, open: () => Promise<void>): HTMLButtonElement {
   const button = document.createElement("button");
@@ -109,6 +126,102 @@ function addInlinePageGroup(target: HTMLElement, group: (ReturnType<typeof pageM
   }
 }
 
+async function renderReaderPageLinkSection(plugin: Plugin, onOpen: PageLinkOpen, enabled: () => boolean,
+  section: ReaderPageLinkSection): Promise<boolean> {
+  if (!enabled() || !section?.element || !section.sourcePath || !section.component || typeof section.markdown !== "string") return false;
+  const parts = section.sourcePath.split("/");
+  if (section.sourcePath.startsWith("/") || section.sourcePath.includes("\\") ||
+      /[\u0000-\u001f]/.test(section.sourcePath) || parts.some(part => !part || part === "." || part === ".." || part.includes(":"))) return false;
+  const file = plugin.app.vault.getAbstractFileByPath(section.sourcePath);
+  if (!(file instanceof TFile) || file.path !== section.sourcePath || file.extension.toLowerCase() !== "md") return false;
+  const canonical = await plugin.app.vault.cachedRead(file);
+  if (!isManagedTranscript(canonical)) return false;
+
+  const renderedLines = section.markdown.split(/\r?\n/);
+  const sourceLineMap = section.sourceLineMap;
+  if (!Array.isArray(sourceLineMap) || sourceLineMap.length !== renderedLines.length) return false;
+  const selectedLines = new Set<number>();
+  let previousLine = -1;
+  for (const line of sourceLineMap) {
+    if (line === null) continue;
+    if (!Number.isSafeInteger(line) || line < 0 || line <= previousLine) return false;
+    selectedLines.add(line);
+    previousLine = line;
+  }
+  const markers = parsePageMarkers(section.markdown);
+  if (!markers.length) return false;
+  const canonicalMarkers = parsePageMarkers(canonical).filter(marker => selectedLines.has(marker.line));
+  const renderedIdentities = markers.map(marker => {
+    const sourceLine = sourceLineMap[marker.line];
+    return sourceLine === null || sourceLine === undefined ? null : `${sourceLine}\u0000${marker.pageId}\u0000${marker.number}`;
+  });
+  const canonicalIdentities = canonicalMarkers.map(marker => `${marker.line}\u0000${marker.pageId}\u0000${marker.number}`);
+  if (renderedIdentities.some(identity => identity === null) ||
+      renderedIdentities.length !== canonicalIdentities.length ||
+      renderedIdentities.some((identity, index) => identity !== canonicalIdentities[index])) return false;
+
+  const linkTokens = new Map<string, (typeof markers)[number]>();
+  const linkFor = (marker: (typeof markers)[number]) => {
+    const token = `${marker.from}-${marker.number}-${linkTokens.size}`;
+    linkTokens.set(token, marker);
+    return `[p.${marker.number} ↗](obsidian://nomad-transcripts-page-link?token=${encodeURIComponent(token)})`;
+  };
+  const groups = pageMarkerGroups(section.markdown, markers);
+  const groupedMarkers = new Set(groups.flatMap(group => group.markers.map(marker => marker.from)));
+  const replacements: Array<{ from: number; to: number; text: string }> = [];
+  for (const group of groups) {
+    const links = group.markers.map(marker => linkFor(marker)).join(" ");
+    // Keep each page chip adjacent to its source block. EOF groups follow the
+    // preceding text; other groups occupy the marker's original standalone lines.
+    const text = group.eof && group.targetLine !== null ? `\n\n${links}`
+      : group.targetLine !== null ? `${links}\n\n` : links;
+    replacements.push({ from: group.from, to: group.to, text });
+  }
+  for (const marker of markers) {
+    if (groupedMarkers.has(marker.from)) continue;
+    replacements.push({ from: marker.from, to: marker.to, text: linkFor(marker) });
+  }
+  replacements.sort((a, b) => a.from - b.from || a.to - b.to);
+  let rendered = "";
+  let offset = 0;
+  for (const replacement of replacements) {
+    if (replacement.from < offset || replacement.to < replacement.from) return false;
+    rendered += section.markdown.slice(offset, replacement.from) + replacement.text;
+    offset = replacement.to;
+  }
+  rendered += section.markdown.slice(offset);
+
+  const fragment = document.createElement("div");
+  fragment.dataset.stPageLinksRender = "true";
+  await MarkdownRenderer.render(plugin.app, rendered, fragment, section.sourcePath, section.component);
+  for (const anchor of Array.from(fragment.querySelectorAll<HTMLAnchorElement>("a[href]"))) {
+    const token = parsePageLinkToken(anchor.getAttribute("href") ?? "") ?? parsePageLinkToken(anchor.getAttribute("data-href") ?? "");
+    const marker = token ? linkTokens.get(token) : undefined;
+    if (marker) anchor.replaceWith(pageButton(marker.number, () => onOpen(section.sourcePath, marker.pageId, marker.number)));
+  }
+  // Standalone metadata must not become a paragraph of its own in a paginated
+  // reader. Move chip-only paragraphs into adjacent text before it measures.
+  for (const paragraph of Array.from(fragment.querySelectorAll<HTMLParagraphElement>("p"))) {
+    const nodes = Array.from(paragraph.childNodes);
+    if (!nodes.length || !nodes.some(node => node instanceof HTMLElement && node.matches("button.st-page-link")) ||
+        !nodes.every(node => node.nodeType === 3 ? !node.textContent?.trim() : node instanceof HTMLElement && node.matches("button.st-page-link"))) continue;
+    const next = paragraph.nextElementSibling as HTMLElement | null;
+    const previous = paragraph.previousElementSibling as HTMLElement | null;
+    const adjacent = next ?? previous;
+    if (!adjacent) continue;
+    const target = adjacent.matches("p,h1,h2,h3,h4,h5,h6,li,td,th") ? adjacent : adjacent.querySelector<HTMLElement>("li,p,th,td");
+    if (!target) continue;
+    const wrapper = document.createElement("span");wrapper.className="st-page-link-group";wrapper.append(...nodes);
+    if (next) {
+      const checkbox=Array.from(target.children).find(child=>child.matches("input[type=checkbox],.task-list-item-checkbox"));
+      target.insertBefore(wrapper,checkbox?checkbox.nextSibling:target.firstChild);
+    } else target.append(wrapper);
+    paragraph.remove();
+  }
+  section.element.replaceChildren(...Array.from(fragment.childNodes));
+  return true;
+}
+
 /** Install view-only page chips. Marker comments remain untouched in Markdown. */
 export function installPageLinks(plugin: Plugin, onOpen: PageLinkOpen, enabled: () => boolean = () => true): { refresh: () => void } {
   const editorViews = new Set<EditorView>();
@@ -185,6 +298,16 @@ export function installPageLinks(plugin: Plugin, onOpen: PageLinkOpen, enabled: 
     destroy() { editorViews.delete(this.view); }
   });
   plugin.registerEditorExtension([pageLinkField, editorTracker]);
+
+  const integration: ReaderPageLinksApi = {
+    enabled,
+    renderSection: section => renderReaderPageLinkSection(plugin, onOpen, enabled, section),
+  };
+  const pluginWithApi = plugin as PluginWithReaderPageLinks;
+  pluginWithApi.pageLinks = integration;
+  plugin.register(() => {
+    if (pluginWithApi.pageLinks === integration) delete pluginWithApi.pageLinks;
+  });
 
   plugin.registerMarkdownPostProcessor(async (el, ctx) => {
     if (el.closest("[data-st-page-links-render]") || el.hasAttribute("data-st-page-links-render")) return;
@@ -267,6 +390,9 @@ export function installPageLinks(plugin: Plugin, onOpen: PageLinkOpen, enabled: 
       const leaves = plugin.app.workspace.getLeavesOfType("markdown") as unknown as Array<{ view: MarkdownView }>;
       for (const view of editorViews) view.dispatch({ effects: refreshPageLinks.of() });
       for (const leaf of leaves) leaf.view.previewMode.rerender(true);
+      const reader = (plugin.app as typeof plugin.app & { plugins?: { plugins?: Record<string, { refreshTranscriptLinks?: () => void }> } })
+        .plugins?.plugins?.["md-reader"];
+      reader?.refreshTranscriptLinks?.();
     },
   };
 }

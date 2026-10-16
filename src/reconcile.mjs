@@ -1,4 +1,5 @@
 import { CONTINUE_PAGE_TEXT, EMPTY_PAGE_TEXT } from "./prompts.mjs";
+import { displayedPageText } from "./provenance.mjs";
 const pathParts = (value) => value.split("/");
 export function validateSource(value, platform) {
   const path = value.trim().replace(/\\/g, "/").replace(/\/+$/, "");
@@ -141,16 +142,17 @@ export function buildMarkdown(notebook, showPageHeadings = true) {
         const result = notebook.pages[p.id];
         const issue = notebook.pageIssues?.[p.id]?.fingerprint === p.fingerprint ? notebook.pageIssues[p.id] : undefined;
         const notice = issue?.status === "skipped" ? issue.force ? "*Requested reprocessing skipped; previous transcription retained.*" : "*Page skipped by you; no current transcription is claimed.*" : issue ? "*This page could not be recognized. Retry it explicitly or skip it in Supernote Transcripts.*" : "";
-        const rawText = result?.text ?? "";
+        const layer = displayedPageText(notebook, p);
+        const rawText = layer.text;
         const joinsPrevious = rawText.startsWith(CONTINUE_PAGE_TEXT);
-        const body = (rawText.trim() === EMPTY_PAGE_TEXT ? "" : continuation(rawText) || (result?.text ? "" :
+        const body = (rawText.trim() === EMPTY_PAGE_TEXT ? "" : continuation(rawText) || (rawText ? "" :
           (issue?.status === "skipped" ? "*Page skipped by you; no transcription is claimed.*" :
            issue ? "*This page could not be recognized. Retry it explicitly or skip it in Supernote Transcripts.*" : "*Awaiting recognition.*"))) + (result&&notice?`\n\n${notice}`:"");
         const stale =
-          result && result.fingerprint !== p.fingerprint
+          layer.stale
             ? "\n\n> Previous transcription; this page has changed."
             : "";
-        const current = result?.fingerprint === p.fingerprint && !issue;
+        const current = !!rawText && !layer.stale && !issue;
         return { p, index, result, body: body.trim(), stale, joinsPrevious, current };
       });
   if (!showPageHeadings) {
@@ -169,7 +171,7 @@ export function buildMarkdown(notebook, showPageHeadings = true) {
     }
   }
   return `---\nnomad_transcripts: true\nsupernote_transcripts_version: 1\n---\n\n# ${name}\n\n` +
-    (incomplete ? `> ${incomplete} page(s) awaiting recognition or an updated transcription.\n\n` : "") +
+    (incomplete ? `> ${incomplete} page(s) awaiting recognition or an updated transcription.${notebook.desired.some(p => displayedPageText(notebook,p).provisional) ? " Device OCR is shown provisionally where available." : ""}\n\n` : "") +
     pageRows.map(({ p, body, stale, omitMarker }) => {
       if (omitMarker) return "";
       const marker = showPageHeadings ? `## Page ${p.number}` : `<!-- supernote-page:${encodeURIComponent(p.id)} number:${p.number} -->`;

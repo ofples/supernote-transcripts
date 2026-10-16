@@ -12,6 +12,8 @@ export interface FolderRule {
   id: string;
   enabled: boolean;
   paused?: boolean;
+  /** False means explicit Update only; the device's global automatic switch still applies. */
+  autoRecognize?: boolean;
   source: string;
   output: string;
   recursive: boolean;
@@ -52,6 +54,7 @@ export interface NotebookDescriptor {
 export interface OpenNotebook {
   descriptor: NotebookDescriptor;
   render(pageNumber: number): Promise<string>;
+  readOcr?(pageNumber: number): Promise<string | undefined>;
   close(): void;
 }
 export interface ReadOnlySource {
@@ -80,6 +83,27 @@ export interface TranscriptPage {
   number: number;
   legacyRenderHash?: string;
   blank?: boolean;
+  recognition?: RecognitionMetadata;
+}
+export interface RecognitionMetadata {
+  provider: "api" | "subscription";
+  model: string;
+  quality: "fast" | "balanced" | "careful";
+  recognizedAt: string;
+  promptHash: string;
+  glossaryHash: string;
+}
+export interface DeviceOcrPage { fingerprint: string; text: string }
+export interface CleanedPage { fingerprint: string; baseText: string; text: string }
+export interface DocumentCleanup {
+  updatedAt: string;
+  inputHash: string;
+  outputHash: string;
+  model: string;
+  quality: "careful";
+  provider: "api" | "subscription";
+  basePages: PageDescriptor[];
+  stale?: boolean;
 }
 export interface PageIssue {
   fingerprint: string;
@@ -101,6 +125,9 @@ export interface NotebookState {
   order: string[];
   desired: PageDescriptor[];
   pages: Record<string, TranscriptPage>;
+  deviceOcr?: Record<string, DeviceOcrPage>;
+  cleanedPages?: Record<string, CleanedPage>;
+  cleanup?: DocumentCleanup;
   status: ItemStatus;
   paused?: boolean;
   error?: string;
@@ -215,6 +242,10 @@ export interface Controller {
   setNotebookPaused(source: string, paused: boolean): Promise<void>;
   preview(path: string, page: number): Promise<string>;
   manual(path: string, range: string, force?: boolean): Promise<void>;
+  reprocessPages(source: string, range: string, outdatedOnly?: boolean): Promise<void>;
+  reprocessEstimate?(source: string, range: string, outdatedOnly?: boolean): QueueEstimate;
+  cleanupEstimate(source: string): QueueEstimate;
+  cleanupDocument(source: string, options?: { saveCopy?: boolean }): Promise<void>;
   openOutput(path: string): Promise<void>;
   previewTranscriptRecovery(source: string): Promise<{ current: string; generated: string; output: string; revision: string }>;
   resolveTranscriptConflict(source: string, action: "replace" | "keep", expectedCurrent: string, expectedRevision?: string): Promise<{ backup?: string; output: string }>;

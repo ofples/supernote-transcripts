@@ -1,6 +1,10 @@
 # Supernote Transcripts
 
-## Current release: 0.10.2 — installed and sign-in verified
+## Version 0.11 — active on Nomad and desktop Vedas
+
+Source controls, provisional device OCR, readable page provenance, text-only whole-document cleanup, desktop page viewing and MD Reader 2.1.1 page chips are implemented. Validation passes: **377/377** plugin tests, the MD Reader suites (**123** logic and **106** UI checks), and **5/5** page-link browser/integration checks. Guarded activation and installed-byte evidence confirm Nomad Transcripts 0.11.0 active on Nomad and desktop Vedas, with MD Reader 2.1.1 active on Nomad only. Protected state was preserved; both workers remain idle and paused, and activation made zero recognition requests. Synthetic UI checks pass; bounded live UI checks are in progress. No paid calls were made; real provider recognition and cleanup quality were not exercised. See [ENHANCEMENTS.md](ENHANCEMENTS.md) and [VALIDATION.md](VALIDATION.md). Native Digest capture remains deferred.
+
+## Previous installed release: 0.10.2 — sign-in verified
 
 0.10.2 is installed and guarded-verified on desktop Vedas and the Nomad. Desktop-assisted pairing completed over the private Wi-Fi network: the user approved sign-in in the desktop browser, Nomad connected with its own saved credentials, the pending callback cleared, and both relay ports closed. A single `chatgpt.models` catalog GET returned seven models; no model identifiers or names were logged. No recognition or inference request occurred. The Nomad connection screen showed the ChatGPT subscription provider and Connected status; Cancel closed settings without saving, mirrors remained closed, and there were zero forms. The device was connected for installation and inspection over USB; authentication traveled over native Wi-Fi. A full unplugged-use check has not been done. The 346-test suite, typecheck, production build and synthetic pairing UI checks pass. Evidence and remaining scope are in [VALIDATION.md](VALIDATION.md), [SUBSCRIPTION-NOMAD.md](SUBSCRIPTION-NOMAD.md), and [test-artifacts/interface-0.10.2-live-pairing-evidence.json](test-artifacts/interface-0.10.2-live-pairing-evidence.json).
 

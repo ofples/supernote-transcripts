@@ -896,10 +896,10 @@
 
 /* Desktop uses the active Obsidian theme and normal window proportions. */
 .st-fullscreen-modal.st-desktop {
-  width: min(1040px, calc(100vw - 40px));
-  height: min(900px, calc(var(--st-visual-height, 100dvh) - 40px));
-  max-width: calc(100vw - 40px);
-  max-height: calc(var(--st-visual-height, 100dvh) - 40px);
+  width: min(960px, calc(100vw - 40px));
+  height: min(860px, calc(var(--st-visual-height, 100dvh) - 40px));
+  max-width: min(960px, calc(100vw - 40px));
+  max-height: min(860px, calc(var(--st-visual-height, 100dvh) - 40px));
   border: 1px solid var(--background-modifier-border);
   border-radius: var(--radius-l, 8px);
   box-shadow: var(--shadow-l);
@@ -950,7 +950,14 @@
 .st-fullscreen-modal.st-desktop button.st-icon-button {
   flex-basis: 36px;
   width: 36px;
+  height: 36px;
+  min-height: 36px;
   padding: 6px;
+}
+.st-fullscreen-modal.st-desktop .st-head-action.is-active {
+  border: 1px solid var(--interactive-accent);
+  color: var(--interactive-accent);
+  background: var(--background-modifier-hover);
 }
 .st-fullscreen-modal.st-desktop button.st-primary {
   min-width: 100px;
@@ -1052,8 +1059,8 @@
   min-height: 8em;
 }
 .st-fullscreen-modal.st-desktop .st-check-row {
-  min-height: 44px;
-  margin: 10px 0;
+  min-height: 32px;
+  margin: 6px 0;
 }
 .st-fullscreen-modal.st-desktop .st-check-row input[type="checkbox"] {
   width: 18px;
@@ -1131,6 +1138,99 @@
   }
   .st-fullscreen-modal.st-desktop .st-footer {
     padding: 10px 16px max(10px, env(safe-area-inset-bottom));
+  }
+}
+
+/* Source editor tasks and the output-folder picker. */
+.st-fullscreen-modal .st-source-profile-mode {
+  margin: 8px 0 14px;
+  padding: 10px 14px;
+  border: 1px solid var(--st-rule);
+}
+.st-fullscreen-modal .st-source-profile-mode > .st-check-row {
+  margin: 0;
+}
+.st-fullscreen-modal .st-source-profile-overrides {
+  margin-top: 14px;
+}
+.st-fullscreen-modal .st-detail-task {
+  margin: 18px 0 0;
+  padding: 16px 0 0;
+  border-top: 1px solid var(--st-rule);
+}
+.st-fullscreen-modal .st-detail-task > .st-section-heading {
+  margin: 0 0 6px;
+}
+.st-fullscreen-modal .st-detail-task > .st-field {
+  max-width: 420px;
+}
+.st-fullscreen-modal .st-detail-task .st-check-row {
+  max-width: 680px;
+}
+.st-fullscreen-modal .st-cleanup-progress {
+  font-weight: 600;
+}
+.st-fullscreen-modal .st-recognition-history-list {
+  margin: 8px 0 0;
+  padding-left: 22px;
+}
+.st-fullscreen-modal .st-recognition-history-list li + li {
+  margin-top: 4px;
+}
+.st-fullscreen-modal .st-new-folder {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: end;
+  gap: 4px 10px;
+  margin: 8px 0 16px;
+  padding: 12px;
+  border: 1px solid var(--st-rule);
+}
+.st-fullscreen-modal .st-new-folder > .st-field {
+  margin: 0;
+}
+.st-fullscreen-modal .st-new-folder > small {
+  grid-column: 1 / -1;
+}
+.st-fullscreen-modal .st-browser-source-action {
+  align-self: center;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 auto;
+  min-width: 76px;
+  min-height: 48px;
+  border: 1px solid var(--st-rule);
+  text-align: center;
+}
+.st-fullscreen-modal .st-browser-configure {
+  color: var(--text-normal);
+}
+.st-fullscreen-modal.st-desktop .st-browser-source-action {
+  flex-basis: 84px;
+  min-width: 84px;
+  min-height: 34px;
+  padding: 5px 8px;
+  border-color: var(--background-modifier-border);
+  border-radius: var(--button-radius, var(--radius-m, 5px));
+  font-size: var(--font-ui-small);
+  line-height: 1.2;
+}
+.st-fullscreen-modal.st-desktop button.st-browser-configure {
+  background: var(--interactive-normal);
+}
+.st-fullscreen-modal.st-desktop button.st-browser-configure:hover {
+  border-color: var(--interactive-accent);
+  background: var(--interactive-hover);
+}
+.st-fullscreen-modal.st-desktop .st-head-action.is-active {
+  border: 1px solid var(--interactive-accent);
+  color: var(--interactive-accent);
+  background: var(--background-modifier-hover);
+}
+@media (max-width: 520px) {
+  .st-fullscreen-modal .st-new-folder {
+    grid-template-columns: minmax(0, 1fr);
   }
 }
 
@@ -1297,12 +1397,12 @@
 .st-fullscreen-modal.st-desktop .st-output-section,
 .st-fullscreen-modal.st-desktop .st-recognition-section,
 .st-fullscreen-modal.st-desktop .st-settings-section {
-  margin-top: 22px;
-  padding-top: 18px;
+  margin-top: 14px;
+  padding-top: 12px;
 }
 .st-fullscreen-modal.st-desktop .st-field {
   max-width: 680px;
-  margin: 12px 0;
+  margin: 8px 0;
 }
 .st-fullscreen-modal.st-desktop .st-output-choice {
   grid-template-columns: minmax(0, 1fr) auto;

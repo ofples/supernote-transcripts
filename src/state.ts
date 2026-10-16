@@ -1,6 +1,8 @@
 import type { Store } from "./types";
 import { validateDestination, validateSource } from "./reconcile.mjs";
 import { sharedHash } from "./shared";
+// @ts-ignore JavaScript provenance helper is shared with runtime validation.
+import { validRecognition } from "./provenance.mjs";
 
 export interface StateSnapshot { generation: number; store: Store; checksum?: string }
 const record = (v: any): v is Record<string, any> => !!v && typeof v === "object" && !Array.isArray(v);
@@ -25,6 +27,18 @@ function descriptors(v: any): boolean {
   return Array.isArray(v) && v.every((p, i) => record(p) && nonempty(p.id) && nonempty(p.fingerprint) && p.number === i + 1) &&
     new Set(v.map(p => p.id)).size === v.length;
 }
+const boundedText = (v: any, maximum = 1_000_000) => nonempty(v) && v.length <= maximum;
+function keyedPageText(value: any, desired: any[], baseRequired: boolean): boolean {
+  if (!record(value)) return false;
+  const byId = new Map(desired.map((p) => [p.id, p.fingerprint]));
+  return Object.entries(value).every(([id, p]: [string, any]) => record(p) && byId.get(id) === p.fingerprint &&
+    boundedText(p.text) && (!baseRequired || boundedText(p.baseText)));
+}
+function cleanup(value: any): boolean {
+  return record(value) && date(value.updatedAt) && hash(value.inputHash) && hash(value.outputHash) &&
+    boundedText(value.model, 200) && value.quality === "careful" && ["api", "subscription"].includes(value.provider) &&
+    descriptors(value.basePages) && value.basePages.length <= 20000 && optional(value.stale, x => typeof x === "boolean");
+}
 function notebook(v: any, source: string): boolean {
   if (!record(v) || v.source !== source || !path(source, true) || !/\.note$/i.test(source) ||
       !nonempty(v.id) || !nonempty(v.ruleId) || !path(v.output) || !/\.md$/i.test(v.output) ||
@@ -48,6 +62,10 @@ function notebook(v: any, source: string): boolean {
         record(p) && nonempty(p.fingerprint) && integer(p.count))) ||
       !optional(v.executionIssue, issue => record(issue) && ["source", "batch"].includes(issue.scope) &&
         nonempty(issue.reason) && optional(issue.recipe, nonempty))) return false;
+  if (!optional(v.deviceOcr, pages => keyedPageText(pages, v.desired, false)) ||
+      !optional(v.cleanedPages, pages => keyedPageText(pages, v.desired, true)) ||
+      !optional(v.cleanup, cleanup)) return false;
+  if (v.pages && !Object.values(v.pages).every((p: any) => optional(p.recognition, value => validRecognition(value)))) return false;
   return true;
 }
 /** Accept optional fields from previous versions, but never coerce damaged cache into an empty store. */

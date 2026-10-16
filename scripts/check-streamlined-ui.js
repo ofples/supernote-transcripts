@@ -6,7 +6,7 @@ import { mkdir, writeFile } from "node:fs/promises";
 const moduleRoot = "C:/Users/pless/.cache/codex-runtimes/codex-primary-runtime/dependencies/node/node_modules";
 const require = createRequire(import.meta.url);
 const { chromium } = require(join(moduleRoot, "playwright"));
-const out = resolve("private/ux-streamline/evidence");
+const out = resolve("test-artifacts/streamlined-ui-screenshots");
 await mkdir(out, { recursive: true });
 const platforms = ["desktop", "nomad"];
 const reports = [];
@@ -24,9 +24,29 @@ for (const platform of platforms) {
   await page.locator(".st-fullscreen-modal .st-header").waitFor().catch(async (error) => { console.error(JSON.stringify({ errors, body: (await page.locator("body").innerText()).slice(0, 500), boot: await page.evaluate(() => typeof window.__bootStreamlinedFixture), fixture: await page.evaluate(() => typeof window.__streamlinedFixture) })); throw error; });
   await page.screenshot({ path: join(out, `${platform}-1280x900-sources.png`), fullPage: false });
   const root = page.locator(".st-fullscreen-modal");
+  await root.locator('button[aria-label="Settings"]').waitFor();
+  const initialLayout = await page.evaluate(() => {
+    const modal = document.querySelector(".st-fullscreen-modal");
+    const header = modal?.querySelector(".st-header");
+    const settings = modal?.querySelector('button[aria-label="Settings"]');
+    const rect = (element) => {
+      const r = element.getBoundingClientRect();
+      return { x: Math.round(r.x), y: Math.round(r.y), width: Math.round(r.width), height: Math.round(r.height) };
+    };
+    return { viewport: { width: innerWidth, height: innerHeight }, modal: modal && rect(modal), header: header && rect(header), settings: settings && rect(settings) };
+  });
+  assert(initialLayout.modal?.width >= Math.min(initialLayout.viewport.width, 960) - 8 && initialLayout.modal?.height >= Math.min(initialLayout.viewport.height, 860) - 8, `${platform}: main modal is too small for the synthetic viewport: ${JSON.stringify(initialLayout)}`);
+  const compactTarget = platform === "desktop" ? 36 : 48;
+  assert(initialLayout.settings?.width >= compactTarget && initialLayout.settings?.height >= compactTarget, `${platform}: Settings gear target is smaller than ${compactTarget}px`);
   const sourceText = await root.innerText();
   assert(sourceText.includes("Sources") && sourceText.includes("Journal") && sourceText.includes("Research"), `${platform}: synthetic sources missing`);
   assert(await root.locator(".st-rule-row").count() >= 2, `${platform}: expected two synthetic source rows`);
+  const configureLayout = await root.locator('button[aria-label="Configure Research"]').evaluate((button) => {
+    const row = button.closest(".st-rule-row"), b = button.getBoundingClientRect(), r = row.getBoundingClientRect();
+    return { button: { x: Math.round(b.x), y: Math.round(b.y), width: Math.round(b.width), height: Math.round(b.height) }, row: { x: Math.round(r.x), y: Math.round(r.y), width: Math.round(r.width), height: Math.round(r.height) } };
+  });
+  assert(configureLayout.button.width >= compactTarget && configureLayout.button.height >= compactTarget, `${platform}: Configure control is smaller than ${compactTarget}px`);
+  assert(configureLayout.button.x >= configureLayout.row.x && configureLayout.button.x + configureLayout.button.width <= configureLayout.row.x + configureLayout.row.width, `${platform}: Configure control is misaligned outside its source row`);
 
   // Source draft: labelled-row checkbox, selection list, editor Cancel, then in-memory Save.
   const before = await page.evaluate(() => JSON.parse(JSON.stringify((window).__streamlinedFixture.controller.config)));
@@ -63,7 +83,7 @@ for (const platform of platforms) {
   await root.locator(".st-output-browser .st-browser-entry").filter({ hasText: "Fixture Output" }).click();
   await root.getByRole("button", { name: "Choose this folder" }).click();
   await root.locator(".st-instructions summary").click();
-  await root.getByRole("button", { name: "Choose glossary files" }).click();
+  await root.getByRole("button", { name: "Choose reference files" }).click();
   await root.locator(".st-glossary-picker").waitFor();
   const glossaryLabel = root.locator(".st-glossary-picker label").filter({ hasText: "Fixture glossary.md" }).first();
   await glossaryLabel.locator('input[type="checkbox"]').check();
@@ -90,7 +110,19 @@ for (const platform of platforms) {
 
   await root.locator("button[aria-label=\"Settings\"]").click();
   assert((await root.locator("h1").innerText()) === "Settings", `${platform}: Settings header navigation failed`);
+  assert(await root.locator(".st-run-behavior").getByText("Automatic catch-up", { exact: true }).count() === 1, `${platform}: automatic catch-up setting is missing`);
+  assert(await root.locator(".st-recognition-defaults .st-model-picker select").count() === 1, `${platform}: default model selector is missing`);
+  assert(await root.locator(".st-recognition-defaults .st-quality-field input[type=range]").count() === 1, `${platform}: default recognition quality selector is missing`);
+  const settingsGear = await root.locator('button[aria-label="Close settings"]').boundingBox();
+  assert(settingsGear?.width >= compactTarget && settingsGear?.height >= compactTarget, `${platform}: Settings-screen gear target is too small`);
+  const autoBeforeCancel = await page.evaluate(() => ({ enabled: window.__streamlinedFixture.controller.autoEnabled, saves: window.__streamlinedFixture.controller.actionCounters.saveConfig }));
+  const autoToggle = root.locator(".st-run-behavior .st-check-row").nth(1).locator('input[type="checkbox"]');
+  await autoToggle.check();
+  assert(await autoToggle.isChecked(), `${platform}: automatic catch-up control did not toggle`);
+  await page.screenshot({ path: join(out, `${platform}-settings.png`), fullPage: false });
   await root.getByRole("button", { name: "Cancel", exact: true }).click();
+  const autoAfterCancel = await page.evaluate(() => ({ enabled: window.__streamlinedFixture.controller.autoEnabled, saves: window.__streamlinedFixture.controller.actionCounters.saveConfig }));
+  assert(JSON.stringify(autoAfterCancel) === JSON.stringify(autoBeforeCancel), `${platform}: cancelling Settings changed automatic catch-up or saved configuration`);
   await root.getByRole("button", { name: "Queue" }).click();
   await root.locator(".st-queue-live").waitFor();
   assert((await root.locator("h1").innerText()) === "Queue", `${platform}: fixture navigation did not enter Queue`);
@@ -174,7 +206,7 @@ for (const platform of platforms) {
   await c.dispose();
   await browser.close();
   assert(errors.length === 0, `${platform}: browser errors: ${errors.join("; ")}`);
-  reports.push({ platform, passed: true, sourceRows: 2, syntheticNotes: 5, profileIsolation: true, cancelPreserved: true, modelQualityDestinationGlossarySave: true, queuePriorityAndPause: true, subscriptionContextOccurrences: disclaimers, targetPagesAndRequestsDistinct: true, errorRetrySkip: true, recognitionCalls: actions.update });
+  reports.push({ platform, passed: true, modal: initialLayout, configureControl: configureLayout, settingsGear: { width: settingsGear.width, height: settingsGear.height }, compactTargetPx: compactTarget, sourceRows: 2, syntheticNotes: 5, profileIsolation: true, cancelPreserved: true, modelQualityDestinationGlossarySave: true, queuePriorityAndPause: true, subscriptionContextOccurrences: disclaimers, targetPagesAndRequestsDistinct: true, errorRetrySkip: true, recognitionCalls: actions.update });
 }
 const evidence = {
   verificationMode: "headless local browser mock",
@@ -182,11 +214,11 @@ const evidence = {
   network: false,
   runtimeAndVaultWriters: false,
   productionObsidianVerified: false,
-  productionVerification: "pending unlocked desktop",
+  productionVerification: "separate device verification",
   reports,
   screenshots: out,
 };
-const evidencePath = resolve("test-artifacts/interface-0.10.0-ui-evidence.json");
+const evidencePath = resolve("test-artifacts/interface-0.11.0-ui-evidence.json");
 await mkdir(resolve("test-artifacts"), { recursive: true });
 await writeFile(evidencePath, `${JSON.stringify(evidence, null, 2)}\n`);
 console.log(JSON.stringify({ ...evidence, evidencePath }, null, 2));

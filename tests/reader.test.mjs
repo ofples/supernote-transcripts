@@ -8,7 +8,7 @@ const bundle = await build({
   format: "esm",
   write: false,
 });
-const { indexNotebook, AndroidReadOnlySource } = await import(
+const { indexNotebook, openByteNotebook, AndroidReadOnlySource } = await import(
   "data:text/javascript;base64," +
     Buffer.from(bundle.outputFiles[0].text).toString("base64")
 );
@@ -32,6 +32,8 @@ function notebook({
   style = "0",
   layerInfo,
   footerKeys,
+  recognition,
+  recognitionAddress = "",
 } = {}) {
   const signature = new Uint8Array(24);
   signature.set(new TextEncoder().encode("noteSN_FILE_VER_20260016"));
@@ -51,8 +53,9 @@ function notebook({
   const pages = ids.map((id, i) => {
     const bitmap = block(ink[i]);
     const layer = block(`<LAYERNAME:MAINLAYER><LAYERBITMAP:${bitmap}>`);
+    const recogn = recognition === undefined ? 0 : block(new TextEncoder().encode(btoa(JSON.stringify(recognition))));
     return block(
-      `<PAGEID:${id}><MAINLAYER:${layer}><LAYERSEQ:MAINLAYER><PAGESTYLE:${style}><RECOGNSTATUS:${status}>${layerInfo === undefined ? "" : `<LAYERINFO:${layerInfo}>`}`,
+      `<PAGEID:${id}><MAINLAYER:${layer}><LAYERSEQ:MAINLAYER><PAGESTYLE:${style}><RECOGNSTATUS:${status}>${recogn ? `<RECOGNTEXT:${recogn}>` : recognitionAddress ? `<RECOGNTEXT:${recognitionAddress}>` : ""}${layerInfo === undefined ? "" : `<LAYERINFO:${layerInfo}>`}`,
     );
   });
   const f = block(
@@ -101,6 +104,24 @@ test("selective parser preserves native identity across reorder and ignores reco
   assert.equal(a.ids[0], b.ids[1]);
   assert.equal(a.pages[0].fingerprint, b.pages[1].fingerprint);
   assert.equal(a.pages[1].fingerprint, b.pages[0].fingerprint);
+});
+
+test("open notebook reads bounded optional device OCR without changing page fingerprints", async () => {
+  const ocr = { elements: [{ label: "Fixture text", type: "Text", words: [{ label: "Fixture", "bounding-box": { x: 1, y: 1, width: 30, height: 10 } }, { label: "text", "bounding-box": { x: 32, y: 1, width: 20, height: 10 } }] }] };
+  const bytes = notebook({ recognition: ocr });
+  const source = streamed(bytes);
+  const revision = "1:100";
+  const opened = await openByteNotebook("fixture.note", revision, source, async () => revision);
+  assert.equal(await opened.readOcr(1), "Fixture text");
+  assert.equal(await opened.readOcr(2), "Fixture text");
+  opened.close();
+});
+
+test("missing or out-of-bounds recognition address is optional", async () => {
+  const absent = await openByteNotebook("fixture.note", "1:100", streamed(notebook()), async () => "1:100");
+  assert.equal(await absent.readOcr(1), undefined);
+  const invalid = await openByteNotebook("fixture.note", "1:100", streamed(notebook({ recognitionAddress: "999999" })), async () => "1:100");
+  assert.equal(await invalid.readOcr(1), undefined);
 });
 test("bitmap and template changes invalidate page fingerprints", async () => {
   const a = await indexNotebook(streamed(notebook()));

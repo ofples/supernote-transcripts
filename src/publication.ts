@@ -5,6 +5,9 @@ const HASH=/^[a-f0-9]{64}$/;
 const HEADER="<!-- supernote-publication-v2 -->\n";
 type Inventory={id:string;fingerprint:string}[];
 type PublishedResult={id:string;fingerprint:string;textHash:string;recipe:string};
+type PresentationCleanup={updatedAt:string;inputHash:string;outputHash:string;model:string;quality:"careful";provider:"api"|"subscription";basePages:PageDescriptor[];stale?:boolean};
+type CleanedPage={fingerprint:string;baseText:string;text:string};
+export interface ReceiptPresentation { cleanedPages:Record<string,CleanedPage>; cleanup:PresentationCleanup }
 export interface Receipt {
   version:2;
   notebookId:string;
@@ -14,6 +17,7 @@ export interface Receipt {
   results:PublishedResult[];
   createdAt:number;
   supersedes:string[];
+  presentation?:ReceiptPresentation;
   recordId:string;
   /** Concurrent received publications with no known causal ordering. */
   candidates?:Receipt[];
@@ -23,8 +27,31 @@ function inventory(pages:Inventory):Inventory {
     throw Error("Invalid publication page inventory.");
   return pages.map(({id,fingerprint})=>({id,fingerprint}));
 }
+function cleanInventory(pages:unknown):PageDescriptor[] {
+  if(!Array.isArray(pages)||pages.length>20000||pages.some((p,i)=>!p||typeof p.id!=="string"||!p.id||p.id.length>256||/[\\/\u0000-\u001f]/.test(p.id)||typeof p.fingerprint!=="string"||!HASH.test(p.fingerprint)||p.number!==i+1)||new Set(pages.map((p:any)=>p.id)).size!==pages.length)
+    throw Error("Invalid publication presentation inventory.");
+  return pages.map(({id,number,fingerprint}:any)=>({id,number,fingerprint}));
+}
+function presentation(value:unknown, pages:Inventory):ReceiptPresentation {
+  if(!value||typeof value!=="object"||Array.isArray(value))throw Error("Invalid publication presentation.");
+  const v=value as any;
+  if(!v.cleanedPages||typeof v.cleanedPages!=="object"||Array.isArray(v.cleanedPages)||!v.cleanup||typeof v.cleanup!=="object"||Array.isArray(v.cleanup))throw Error("Invalid publication presentation.");
+  const current=new Map(pages.map(p=>[p.id,p.fingerprint]));
+  const cleanedPages:Record<string,CleanedPage>={};
+  for(const [id,p] of Object.entries(v.cleanedPages) as [string,any][]) {
+    if(["__proto__","prototype","constructor"].includes(id)||!current.has(id)||!p||typeof p!=="object"||Array.isArray(p)||p.fingerprint!==current.get(id)||typeof p.baseText!=="string"||!p.baseText.trim()||p.baseText.length>1_000_000||typeof p.text!=="string"||!p.text.trim()||p.text.length>1_000_000)
+      throw Error("Invalid cleaned page presentation.");
+    cleanedPages[id]={fingerprint:p.fingerprint,baseText:p.baseText,text:p.text};
+  }
+  const c=v.cleanup;
+  if(typeof c.updatedAt!=="string"||!Number.isFinite(Date.parse(c.updatedAt))||typeof c.inputHash!=="string"||!HASH.test(c.inputHash)||typeof c.outputHash!=="string"||!HASH.test(c.outputHash)||typeof c.model!=="string"||!c.model.trim()||c.model.length>200||/[\u0000-\u001f]/.test(c.model)||c.quality!=="careful"||!["api","subscription"].includes(c.provider)||!Array.isArray(c.basePages)||c.basePages.length>20000||(c.stale!==undefined&&typeof c.stale!=="boolean"))throw Error("Invalid document cleanup presentation.");
+  const cleanup:PresentationCleanup={updatedAt:c.updatedAt,inputHash:c.inputHash,outputHash:c.outputHash,model:c.model,quality:"careful",provider:c.provider,basePages:cleanInventory(c.basePages)};
+  if(c.stale!==undefined)cleanup.stale=c.stale;
+  return {cleanedPages,cleanup};
+}
 function payload(r:Omit<Receipt,"recordId">){
-  return {version:2,notebookId:r.notebookId,textHash:r.textHash,pages:r.pages,results:r.results,createdAt:r.createdAt,supersedes:r.supersedes};
+  const base={version:2,notebookId:r.notebookId,textHash:r.textHash,pages:r.pages,results:r.results,createdAt:r.createdAt,supersedes:r.supersedes};
+  return r.presentation===undefined?base:{...base,presentation:r.presentation};
 }
 const envelope=(r:Receipt)=>HEADER+JSON.stringify({...payload(r),recordId:r.recordId})+"\n";
 const lexical=(a:string,b:string)=>a<b?-1:a>b?1:0;
@@ -57,6 +84,7 @@ export class PublicationReceipts {
           !r.pages.some((page:any)=>page.id===p.id))||new Set(r.results.map((p:any)=>p.id)).size!==r.results.length)
           throw Error("Invalid publication result provenance.");
         r.results=r.results.map(({id,fingerprint,textHash,recipe}:PublishedResult)=>({id,fingerprint,textHash,recipe}));
+        if(r.presentation!==undefined)r.presentation=presentation(r.presentation,r.pages);
         if(await sharedHash(JSON.stringify(payload(r)))!==r.recordId||!path.slice(path.lastIndexOf("/")+1).startsWith(r.recordId))
           throw Error("Publication metadata integrity failed.");
         records.set(r.recordId,{...payload(r),version:2,recordId:r.recordId});
@@ -67,7 +95,7 @@ export class PublicationReceipts {
     if(records.size&&!tips.length)invalid=true;
     return {tips,invalid};
   }
-  async save(id:string,text:string,pages:PageDescriptor[],localResults?:NotebookState["pages"]):Promise<void>{
+  async save(id:string,text:string,pages:PageDescriptor[],localResults?:NotebookState["pages"],presentationOverlay?:ReceiptPresentation):Promise<void>{
     const h=await sharedHash(text),ordered=inventory(pages),folder=this.folder(id,h);
     const results:PublishedResult[]=[];
     for(const page of ordered){
@@ -76,12 +104,13 @@ export class PublicationReceipts {
         throw Error("Invalid publication result provenance.");
       results.push({id:page.id,fingerprint:result.fingerprint,textHash:await sharedHash(result.text),recipe:result.recipe});
     }
+    const overlay=presentationOverlay===undefined?undefined:presentation(presentationOverlay,ordered);
     const {tips,invalid}=await this.received(id,h);
     if(invalid)throw Error("Shared publication metadata is damaged. Previous receipts are retained.");
-    if(tips.length===1&&same(tips[0].pages,ordered)&&JSON.stringify(tips[0].results)===JSON.stringify(results))return;
+    if(tips.length===1&&same(tips[0].pages,ordered)&&JSON.stringify(tips[0].results)===JSON.stringify(results)&&JSON.stringify(tips[0].presentation)===JSON.stringify(overlay))return;
     const createdAt=this.now();
     if(!Number.isSafeInteger(createdAt)||createdAt<0)throw Error("Invalid publication timestamp.");
-    const p={version:2 as const,notebookId:id,textHash:h,pages:ordered,results,createdAt,supersedes:tips.map(r=>r.recordId).sort(lexical)};
+    const p={version:2 as const,notebookId:id,textHash:h,pages:ordered,results,createdAt,supersedes:tips.map(r=>r.recordId).sort(lexical),...(overlay===undefined?{}:{presentation:overlay})};
     const recordId=await sharedHash(JSON.stringify(payload(p))),r:Receipt={...p,recordId},path=`${folder}/${recordId}.md`,body=envelope(r);
     const parts=folder.split("/");
     for(let n=1;n<=parts.length;n++){

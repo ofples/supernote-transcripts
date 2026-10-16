@@ -53,7 +53,7 @@ export function completedResponse(response, streamedText = "", streamRefusal = f
   if (streamRefusal || content.some(c => c?.type === "refusal"))
     throw new RecognitionFailure("refusal", "The model declined to transcribe this page. Review its instructions, retry it explicitly, or skip it.", { response, usage: response.usage, outcomeKnown: true });
   const canonical = content.filter(c => c?.type === "output_text" && typeof c.text === "string").map(c => c.text).join("\n");
-  try { return { text: normalizePageText(canonical || streamedText), usage: response.usage }; }
+  try { return { text: normalizePageText(canonical || streamedText), usage: response.usage, ...(typeof response.model === "string" && response.model.length <= 200 ? {model:response.model} : {}) }; }
   catch (error) { throw new RecognitionFailure("empty_response", error.message, { response, usage: response.usage, outcomeKnown: true }); }
 }
 export function catalogModels(catalog) {

@@ -1,0 +1,155 @@
+import test from "node:test";
+import assert from "node:assert/strict";
+import { build } from "esbuild";
+
+class FakeNode {
+  constructor() { this.children = []; this.childNodes = this.children; this.dataset = {}; this.attributes = {}; this.listeners = {}; }
+  appendChild(node) { node.parentNode = this; this.children.push(node); return node; }
+  replaceChildren(...nodes) { this.children = nodes; this.childNodes = this.children; for (const node of nodes) node.parentNode = this; }
+  querySelectorAll(selector) { return selector === "a[href]" ? this.children.filter(node => node.tagName === "A") : []; }
+  setAttribute(name, value) { this.attributes[name] = String(value); }
+  getAttribute(name) { return this.attributes[name] ?? null; }
+  removeAttribute(name) { delete this.attributes[name]; }
+  addEventListener(name, listener) { (this.listeners[name] ??= []).push(listener); }
+  replaceWith(node) {
+    const index = this.parentNode.children.indexOf(this);
+    if (index >= 0) this.parentNode.children.splice(index, 1, node);
+    node.parentNode = this.parentNode;
+  }
+}
+
+class FakeButton extends FakeNode {
+  constructor() { super(); this.tagName = "BUTTON"; }
+}
+class FakeAnchor extends FakeNode {
+  constructor(href) { super(); this.tagName = "A"; this.attributes.href = href; }
+}
+globalThis.document = { createElement(tag) { return tag === "button" ? new FakeButton() : new FakeNode(); } };
+globalThis.FakeAnchor = FakeAnchor;
+
+const mocks = {
+  obsidian: `
+    export const editorInfoField = {};
+    export const editorLivePreviewField = {};
+    export const MarkdownRenderer = { async render(_app, markdown, target) {
+      const pattern = /\\[[^\\]]+\\]\\((obsidian:\\/\\/[^)\\s]+)\\)/g;
+      for (const match of markdown.matchAll(pattern)) target.appendChild(new globalThis.FakeAnchor(match[1]));
+    } };
+    export class MarkdownRenderChild {}
+    export class MarkdownView {}
+    export class TFile { static [Symbol.hasInstance](value) { return value?.isTFile === true; } }
+  `,
+  "@codemirror/view": `
+    export class Decoration { static replace(value) { return value; } static widget(value) { return value; } }
+    export class WidgetType {}
+    export class EditorView { static decorations = { from() {} }; }
+    export class ViewPlugin { static fromClass(value) { return value; } }
+  `,
+  "@codemirror/state": `
+    export class RangeSetBuilder { add() {} finish() { return []; } }
+    export class StateEffect { static define() { return { of(value) { return { value }; }, is() { return false; } }; } }
+    export class StateField { static define(value) { return value; } }
+  `,
+};
+const bundled = await build({
+  entryPoints: ["src/page-links-ui.ts"], bundle: true, platform: "node", format: "esm", write: false,
+  plugins: [{ name: "test-mocks", setup(buildApi) {
+    buildApi.onResolve({ filter: /^(obsidian|@codemirror\/view|@codemirror\/state)$/ }, args => ({ path: args.path, namespace: "test-mock" }));
+    buildApi.onLoad({ filter: /.*/, namespace: "test-mock" }, args => ({ contents: mocks[args.path], loader: "js" }));
+  } }],
+});
+const { installPageLinks } = await import("data:text/javascript;base64," + Buffer.from(bundled.outputFiles[0].text).toString("base64"));
+
+const source = [
+  "---", "nomad_transcripts: true", "---", "",
+  "# Repeat", "<!-- supernote-page:native%3Afirst number:1 -->", "", "Repeated chapter text.", "",
+  "# Repeat", "<!-- supernote-page:native%3Asecond number:2 -->", "", "Repeated chapter text.",
+].join("\n");
+const files = new Map([["Transcripts/book.md", { path: "Transcripts/book.md", extension: "md", isTFile: true }]]);
+let enabled = true;
+const cleanups = [];
+const plugin = {
+  app: {
+    vault: {
+      getAbstractFileByPath(path) { return files.get(path) ?? null; },
+      async cachedRead(file) { return file.path === "Transcripts/book.md" ? source : ""; },
+    },
+    workspace: { updateOptions() {}, getLeavesOfType() { return []; } },
+  },
+  register() {},
+  registerEditorExtension() {},
+  registerMarkdownPostProcessor() {},
+};
+
+test("reader chapters validate page ids against their exact canonical source lines", async () => {
+  installPageLinks(plugin, async () => {}, () => enabled);
+  const firstElement = new FakeNode();
+  const secondElement = new FakeNode();
+  const firstMarkdown = "# Repeat\n<!-- supernote-page:native%3Afirst number:1 -->\n\nRepeated chapter text.";
+  const secondMarkdown = "# Repeat\n<!-- supernote-page:native%3Asecond number:2 -->\n\nRepeated chapter text.";
+  assert.equal(await plugin.pageLinks.renderSection({
+    element: firstElement, sourcePath: "Transcripts/book.md", markdown: firstMarkdown,
+    sourceLineMap: [4, 5, 6, 7], component: {},
+  }), true);
+  assert.equal(await plugin.pageLinks.renderSection({
+    element: secondElement, sourcePath: "Transcripts/book.md", markdown: secondMarkdown,
+    sourceLineMap: [9, 10, 11, 12], component: {},
+  }), true);
+  assert.deepEqual(firstElement.children.map(button => button.textContent), ["p.1 ↗"]);
+  assert.deepEqual(secondElement.children.map(button => button.textContent), ["p.2 ↗"]);
+  await plugin.pageLinks.renderSection({
+    element: firstElement, sourcePath: "Transcripts/book.md", markdown: firstMarkdown,
+    sourceLineMap: [4, 5, 6, 7], component: {},
+  });
+  assert.deepEqual(firstElement.children.map(button => button.textContent), ["p.1 ↗"]);
+});
+
+test("reader hook rejects spoofed markers and respects the page-link toggle", async () => {
+  const target = new FakeNode();
+  const markdown = "# Repeat\n<!-- supernote-page:native%3Asecond number:2 -->\n\nRepeated chapter text.";
+  assert.equal(await plugin.pageLinks.renderSection({
+    element: target, sourcePath: "Transcripts/book.md", markdown,
+    sourceLineMap: [4, 5, 6, 7], component: {},
+  }), false);
+  assert.equal(target.children.length, 0);
+  enabled = false;
+  let readCount = 0;
+  const cachedRead = plugin.app.vault.cachedRead;
+  plugin.app.vault.cachedRead = async file => { readCount++; return cachedRead(file); };
+  assert.equal(await plugin.pageLinks.renderSection({
+    element: target, sourcePath: "Transcripts/book.md", markdown: "# Repeat\n<!-- supernote-page:native%3Afirst number:1 -->\n\nRepeated chapter text.",
+    sourceLineMap: [4, 5, 6, 7], component: {},
+  }), false);
+  assert.equal(readCount, 0);
+  enabled = true;
+});
+
+test("reader chips open the validated stable page and plugin unload removes the API", async () => {
+  const opened = [];
+  const localPlugin = {
+    ...plugin,
+    app: plugin.app,
+    register(callback) { cleanups.push(callback); },
+  };
+  installPageLinks(localPlugin, async (...args) => { opened.push(args); }, () => enabled);
+  const target = new FakeNode();
+  await localPlugin.pageLinks.renderSection({
+    element: target, sourcePath: "Transcripts/book.md",
+    markdown: "# Repeat\n<!-- supernote-page:native%3Afirst number:1 -->\n\nRepeated chapter text.",
+    sourceLineMap: [4, 5, 6, 7], component: {},
+  });
+  target.children[0].listeners.click[0]({ preventDefault() {}, stopPropagation() {} });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.deepEqual(opened, [["Transcripts/book.md", "native:first", 1]]);
+  cleanups.forEach(cleanup => cleanup());
+  assert.equal(localPlugin.pageLinks, undefined);
+});
+
+test("page-link refresh invalidates open MD Reader chapters through its optional hook", () => {
+  let refreshed = 0;
+  plugin.app.plugins = { plugins: { "md-reader": { refreshTranscriptLinks() { refreshed++; } } } };
+  const controller = installPageLinks(plugin, async () => {}, () => enabled);
+  controller.refresh();
+  assert.equal(refreshed, 1);
+  delete plugin.app.plugins;
+});

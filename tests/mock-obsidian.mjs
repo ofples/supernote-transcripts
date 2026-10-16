@@ -22,6 +22,23 @@ export class Plugin {
   registerEditorExtension() {}
   registerMarkdownPostProcessor() {}
 }
+export class Modal {
+  constructor(app) {
+    this.app = app;
+    this.titleEl = { setText: text => { this.title = text; } };
+    this.contentEl = {
+      children: [],
+      createEl: (tag, options = {}) => {
+        const element = { tag, ...options, style: {} };
+        this.contentEl.children.push(element);
+        return element;
+      },
+      empty: () => { this.contentEl.children.length = 0; },
+    };
+  }
+  open() { (this.app.modalOpens ??= []).push(this); this.onOpen?.(); }
+  close() { this.onClose?.(); }
+}
 export class MarkdownRenderChild {}
 export class TFile {}
 export const MarkdownRenderer = { render: async () => {} };

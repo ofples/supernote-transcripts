@@ -1,3 +1,7 @@
+import type { RecognitionMetadata } from "./types";
+// @ts-ignore JavaScript provenance helper is shared with the runtime.
+import { recognitionFields, validRecognition } from "./provenance.mjs";
+
 /** Shared files are ordinary Markdown so default Obsidian Sync includes them.
  * Leases reduce duplicate work; local files plus delayed Sync cannot provide an
  * atomic lock or exactly-once requests. Never store credentials in these files.
@@ -30,6 +34,7 @@ export interface SharedResult extends SharedQuery {
   textHash: string;
   deviceId: string;
   createdAt: number;
+  recognition?: RecognitionMetadata;
   nonce: string;
   recordId: string;
   path: string;
@@ -97,9 +102,14 @@ function decode(text: string): any {
   return result;
 }
 function resultPayload(r: any) {
-  return { kind: "result", version: 1, notebookId: r.notebookId, pageId: r.pageId,
+  const payload = { kind: "result", version: 1, notebookId: r.notebookId, pageId: r.pageId,
     fingerprint: r.fingerprint, recipe: r.recipe, text: r.text, textHash: r.textHash,
     deviceId: r.deviceId, createdAt: r.createdAt, nonce: r.nonce };
+  if (r.recognition !== undefined) {
+    if (!validRecognition(r.recognition)) throw new Error("Invalid shared recognition metadata.");
+    return { ...payload, recognition: recognitionFields(r.recognition) };
+  }
+  return payload;
 }
 function claimPayload(c: Claim): Claim {
   return { kind: "claim", version: 1, notebookId: c.notebookId, deviceId: c.deviceId,
@@ -164,10 +174,11 @@ export class SharedNotebookCache {
     const key = await sharedHash(JSON.stringify([query.pageId, query.fingerprint, query.recipe]));
     return `${this.folder(query.notebookId)}/results/${key}`;
   }
-  async saveResult(query: SharedQuery, text: string): Promise<SharedResult> {
+  async saveResult(query: SharedQuery, text: string, recognition?: RecognitionMetadata): Promise<SharedResult> {
     if (!queryOK(query) || typeof text !== "string" || !text.trim()) throw new Error("Invalid successful shared result.");
+    if (recognition !== undefined && !validRecognition(recognition)) throw new Error("Invalid shared recognition metadata.");
     // Whitelist fields; callers cannot leak profile credentials or local paths.
-    const payload = resultPayload({ ...query, text, textHash: await sharedHash(text),
+    const payload = resultPayload({ ...query, text, textHash: await sharedHash(text), recognition,
       deviceId: this.deviceId, createdAt: this.now(), nonce: this.nonce() });
     if (!time(payload.createdAt) || !nonempty(payload.nonce)) throw new Error("Invalid shared result metadata.");
     const recordId = await sharedHash(JSON.stringify(payload));

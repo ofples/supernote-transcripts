@@ -238,6 +238,122 @@ test("continuous updates drain a notebook beyond the old batch size", async () =
   assert.equal(f.plugin.costs.total.requests, 7);
 });
 
+function withOcr(f, readOcr) {
+  const open=f.reader.open;
+  f.reader.open=async(...args)=>{const notebook=await open(...args);notebook.readOcr=readOcr;return notebook;};
+}
+test("device OCR can publish provisionally with AI disabled but is not counted as a recognized page",async()=>{
+  const f=fixture(3);withOcr(f,async n=>n===2?"device-only words":undefined);f.plugin.aiEnabled=false;
+  await f.plugin.update();const state=f.plugin.store.notebooks[source];
+  assert.equal(f.calls.length,0);assert.equal(state.deviceOcr["native:2"].text,"device-only words");assert.deepEqual(state.pages,{});
+  assert.notEqual(state.status,"current");assert.match(f.files.get("Mirror/a.md"),/device-only words/);
+  assert.equal(f.plugin.progress.recognized,0);
+});
+
+test("bad or missing page OCR does not block later provisional page text",async()=>{
+  const f=fixture(3);withOcr(f,async n=>n===3?"later device words":undefined);f.plugin.aiEnabled=false;
+  await f.plugin.update();const state=f.plugin.store.notebooks[source];
+  assert.equal(f.calls.length,0);assert.equal(state.deviceOcr["native:1"],undefined);assert.equal(state.deviceOcr["native:2"],undefined);
+  assert.equal(state.deviceOcr["native:3"].text,"later device words");assert.match(f.files.get("Mirror/a.md"),/later device words/);
+});
+
+test("AI page recognition takes precedence over and replaces its provisional OCR",async()=>{
+  const f=fixture(1);withOcr(f,async()=>"unverified device words");f.plugin.aiEnabled=false;await f.plugin.update();
+  assert.match(f.files.get("Mirror/a.md"),/unverified device words/);f.plugin.aiEnabled=true;await f.plugin.update();
+  const state=f.plugin.store.notebooks[source];assert.equal(state.pages["native:1"].text,"text 1");
+  assert.match(f.files.get("Mirror/a.md"),/text 1/);assert.doesNotMatch(f.files.get("Mirror/a.md"),/unverified device words/);
+});
+
+test("automatic catch-up honors a source auto-recognition opt-out while explicit Update still works",async()=>{
+  const f=fixture(2);f.plugin.config.continuous=true;f.plugin.config.rules[0].autoRecognize=false;
+  await f.plugin.update(true);assert.equal(f.calls.length,0);assert.equal(f.plugin.store.queue.some(task=>task.source===source),true);
+  await f.plugin.update(false);assert.ok(f.calls.length===2,JSON.stringify({queue:f.plugin.store.queue,state:f.plugin.store.notebooks[source],stage:f.plugin.progress.stage,ai:f.plugin.aiEnabled,paused:f.plugin.progress.paused}));assert.equal(f.plugin.store.notebooks[source].status,"current");
+});
+
+test("selected reprocessing honors comma/range selection, clears only selected issues, and filters outdated recipes",async()=>{
+  const f=fixture(4);f.plugin.config.continuous=true;await f.plugin.update();const state=f.plugin.store.notebooks[source];
+  state.pageIssues={"native:1":{fingerprint:"f1",number:1,status:"failed",kind:"provider",reason:"old issue",attempts:1,updatedAt:new Date().toISOString()},"native:2":{fingerprint:"f2",number:2,status:"failed",kind:"provider",reason:"keep issue",attempts:1,updatedAt:new Date().toISOString()}};
+  const start=f.calls.length;await f.plugin.reprocessPages(source,"1, 3-4");
+  assert.deepEqual(f.calls.slice(start).flatMap(requestedPages),[1,3,4]);assert.equal(state.pageIssues["native:1"],undefined);
+  assert.equal(state.pageIssues["native:2"].reason,"keep issue");state.pages["native:1"].recipe="outdated-recipe";
+  const before=f.calls.length;await f.plugin.reprocessPages(source,"",true);
+  assert.deepEqual(f.calls.slice(before).flatMap(requestedPages),[1]);assert.equal(state.pages["native:1"].recipe!="outdated-recipe",true);
+});
+
+test("page reprocessing follows the selected stable page ID when the notebook reorders before reading",async()=>{
+  const f=fixture(3);f.plugin.config.continuous=true;await f.plugin.update();const state=f.plugin.store.notebooks[source],before=f.calls.length;
+  const open=f.reader.open;let reordered=false;f.reader.open=async(...args)=>{if(!reordered){reordered=true;f.change([{id:"native:2",number:1,fingerprint:"f2"},{id:"native:1",number:2,fingerprint:"f1"},{id:"native:3",number:3,fingerprint:"f3"}]);}return open(...args);};
+  await f.plugin.reprocessPages(source,"1");
+  assert.deepEqual(f.calls.slice(before).flatMap(requestedPages),[2]);assert.equal(state.pages["native:1"].number,2);assert.equal(state.pages["native:2"].text,"text 2");
+});
+
+function enableCleanupApi(f){
+  const profile=f.plugin.config.profiles[0];profile.model="gpt-6.1-sol";profile.endpoint="https://api.openai.com/v1/responses";
+  f.plugin.saveCostSettings({...f.plugin.costs.settings,prices:[...f.plugin.costs.settings.prices,{endpoint:profile.endpoint,model:profile.model,input:1,cached:0.1,cacheWrite:1.25,output:1,longThreshold:272000,longInputMultiplier:2,longOutputMultiplier:1.5}]});
+}
+function cleanupResponse(f,textForPage=number=>`clean page ${number}`){
+  globalThis.__response=async request=>{const body=JSON.parse(request.body);f.calls.push(body);const prompt=body.input?.[0]?.content?.find(item=>item.type==="input_text")?.text??"";
+    if(prompt.includes("Clean this entire document")){const pages=f.plugin.store.notebooks[source].desired.map(page=>({number:page.number,text:textForPage(page.number),joinPrevious:false}));return answer(JSON.stringify({pages}),body);}
+    return answer(`recognized ${f.calls.length}`,body);
+  };
+}
+async function populatedCleanupFixture(count=2){
+  const f=fixture(count);f.plugin.config.continuous=true;enableCleanupApi(f);await f.plugin.update();cleanupResponse(f);return f;
+}
+
+test("document cleanup uses one text-only high-reasoning request, backs up and preserves raw AI cache",async()=>{
+  const f=await populatedCleanupFixture(2),state=f.plugin.store.notebooks[source],raw=structuredClone(state.pages),before=f.files.get("Mirror/a.md"),calls=f.calls.length,requests=f.plugin.costs.total.requests,pages=f.plugin.costs.total.pages;
+  await f.plugin.cleanupDocument(source);const request=f.calls.at(-1),content=request.input[0].content;
+  assert.equal(f.calls.length,calls+1);assert.equal(content.filter(item=>item.type==="input_image").length,0);assert.equal(content.filter(item=>item.type==="input_text").length,1);
+  assert.equal(request.reasoning.effort,"high");assert.match(content[0].text,/Original page map/);assert.match(content[0].text,/Page 1/);assert.match(content[0].text,/Page 2/);
+  assert.equal(f.plugin.costs.total.requests,requests+1);assert.equal(f.plugin.costs.total.pages,pages+2);assert.deepEqual(state.pages,raw);
+  assert.notEqual(f.files.get("Mirror/a.md"),before);assert.match(f.files.get("Mirror/a.md"),/clean page 1/);assert.match(f.files.get("Mirror/a.md"),/clean page 2/);
+  const history=[...f.files.entries()].filter(([path,text])=>path.startsWith("Supernote Transcripts/History/")&&path.endsWith(".md")&&text===before);assert.equal(history.length,1);
+});
+
+test("cleanup output remains overlaid when pages append and only changed page cleanup is invalidated",async()=>{
+  const f=await populatedCleanupFixture(2);await f.plugin.cleanupDocument(source);let state=f.plugin.store.notebooks[source];
+  f.change([...state.desired,{id:"native:3",number:3,fingerprint:"f3"}]);await f.plugin.update();state=f.plugin.store.notebooks[source];
+  assert.equal(state.cleanedPages["native:1"].text,"clean page 1");assert.equal(state.cleanedPages["native:2"].text,"clean page 2");assert.equal(state.cleanup.stale,true);
+  assert.match(f.files.get("Mirror/a.md"),/clean page 1/);assert.match(f.files.get("Mirror/a.md"),/recognized/);
+  f.change([{...state.desired[0],fingerprint:"f1-edited"},...state.desired.slice(1)]);await f.plugin.update();state=f.plugin.store.notebooks[source];
+  assert.equal(state.cleanedPages["native:1"],undefined);assert.equal(state.cleanedPages["native:2"].text,"clean page 2");
+  assert.match(f.files.get("Mirror/a.md"),/clean page 2/);assert.equal(state.pages["native:1"].fingerprint,"f1-edited");
+});
+
+test("cleanup respects API budget admission before dispatch",async()=>{
+  const f=await populatedCleanupFixture(1),before=f.files.get("Mirror/a.md"),calls=f.calls.length;
+  f.plugin.saveCostSettings({...f.plugin.costs.settings,runUsd:0});
+  await assert.rejects(f.plugin.cleanupDocument(source),/limit|spending|budget/i);
+  assert.equal(f.calls.length,calls);assert.equal(f.files.get("Mirror/a.md"),before);
+});
+
+test("pausing a source during cleanup token preflight prevents reservation and dispatch",async()=>{
+  const f=await populatedCleanupFixture(1),before=f.files.get("Mirror/a.md"),requests=f.plugin.costs.total.requests,calls=f.calls.length;
+  globalThis.__tokenCount=async()=>{f.plugin.config.rules[0].paused=true;return {status:200,json:{input_tokens:100}};};
+  await f.plugin.cleanupDocument(source);
+  assert.equal(f.calls.length,calls);assert.equal(f.plugin.costs.total.requests,requests);assert.equal(f.files.get("Mirror/a.md"),before);
+});
+
+test("transcript edits during cleanup remain intact and the paid cleanup result is recoverable",async()=>{
+  const f=await populatedCleanupFixture(1),state=f.plugin.store.notebooks[source],raw=structuredClone(state.pages),current=f.files.get("Mirror/a.md");
+  let entered;const dispatched=new Promise(resolve=>{entered=resolve;});let release;const gate=new Promise(resolve=>{release=resolve;});
+  globalThis.__response=async request=>{const body=JSON.parse(request.body);f.calls.push(body);const prompt=body.input?.[0]?.content?.[0]?.text??"";if(prompt.includes("Clean this entire document")){entered();await gate;return answer(JSON.stringify({pages:[{number:1,text:"recovered cleaned result",joinPrevious:false}]}),body);}return answer("unused",body);};
+  const operation=f.plugin.cleanupDocument(source);await dispatched;f.files.set(state.output,"User changed this while cleanup was running.");release();
+  await assert.rejects(operation,/changed during cleanup|changed before cleanup/);
+  assert.equal(f.files.get(state.output),"User changed this while cleanup was running.");assert.deepEqual(state.pages,raw);
+  const recovered=[...f.files.entries()].find(([path])=>path.endsWith("-cleanup-result.md"));assert.ok(recovered);assert.match(recovered[1],/recovered cleaned result/);assert.notEqual(current,f.files.get(state.output));
+});
+
+test("profile and output changes during cleanup preserve the current transcript and save paid result to History",async()=>{
+  const f=await populatedCleanupFixture(1),state=f.plugin.store.notebooks[source],current=f.files.get(state.output);
+  let entered;const dispatched=new Promise(resolve=>{entered=resolve;});let release;const gate=new Promise(resolve=>{release=resolve;});
+  globalThis.__response=async request=>{const body=JSON.parse(request.body);f.calls.push(body);const prompt=body.input?.[0]?.content?.[0]?.text??"";if(prompt.includes("Clean this entire document")){entered();await gate;return answer(JSON.stringify({pages:[{number:1,text:"paid result after settings changed",joinPrevious:false}]}),body);}return answer("unused",body);};
+  const operation=f.plugin.cleanupDocument(source);await dispatched;f.plugin.config.profiles[0].prompt="changed while request was running";state.outputOverride="Mirror/new-output.md";release();
+  await assert.rejects(operation,/settings.*changed|transcript changed/);assert.equal(f.files.get(state.output),current);assert.equal(f.files.has("Mirror/new-output.md"),false);
+  const recovered=[...f.files.entries()].find(([path])=>path.endsWith("-cleanup-result.md"));assert.ok(recovered);assert.match(recovered[1],/paid result after settings changed/);
+});
+
 function folderFixture() {
   const f = fixture(1),
     nested = "/storage/emulated/0/Note/Reflections/Branch/b.note",
@@ -1764,7 +1880,7 @@ test("runtime deduplicates simultaneous page opens", async () => {
   assert.equal(urls.length, 1);
 });
 
-test("runtime does not open a removed page and reports desktop usage", async () => {
+test("runtime does not open a removed page and desktop uses its viewer or verified image fallback", async () => {
   const removed = await pageNavigationFixture();
   removed.f.change([{ id: "native:2", number: 1, fingerprint: "f2" }]);
   await assert.rejects(removed.f.plugin.openNotebookPage(removed.state.output, "native:1", 1), /removed|identity changed/);
@@ -1772,7 +1888,25 @@ test("runtime does not open a removed page and reports desktop usage", async () 
 
   const desktop = await pageNavigationFixture();
   globalThis.__desktop = true;
-  await assert.rejects(desktop.f.plugin.openNotebookPage(desktop.state.output, "native:1", 1), /on your Supernote/);
-  assert.equal(desktop.opened.length, 0);
+  const desktopPath="/storage/emulated/0/Note/Reflections/a.note";
+  desktop.f.rename(desktopPath);desktop.state.source=desktopPath;
+  desktop.f.app.vault.adapter.getBasePath=()=>"/storage/emulated/0/Note";
+  desktop.f.app.plugins={plugins:{"supernote-cloud-sync":{}}};
+  let viewerArguments;desktop.f.app.workspace.openLinkText=async(...args)=>{viewerArguments=args;};
+  await desktop.f.plugin.openNotebookPage(desktop.state.output,"native:1",1);
+  assert.deepEqual(viewerArguments,["Reflections/a.note#page=1",desktop.state.output,true]);
+  assert.equal(desktop.f.app.modalOpens,undefined);
   assert.equal(desktop.urls.length, 0);
+
+  const fallback=await pageNavigationFixture();globalThis.__desktop=true;
+  fallback.f.rename(desktopPath);fallback.state.source=desktopPath;
+  fallback.f.app.vault.adapter.getBasePath=()=>"/storage/emulated/0/Note";
+  await fallback.f.plugin.openNotebookPage(fallback.state.output,"native:1",1);
+  assert.equal(fallback.f.app.modalOpens.length,1);assert.equal(fallback.f.app.modalOpens[0].title,"Original notebook · page 1");
+  assert.equal(fallback.f.app.modalOpens[0].contentEl.children[0].attr.src,"image:1");
+
+  const missing=await pageNavigationFixture();globalThis.__desktop=true;
+  missing.f.reader.open=async()=>{throw Error("missing local source");};
+  await assert.rejects(missing.f.plugin.openNotebookPage(missing.state.output,"native:1",1),/original notebook could not be read/);
+  assert.equal(missing.f.app.modalOpens,undefined);
 });

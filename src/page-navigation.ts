@@ -20,6 +20,7 @@ export interface NavigationOptions {
   reader: ReadOnlySource;
   readTranscript: (path: string) => Promise<string>;
   sharedIO?: SharedIO;
+  platform?: "nomad" | "desktop";
 }
 
 export function validateNavigationRequest(request: PageNavigationRequest): void {
@@ -66,7 +67,7 @@ export async function resolveNotePage(request: PageNavigationRequest, options: N
   const text = await options.readTranscript(request.outputPath);
   if (!isManagedTranscript(text)) throw Error("Page links are available in generated Supernote transcripts.");
   const state = await sourceForTranscript(request, options, text);
-  const path = validateSource(state.source, "nomad");
+  const path = validateSource(state.source, options.platform ?? "nomad");
   if (!/\.note$/i.test(path)) throw Error("The original source is not a Supernote notebook.");
   let opened;
   try { opened = await options.reader.open(path); }

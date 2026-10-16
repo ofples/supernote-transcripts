@@ -1,6 +1,14 @@
 # Validation — 16 October 2026
 
-## Version 0.10.2 — installed; LAN sign-in verified
+## Version 0.11 — active on Nomad and desktop; bounded live UI checks in progress
+
+- `npm test` passes **377/377**, `npm run check` passes, and the production build passes.
+- MD Reader 2.1.1 checks pass: **123/123** logic and **106/106** UI checks. Page-link browser and integration checks pass **5/5**, including real DOM placement before pagination, duplicate chapter mappings, and optional refresh behavior.
+- Synthetic desktop and Nomad UI fixtures pass with no network requests or recognition calls. The source editor, Settings, automatic catch-up draft, model/quality/destination controls and queue actions were exercised. Evidence and screenshots are generated under ignored `test-artifacts/`.
+- This verification did not make paid calls or exercise real provider recognition or whole-document cleanup quality. Mock results do not establish provider quality.
+- Guarded activation completed on the Nomad with Nomad Transcripts 0.11.0 and MD Reader 2.1.1 active; all six installed artifacts matched their approved hashes. Desktop Vedas has Nomad Transcripts 0.11.0 active with all three approved hashes matching; MD Reader is absent there and its existing state was preserved. Activation preserved protected configuration, caches, error/state records, managed Markdown, ledgers, sessions and (on Nomad) reader data/settings. Both workers are connected, idle, paused and unblocked, with zero forms and zero recognition requests. Nomad has five notebooks and two queued items; desktop has two notebooks and one queued item. See the private activation and byte evidence under `private/device-evidence/2026-10-16/` (`activation-evidence-0.11.json`, `desktop-activation-evidence-0.11.json`, `active-byte-evidence-0.11.json`, `desktop-active-byte-evidence-0.11.json`). Bounded live UI checks are still in progress and are not claimed here.
+
+## Previous installed release: Version 0.10.2 — LAN sign-in verified
 
 - The experimental device-code compatibility POST, using Nomad’s own issued registration, returned **HTTP 400 `invalid_client`**. No device code was returned, so no poll or token exchange followed; no AI request was made. This result applies to the tested registration/request and does not establish that all device-code flows are impossible.
 - The desktop-assisted pairing fallback is implemented: temporary private-IPv4 LAN host, 128-bit temporary code, purpose-bound HKDF/AES-GCM request and result messages, loopback-only desktop OAuth callback, encrypted result available until acknowledgment or expiry, ten-minute expiration, and cancellation. Only the OAuth code exchange is one-use. The Nomad creates and exchanges its own PKCE authorization and saves credentials in its own encrypted SecretStorage. No desktop token or shared-vault configuration is transferred.
