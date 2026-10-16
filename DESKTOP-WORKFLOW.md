@@ -1,5 +1,7 @@
 # Desktop Cloud Sync and Nomad workflow
 
+New to the setup? Start with the [complete installation and workflow walkthrough](docs/workflow.md), which explains each service, both devices, exclusions, shared settings and page links. This page is a shorter operational reference.
+
 Use the same Obsidian Sync vault for transcripts and shared recognition data. Each device chooses its own local location for original notebooks.
 
 ## Desktop setup
@@ -8,7 +10,7 @@ Use the same Obsidian Sync vault for transcripts and shared recognition data. Ea
 2. Install and enable **Supernote Cloud Sync** in the desktop vault. Choose that excluded folder as its mirror destination. Sign in to Supernote Cloud and choose the notebooks/folders to download. Keep its separate transcription feature and uploads off when Supernote Transcripts handles recognition.
 3. In **Supernote Transcripts**, choose the desktop `.note` files/folders as sources. Keep their logical mirror connections and transcript destinations the same as on the Nomad. Desktop source paths are local to that device.
 4. Keep `Supernote Transcripts/Shared Data`, transcript Markdown and reference files included in Obsidian Sync. Prefer `.md` reference/glossary files: a `.txt` reference may be excluded by Sync's attachment-type settings even when its folder is included. Shared data contains recognition results, publication receipts and mirror definitions. It contains no account tokens or API keys.
-5. Use Cloud Sync as the desktop `.note` viewer. A page chip in a transcript opens that local notebook at the requested page. Only one plugin should own the `.note` extension.
+5. If Cloud Sync is the enabled desktop `.note` viewer, a transcript page chip can open its local notebook at the requested page. This compatibility is verified against the viewer's source; live foreground viewer acceptance remains pending. Without a compatible viewer, Transcripts provides a read-only page preview. Only one plugin should own the `.note` extension.
 
 Cloud Sync downloads original files from Supernote Cloud. Obsidian Sync distributes the resulting Markdown and shared recognition state. Neither sync service performs AI recognition itself.
 
