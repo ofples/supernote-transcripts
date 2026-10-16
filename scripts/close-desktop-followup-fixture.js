@@ -1,0 +1,1 @@
+(async()=>{const r=document.querySelector('.st-fullscreen-modal');if(!window.__transcriptUIFixture||!r)throw Error('Only close our fixture');r.querySelector('[aria-label="Close mirrors"]').click();await app.plugins.unloadPlugin('nomad-transcripts-ui-fixture');return {closed:true,realPaused:app.plugins.plugins['nomad-transcripts'].progress.paused};})();

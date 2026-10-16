@@ -1,0 +1,1 @@
+(async()=>{document.querySelector('.st-fullscreen-modal .st-close')?.click();await app.plugins.unloadPlugin('nomad-transcripts-ui-fixture');await app.plugins.loadPlugin('nomad-transcripts-ui-fixture');app.commands.executeCommandById('nomad-transcripts-ui-fixture:open');return {fixture:true};})();

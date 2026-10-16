@@ -1,0 +1,1 @@
+(async()=>{const p=app.plugins.plugins['nomad-transcripts'];if(p.task||!p.progress.paused)throw Error('Preserve paused state');for(const r of p.config.rules)r.sharedId??=r.id;await p.saveConfig();return {ids:p.config.rules.map(r=>({id:r.id,sharedId:r.sharedId})),idle:!p.task,paused:p.progress.paused};})();

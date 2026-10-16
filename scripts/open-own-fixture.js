@@ -1,0 +1,1 @@
+app.commands.executeCommandById("nomad-transcripts-ui-fixture:open")

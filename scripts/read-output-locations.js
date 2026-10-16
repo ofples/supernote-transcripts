@@ -1,0 +1,1 @@
+(()=>{const p=app.plugins.plugins['nomad-transcripts'];return {rules:p.config.rules.map(r=>({enabled:r.enabled,output:r.output})),savedOutputs:Object.values(p.store.notebooks).map(s=>({output:s.output})),beforeRules:JSON.parse(window.__transcriptPolishBefore?.config||'null')?.rules?.map(r=>({enabled:r.enabled,output:r.output}))};})();

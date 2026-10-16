@@ -1,0 +1,1 @@
+(async()=>{const p=app.plugins.plugins['nomad-transcripts'];if(!p||p.task||!p.progress.paused||document.querySelector('.modal-container'))throw Error('Preserve active work/form');await app.plugins.unloadPlugin('nomad-transcripts');return {unloaded:true};})();

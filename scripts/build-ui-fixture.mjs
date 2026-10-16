@@ -1,0 +1,11 @@
+import {build} from 'esbuild';
+import {mkdir,writeFile,copyFile} from 'node:fs/promises';
+const folder='test-artifacts/ui-fixture';
+const qualityFixture=process.argv.includes('--quality');
+const outputFolder=qualityFixture?'test-artifacts/quality-ui-fixture':folder;
+const entryPoint=qualityFixture?'scripts/quality-ui-fixture.ts':'scripts/ui-fixture.ts';
+const id=qualityFixture?'nomad-transcripts-quality-ui-fixture':'nomad-transcripts-ui-fixture';
+await mkdir(outputFolder,{recursive:true});
+await build({entryPoints:[entryPoint],bundle:true,outfile:`${outputFolder}/main.js`,platform:'browser',format:'cjs',target:'chrome100',external:['obsidian','fs','http'],minify:true});
+await writeFile(`${outputFolder}/manifest.json`,JSON.stringify({id,name:qualityFixture?'Transcripts quality UI fixture':'Transcripts interface test',version:qualityFixture?'0.0.2':'0.0.1',minAppVersion:'1.7.2',description:qualityFixture?'Isolated UI fixture with mock controller; no AI calls or transcript writes.':'Isolated read-only interface test. No AI calls or transcript writes.',author:'Personal tools',isDesktopOnly:qualityFixture},null,2));
+await copyFile('styles.css',`${outputFolder}/styles.css`);

@@ -1,0 +1,25 @@
+node_modules/
+main.js
+test-artifacts/
+private/
+
+# Local credentials and private configuration. Commit only an explicit example.
+.env
+.env.*
+!.env.example
+
+# Local Android and signing material.
+local.properties
+*.jks
+*.keystore
+*.p12
+*.pfx
+*.key
+*.pem
+
+# Generated Android build state and packages.
+**/.gradle/
+**/build/
+**/outputs/
+*.apk
+*.aab

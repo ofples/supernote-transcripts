@@ -1,0 +1,345 @@
+import {
+  toImage,
+  flattenToWhite,
+  type IRenderablePage,
+} from "supernote-typescript";
+import { encodeDataURL, Image, ImageColorModel } from "image-js";
+import { visibleSequence } from "./reader-support/visibility";
+import { excludedRelative } from "./reconcile.mjs";
+import type { ReadOnlySource, OpenNotebook } from "./types";
+import {
+  StreamingFile,
+  pairs,
+  sha,
+  identities,
+  type ByteSource,
+} from "./reader-support/stream";
+export interface NativeReadFS {
+  stat(path: string): Promise<{ size: number; mtime: number; type?: string }>;
+  readdir(path: string): Promise<(string | { name: string; type?: string })[]>;
+  getUri(path: string): string;
+}
+const layers = ["MAINLAYER", "LAYER1", "LAYER2", "LAYER3", "BGLAYER"];
+function sourcePath(path: string) {
+  const clean = path.replace(/\/+$/, "");
+  if (
+    !clean.startsWith("/storage/emulated/0/Note/") &&
+    clean !== "/storage/emulated/0/Note"
+  )
+    throw new Error("Choose a source under /storage/emulated/0/Note.");
+  if (
+    clean.split("/").some((s) => s === "." || s === "..") ||
+    /[\u0000-\u001f\\]/.test(clean)
+  )
+    throw new Error("Invalid source path.");
+  return clean;
+}
+function address(s: string | undefined) {
+  if (!s || s === "0") return 0;
+  if (!/^\d+$/.test(s) || !Number.isSafeInteger(Number(s)))
+    throw new Error("Invalid notebook address.");
+  return Number(s);
+}
+async function records(source: ByteSource, addresses: number[], hashes?: Map<number,string>) {
+  const result = new Map<number, Record<string, string>>();
+  await source.scan(addresses, async (a, b) => {
+    if(hashes)hashes.set(a,await sha(b));
+    result.set(a, pairs(b));
+  });
+  return result;
+}
+interface IndexedPage {
+  meta: Record<string, string>;
+  sequence: string[];
+  bitmaps: { name: string; address: number; layerName: string; hash?:string }[];
+  checks: [number,string][];
+  width: number;
+  height: number;
+  fingerprint: string;
+}
+/** Index only current metadata and hashes. Journal history, recognition data,
+ * vector paths, thumbnails and all-page bitmap buffers are never retained. */
+export async function indexNotebook(
+  source: ByteSource,
+  onStage: (detail: string) => void = () => {},
+) {
+  onStage("Checking file signature");
+  if (source.size < 28) throw new Error("Notebook is too short.");
+  const signature = new TextDecoder().decode(await source.head());
+  if (!/^(?:mark|note)SN_FILE_VER_\d{8}/.test(signature))
+    throw new Error("Unsupported notebook signature.");
+  onStage("Finding current notebook footer");
+  const footerAddress = new DataView((await source.tail()).buffer).getUint32(
+    0,
+    true,
+  );
+  let footer: Record<string, string> = {};
+  onStage("Reading current page inventory");
+  await source.scan([footerAddress], (_a, b) => {
+    for (const m of new TextDecoder()
+      .decode(b)
+      .matchAll(/<([^:<>]+):([^:<>]+)>/g)) {
+      if (m[1] === "FILE_FEATURE" || /^PAGE\d+$/.test(m[1])) {
+        if (m[1] in footer) throw new Error("Ambiguous notebook footer.");
+        footer[m[1]] = m[2];
+      }
+    }
+  });
+  const entries = Object.keys(footer).filter((k) => /^PAGE\d+$/.test(k));
+  const pageNumbers = new Set<number>();
+  for (const key of entries) {
+    if (!/^PAGE[1-9]\d*$/.test(key))
+      throw new Error("Invalid notebook page key.");
+    const pageNumber = Number(key.slice(4));
+    if (!Number.isSafeInteger(pageNumber) || pageNumbers.has(pageNumber))
+      throw new Error("Ambiguous notebook footer.");
+    pageNumbers.add(pageNumber);
+  }
+  entries.sort((a, b) => Number(a.slice(4)) - Number(b.slice(4)));
+  if (!entries.length) throw new Error("Notebook contains no supported pages.");
+  onStage("Reading page metadata");
+  const headerAddress = address(footer.FILE_FEATURE) || 24;
+  const metadataHashes = new Map<number,string>();
+  const metadata = await records(source, [
+    headerAddress,
+    ...entries.map((k) => address(footer[k])),
+  ], metadataHashes);
+  const header = metadata.get(headerAddress)!;
+  let width = header.APPLY_EQUIPMENT === "N5" ? 1920 : 1404,
+    height = header.APPLY_EQUIPMENT === "N5" ? 2560 : 1872;
+  const metas = entries.map((k) => metadata.get(address(footer[k]))!);
+  if (metas.every((p) => ["1090", "1270"].includes(p.ORIENTATION)))
+    [width, height] = [height, width];
+  if (
+    metas.some((p) => ["1090", "1270"].includes(p.ORIENTATION)) &&
+    !metas.every((p) => ["1090", "1270"].includes(p.ORIENTATION))
+  )
+    throw new Error(
+      "Mixed portrait and landscape notebooks are not supported by this renderer.",
+    );
+  onStage("Reading layer metadata");
+  const layerRecords = await records(
+    source,
+    metas.flatMap((p) => layers.map((l) => address(p[l]))),
+    metadataHashes,
+  );
+  const pages: IndexedPage[] = metas.map((meta, i) => {
+    const declaredSequence = (meta.LAYERSEQ || "MAINLAYER,BGLAYER").split(",");
+    if (
+      declaredSequence.some((l) => !layers.includes(l)) ||
+      new Set(declaredSequence).size !== declaredSequence.length
+    )
+      throw new Error("Unsupported notebook layer sequence.");
+    const sequence = visibleSequence(meta.LAYERINFO, declaredSequence);
+    return {
+      meta,
+      sequence,
+      width,
+      height,
+      fingerprint: "",
+      checks: [...new Set([headerAddress,address(footer[entries[i]]),...sequence.map(name=>address(meta[name]))])]
+        .filter(a=>metadataHashes.has(a)).map(a=>[a,metadataHashes.get(a)!] as [number,string]),
+      bitmaps: sequence.map((name) => {
+        const l = layerRecords.get(address(meta[name])) || {};
+        if (l.LAYERPROTOCOL && l.LAYERPROTOCOL !== "RATTA_RLE")
+          throw new Error("Unsupported notebook layer protocol.");
+        return {
+          name,
+          address: address(l.LAYERBITMAP),
+          layerName: l.LAYERNAME || name,
+        };
+      }),
+    };
+  });
+  onStage("Fingerprinting current page bitmaps");
+  const bitmapHashes = new Map<number, string>();
+  await source.scan(
+    pages.flatMap((p) => p.bitmaps.map((b) => b.address)),
+    async (a, b) => {
+      bitmapHashes.set(a, await sha(b));
+    },
+  );
+  for(const p of pages)for(const b of p.bitmaps)b.hash=bitmapHashes.get(b.address);
+  for (const p of pages)
+    p.fingerprint = await sha(
+      JSON.stringify({
+        renderer: "snt-0.7.1-native-1",
+        width,
+        height,
+        style: p.meta.PAGESTYLE || "0",
+        layers: p.bitmaps.map((b) => [
+          b.name,
+          b.layerName,
+          bitmapHashes.get(b.address) || null,
+        ]),
+      }),
+    );
+  const ids = identities(
+    pages.map((p) => p.meta.PAGEID),
+    pages.map((p) => p.fingerprint),
+  );
+  return { pages, ids, width, height };
+}
+export class AndroidReadOnlySource implements ReadOnlySource {
+  constructor(
+    private fs: NativeReadFS,
+    private progress?: (stage: string, detail: string) => void,
+    private fetcher: typeof fetch = fetch,
+  ) {}
+  async list(folder: string, recursive: boolean, exclude: string[]) {
+    const root = sourcePath(folder);
+    const out: { path: string; size: number; mtime: number }[] = [];
+    const excluded = (relative: string) => excludedRelative(relative, exclude);
+    const rootStat = await this.fs.stat(root);
+    if (rootStat.type === "file") {
+      if (!root.toLowerCase().endsWith(".note"))
+        throw new Error("Selected source is not a notebook or folder.");
+      return excluded(root.split("/").pop()!)
+        ? []
+        : [{ path: root, size: rootStat.size, mtime: rootStat.mtime }];
+    }
+    if (rootStat.type !== "directory")
+      throw new Error("Selected source has an unsupported filesystem type.");
+    const walk = async (path: string, relative: string, depth: number) => {
+      if (depth > 64)
+        throw new Error("Source nesting exceeds the safe scan depth.");
+      for (const entry of await this.fs.readdir(path)) {
+        const name = typeof entry === "string" ? entry : entry.name;
+        if (!name || name.includes("/") || name === "." || name === "..")
+          throw new Error("Invalid source directory entry.");
+        if (name.startsWith(".")) continue;
+        const rel = relative ? relative + "/" + name : name;
+        if (excluded(rel)) continue;
+        const next = path + "/" + name;
+        const stat = await this.fs.stat(next);
+        if (stat.type === "directory") {
+          if (recursive) await walk(next, rel, depth + 1);
+        } else if (name.toLowerCase().endsWith(".note"))
+          out.push({ path: next, size: stat.size, mtime: stat.mtime });
+      }
+    };
+    await walk(root, "", 0);
+    return out.sort((a, b) => a.path.localeCompare(b.path));
+  }
+  async revision(path: string) {
+    const s = await this.fs.stat(sourcePath(path));
+    return `${s.mtime}:${s.size}`;
+  }
+  async open(path: string): Promise<OpenNotebook> {
+    path = sourcePath(path);
+    const before = await this.fs.stat(path);
+    const revision = `${before.mtime}:${before.size}`;
+    let pass = "Reading notebook";
+    const name = path.split("/").pop();
+    const report = (detail: string) => {
+      pass = detail;
+      this.progress?.("Reading notebook", `${name} - ${detail}`);
+    };
+    const source = new StreamingFile(
+      before.size,
+      this.fs.getUri(path),
+      this.fetcher,
+      (read, size) =>
+        this.progress?.(
+          "Reading notebook",
+          `${name} - ${pass}: ${(Math.min(read, size) / 1048576) | 0} / ${Math.ceil(size / 1048576)} MB`,
+        ),
+    );
+    return openByteNotebook(path, revision, source, () => this.revision(path), this.progress, report);
+  }
+}
+
+/** Shared indexing, native page identities and renderer for Android and desktop.
+ * The byte source must keep individual block reads bounded and read-only. */
+export async function openByteNotebook(
+  path: string,
+  revision: string,
+  source: ByteSource,
+  readRevision: () => Promise<string>,
+  progress?: (stage: string, detail: string) => void,
+  report: (detail: string) => void = (detail) =>
+    progress?.("Reading notebook", `${path.split("/").pop()} - ${detail}`),
+): Promise<OpenNotebook> {
+  const name = path.split("/").pop();
+  const index = await indexNotebook(source, report);
+  if ((await readRevision()) !== revision)
+    throw new Error(
+      "Notebook changed while checking. Close it in Notes and retry.",
+    );
+  let closed = false;
+  let tail: Promise<unknown> = Promise.resolve();
+  return {
+    descriptor: {
+      path,
+      revision,
+      width: index.width,
+      height: index.height,
+      pages: index.pages.map((p, i) => ({
+        id: index.ids[i],
+        number: i + 1,
+        fingerprint: p.fingerprint,
+      })),
+    },
+    render: (number: number) => {
+      const job = tail.then(async () => {
+        if (closed) throw new Error("Notebook was closed.");
+        const p = index.pages[number - 1];
+        if (!p || !Number.isInteger(number))
+          throw new Error("Page number is outside this notebook.");
+        if ((await readRevision()) !== revision)
+          throw new Error("Notebook changed before rendering.");
+        report(`Reading bitmap blocks for page ${number}`);
+        const buffers = new Map<number, Uint8Array>();
+        const expected = new Map<number,string>([...p.checks,...p.bitmaps.filter(b=>b.hash).map(b=>[b.address,b.hash!] as [number,string])]);
+        await source.scan(
+          [...expected.keys(),...p.bitmaps.map((b) => b.address)],
+          async (a, b) => {
+            if(expected.has(a) && await sha(b)!==expected.get(a)){
+              const error=new Error("Notebook content changed after indexing. Save it in Notes and retry this notebook.");
+              error.name="SourceChangedError";throw error;
+            }
+            buffers.set(a, b);
+          },
+        );
+        const page: IRenderablePage = {
+          PAGESTYLE: p.meta.PAGESTYLE || "0",
+          LAYERSEQ: p.sequence as any,
+        };
+        for (const b of p.bitmaps)
+          (page as any)[b.name] = {
+            LAYERNAME: b.layerName,
+            bitmapBuffer: buffers.get(b.address) || null,
+          };
+        if (
+          p.sequence.length &&
+          !p.bitmaps.some((b) => buffers.get(b.address)?.length)
+        )
+          throw new Error("Notebook page contains no renderable bitmap.");
+        progress?.(
+          "Rendering",
+          `${name} - rendering page ${number} at ${p.width} x ${p.height}`,
+        );
+        const rendered = p.sequence.length
+          ? (
+              await toImage(
+                { pageWidth: p.width, pageHeight: p.height, pages: [page] },
+                [1],
+              )
+            )[0]
+          : new Image(p.width, p.height, {
+              colorModel: ImageColorModel.GREY,
+            }).fill(255);
+        const image = encodeDataURL(flattenToWhite(rendered));
+        if ((await readRevision()) !== revision)
+          throw new Error("Notebook changed while rendering.");
+        return image;
+      });
+      tail = job.catch(() => {});
+      return job;
+    },
+    close: () => {
+      closed = true;
+      index.pages.length = 0;
+    },
+  };
+}

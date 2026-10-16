@@ -1,0 +1,1 @@
+(()=>{globalThis.__fixtureReload={status:"running"};app.plugins.loadPlugin("nomad-transcripts-ui-fixture").then(()=>{globalThis.__fixtureReload={status:"loaded"};app.commands.executeCommandById("nomad-transcripts-ui-fixture:open")},e=>{globalThis.__fixtureReload={status:"failed",name:String(e?.name||"Error")}});return true})()

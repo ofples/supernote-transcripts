@@ -1,0 +1,6 @@
+import {build} from 'esbuild';
+import {mkdir,writeFile} from 'node:fs/promises';
+const dir='test-artifacts/subscription-probe';await mkdir(dir,{recursive:true});
+await build({entryPoints:['scripts/subscription-probe/device.ts'],bundle:true,outfile:`${dir}/main.js`,platform:'browser',format:'cjs',target:'chrome100',external:['obsidian'],minify:true});
+await writeFile(`${dir}/manifest.json`,JSON.stringify({id:'nomad-subscription-probe',name:'Supernote subscription test',version:'0.0.1',minAppVersion:'1.7.2',description:'Isolated memory-only ChatGPT plan test. No API-key fallback or transcript writes.',author:'Personal tools',isDesktopOnly:false},null,2));
+await writeFile(`${dir}/styles.css`,`.st-subscription-probe{width:100vw;height:100dvh;max-width:none;max-height:none;border-radius:0;padding:32px}.st-subscription-probe .modal-content{height:100%;overflow:auto;font-size:25px}.st-subscription-probe h1{font-size:28px}.st-subscription-probe label{display:block;margin:24px 0}.st-subscription-probe input{display:block;width:100%;min-height:48px;border-radius:0;font:inherit;margin-top:8px}.st-subscription-probe button{min-height:48px;border:1px solid black;border-radius:0;font:inherit;padding:10px 20px}.st-subscription-probe pre{white-space:pre-wrap;font:inherit;line-height:1.6}`);

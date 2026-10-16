@@ -1,0 +1,7 @@
+.st-subscription-probe{width:100vw;height:100dvh;max-width:none;max-height:none;border-radius:0;padding:32px}
+.st-subscription-probe .modal-content{height:100%;overflow:auto;font-size:25px}
+.st-subscription-probe h1{font-size:28px}
+.st-subscription-probe label{display:block;margin:24px 0}
+.st-subscription-probe input{display:block;width:100%;min-height:48px;border-radius:0;font:inherit;margin-top:8px}
+.st-subscription-probe button{margin:8px 12px 8px 0;min-height:48px;border:1px solid black;border-radius:0;font:inherit;padding:10px 20px}
+.st-subscription-probe pre{white-space:pre-wrap;font:inherit;line-height:1.6}

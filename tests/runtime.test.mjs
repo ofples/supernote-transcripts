@@ -1,0 +1,1778 @@
+import test from "node:test";
+import assert from "node:assert/strict";
+import { build } from "esbuild";
+import { fileURLToPath } from "node:url";
+import { mkdir } from "node:fs/promises";
+import { RecognitionFailure } from "../src/subscription-stream.mjs";
+import { EMPTY_PAGE_TEXT } from "../src/prompts.mjs";
+const directory = fileURLToPath(new URL("../", import.meta.url));
+await mkdir(`${directory}test-artifacts`, { recursive: true });
+await build({
+  entryPoints: [`${directory}src/runtime.ts`],
+  outfile: `${directory}test-artifacts/runtime-test.mjs`,
+  bundle: true,
+  format: "esm",
+  platform: "browser",
+  external: ["fs", "http", "os"],
+  loader: { ".txt": "text" },
+  plugins: [
+    {
+      name: "mock-runtime",
+      setup(build) {
+        build.onResolve({ filter: /^obsidian$/ }, () => ({
+          path: `${directory}tests/mock-obsidian.mjs`,
+        }));
+        build.onResolve({ filter: /^\.\/reader$/ }, (args) => args.importer.endsWith("runtime.ts") ? ({
+          path: `${directory}tests/mock-reader.mjs`,
+        }) : undefined);
+        build.onResolve({ filter: /^\.\/desktop-reader$/ }, () => ({path: `${directory}tests/mock-reader.mjs`}));
+        build.onResolve({ filter: /^\.\/ui$/ }, () => ({
+          path: `${directory}tests/mock-ui.mjs`,
+        }));
+      },
+    },
+  ],
+});
+const { default: Runtime } = await import("../test-artifacts/runtime-test.mjs");
+await build({stdin:{contents:"export * from './src/shared'; export * from './src/publication'; export * from './src/state';",resolveDir:directory},outfile:`${directory}test-artifacts/runtime-shared.mjs`,bundle:true,format:"esm",platform:"browser"});
+const {SharedNotebookCache,PublicationReceipts,notebookIdentity,sharedHash,validateStateSnapshot,encodeStateSnapshot}=await import("../test-artifacts/runtime-shared.mjs");
+const source = "/storage/emulated/0/Note/Reflections/a.note";
+const statePath=suffix=>`.obsidian-supernote/plugins/nomad-transcripts/state-${suffix}.json`;
+function requestedPages(request) {
+  const prompt=typeof request==="string"?request:request?.input?.[0]?.content?.find(item=>item.type==="input_text")?.text??"";
+  const match=/Target pages \(transcribe exactly these\): ([^\n]+)/.exec(prompt);
+  return [...(match?.[1]??"").matchAll(/Page (\d+)/g)].map(m=>Number(m[1]));
+}
+const answer=(text,request)=>{
+  let structured;
+  try { const parsed=JSON.parse(text); if(Array.isArray(parsed?.pages))structured=text; } catch {}
+  if(!structured){const pages=requestedPages(request);structured=JSON.stringify({pages:(pages.length?pages:[1]).map(number=>({number,text,joinPrevious:false}))});}
+  return {status:200,json:{status:"completed",output:[{type:"message",content:[{type:"output_text",text:structured}]}]}};
+};
+function fixture(count = 3) {
+  globalThis.__desktop=false;
+  globalThis.__tokenCount = undefined;
+  globalThis.__omitUsage = false;
+  const storage = new Map();
+  globalThis.localStorage = {
+    getItem: (k) => storage.get(k) ?? null,
+    setItem: (k, v) => storage.set(k, v),
+    removeItem: (k) => storage.delete(k),
+  };
+  globalThis.document = { hidden: false };
+  globalThis.window = { setInterval: () => 0, setTimeout: () => 0 };
+  const files = new Map(),
+    calls = [];
+  const adapter = {
+    exists: async (p) => files.has(p),
+    read: async (p) => {
+      if (!files.has(p)) throw Error("missing");
+      return files.get(p);
+    },
+    write: async (p, text) => files.set(p, text),
+    process: async (p, f) => files.set(p, f(files.get(p))),
+    rename: async (a, b) => {
+      files.set(b, files.get(a));
+      files.delete(a);
+    },
+  };
+  const app = {
+    vault: {
+      configDir: ".obsidian-supernote",
+      adapter,
+      getName: () => "Test",
+      createFolder: async (p) => files.set(p, "folder"),
+      create: async (p, text) => {
+        if (files.has(p)) throw Error("Destination already exists");
+        files.set(p, text);
+      },
+    },
+    workspace: { onLayoutReady: () => {}, openLinkText: async () => {} },
+  };
+  const plugin = new Runtime(app);
+  plugin.config = {
+    version: 1,
+    profiles: [
+      {
+        id: "general",
+        name: "General",
+        model: "test-model",
+        endpoint: "https://example.invalid/responses",
+        prompt: "transcribe",
+        quality: "fast",
+        glossaries: [],
+      },
+    ],
+    rules: [
+      {
+        id: "r",
+        enabled: true,
+        source: "/storage/emulated/0/Note/Reflections",
+        output: "Mirror",
+        recursive: true,
+        exclude: [],
+        profileId: "general",
+      },
+    ],
+    intervalMinutes: 5,
+    batchPages: 2,
+    continuous: false,
+  };
+  plugin.saveCostSettings({
+    dailyUsd: 10,
+    monthlyUsd: 100,
+    runUsd: 10,
+    dailyRequests: 10000,
+    maxOutputTokens: 4096,
+    prices: [
+      {
+        endpoint: "https://example.invalid/responses",
+        model: "test-model",
+        input: 1,
+        cached: 0.1,
+        cacheWrite: 1.25,
+        output: 1,
+        longThreshold: 272000,
+        longInputMultiplier: 2,
+        longOutputMultiplier: 1.5,
+      },
+      {
+        endpoint: "https://example.invalid/responses",
+        model: "test",
+        input: 1,
+        cached: 0.1,
+        cacheWrite: 1.25,
+        output: 1,
+        longThreshold: 272000,
+        longInputMultiplier: 2,
+        longOutputMultiplier: 1.5,
+      },
+    ],
+  });
+  plugin.apiKey = "fake-not-a-secret";
+  let currentSource = source;
+  let revision = "1:100";
+  let pages = Array.from({ length: count }, (_, i) => ({
+    id: `native:${i + 1}`,
+    number: i + 1,
+    fingerprint: `f${i + 1}`,
+  }));
+  let present = true;
+  const reader = {
+    list: async () =>
+      present
+        ? [
+            {
+              path: currentSource,
+              size: 100,
+              mtime: Number(revision.split(":")[0]),
+            },
+          ]
+        : [],
+    revision: async () => revision,
+    open: async () => ({
+      descriptor: {
+        path: currentSource,
+        revision,
+        pages: structuredClone(pages),
+        width: 1404,
+        height: 1872,
+      },
+      render: async (n) => `image:${n}`,
+      close() {},
+    }),
+  };
+  plugin.reader = () => reader;
+  globalThis.__response = async (request) => {
+    const body=JSON.parse(request.body);calls.push(body);
+    return answer(`text ${calls.length}`,body);
+  };
+  return {
+    plugin,
+    app,
+    files,
+    calls,
+    reader,
+    change: (next) => {
+      pages = next;
+      revision = `${Number(revision.split(":")[0]) + 1}:100`;
+    },
+    missing: () => {
+      present = false;
+    },
+    restore: () => {
+      present = true;
+    },
+    rename: (path) => {
+      currentSource = path;
+    },
+  };
+}
+test("bounded backfill checkpoints paid results; restart reuses them", async () => {
+  const f = fixture();
+  await f.plugin.saveConfig();
+  await f.plugin.update();
+  assert.equal(f.calls.length, 2);
+  assert.equal(f.plugin.store.notebooks[source].status, "queued");
+  assert.equal(f.plugin.store.queue.length, 1);
+  const restarted = new Runtime(f.app);
+  restarted.reader = () => f.reader;
+  await restarted.onload();
+  await restarted.update();
+  assert.equal(f.calls.length, 3);
+  assert.equal(restarted.store.notebooks[source].status, "current");
+  await restarted.update();
+  assert.equal(f.calls.length, 3);
+  assert.equal(restarted.progress.stage, "Current");
+});
+
+test("continuous updates drain a notebook beyond the old batch size", async () => {
+  const f = fixture(7);
+  f.plugin.config.continuous = true;
+  await f.plugin.update();
+  assert.equal(f.calls.length, 7);
+  assert.equal(f.plugin.store.queue.length, 0);
+  assert.equal(f.plugin.progress.stage, "Current");
+  await f.plugin.update();
+  assert.equal(f.calls.length, 7);
+  assert.equal(f.plugin.costs.total.requests, 7);
+});
+
+function folderFixture() {
+  const f = fixture(1),
+    nested = "/storage/emulated/0/Note/Reflections/Branch/b.note",
+    skip = "/storage/emulated/0/Note/Reflections/Skip/c.note";
+  f.plugin.config.continuous = true;
+  f.plugin.config.rules[0].exclude = ["Skip"];
+  f.reader.list = async () =>
+    [source, nested, skip].map((path) => ({ path, size: 100, mtime: 1 }));
+  f.reader.open = async (path) => ({
+    descriptor: {
+      path,
+      revision: "1:100",
+      width: 1404,
+      height: 1872,
+      pages: Array.from({ length: path === source ? 3 : 2 }, (_, i) => ({
+        id: `native:${i + 1}`,
+        number: i + 1,
+        fingerprint: `${path}:${i + 1}`,
+      })),
+    },
+    render: async (n) => `image:${n}`,
+    close() {},
+  });
+  return { ...f, nested, skip };
+}
+test("middle page failure continues sibling notebooks and remains held through Update and restart",async()=>{
+  const f=folderFixture();f.plugin.concurrency=3;const original=globalThis.__response;
+  let failed=false;globalThis.__response=async request=>{const body=JSON.parse(request.body);if(!failed&&requestedPages(body).includes(2)){failed=true;f.calls.push(body);throw Error("Interrupted");}return original(request);};
+  await f.plugin.saveConfig();await f.plugin.update();
+  const state=f.plugin.store.notebooks[source];assert.equal(f.calls.length,5);assert.equal(state.status,"partial");assert.equal(Object.keys(state.pages).length,2);assert.equal(state.pageIssues["native:2"].status,"failed");assert.equal(f.plugin.store.notebooks[f.nested].status,"current");
+  assert.ok(f.plugin.queueView.attention.includes(source));await f.plugin.update();assert.equal(f.calls.length,5);
+  const restarted=new Runtime(f.app);await restarted.onload();restarted.reader=()=>f.reader;restarted.apiKey="fake";await restarted.update();assert.equal(f.calls.length,5);assert.equal(restarted.store.notebooks[source].pageIssues["native:2"].attempts,1);
+  await restarted.retryPage(source,"native:2");assert.equal(f.calls.length,5);await restarted.update();assert.equal(f.calls.length,6);assert.equal(restarted.store.notebooks[source].status,"current");
+});
+test("selective retries merge distinct pages, retain other holds, and changed fingerprints become eligible",async()=>{
+  const f=fixture(3);f.plugin.config.continuous=true;globalThis.__response=async request=>{f.calls.push(JSON.parse(request.body));throw Error("Interrupted");};
+  await f.plugin.update();assert.equal(f.calls.length,3);await f.plugin.retryPage(source,"native:1");await f.plugin.retryPage(source,"native:3");assert.deepEqual(f.plugin.store.queue[0].pageIds,["native:1","native:3"]);
+  globalThis.__response=async request=>{const body=JSON.parse(request.body);f.calls.push(body);return answer("retried",body);};await f.plugin.update();assert.equal(f.calls.length,5);assert.equal(f.plugin.store.notebooks[source].pageIssues["native:2"].status,"failed");
+  await f.plugin.skipPage(source,"native:2");assert.equal(f.plugin.store.notebooks[source].pages["native:2"],undefined);await f.plugin.update();assert.equal(f.calls.length,5);
+  f.change([{id:"native:1",number:1,fingerprint:"f1"},{id:"native:2",number:2,fingerprint:"changed"},{id:"native:3",number:3,fingerprint:"f3"}]);await f.plugin.update();assert.equal(f.calls.length,6);assert.equal(f.plugin.store.notebooks[source].status,"current");
+});
+test("isolated render failure is held while remaining pages finish without a provider request for it",async()=>{
+  const f=fixture(3);f.plugin.config.continuous=true;const open=f.reader.open;f.reader.open=async()=>{const o=await open();o.render=async n=>{if(n===2)throw Error("Image decoding failed");return `image:${n}`;};return o;};
+  await f.plugin.update();assert.equal(f.calls.length,2);assert.equal(f.plugin.store.notebooks[source].pageIssues["native:2"].kind,"render");await f.plugin.update();assert.equal(f.calls.length,2);
+});
+test("known blank pages are persisted and reused; empty completed and incomplete responses remain failures",async()=>{
+  const f=fixture(3);f.plugin.config.continuous=true;globalThis.__response=async request=>{const body=JSON.parse(request.body);f.calls.push(body);const [page]=requestedPages(body);return page===1?answer(EMPTY_PAGE_TEXT,body):page===2?answer("",body):{status:200,json:{status:"incomplete",incomplete_details:{reason:"max_output_tokens"},output:[]}};};
+  await f.plugin.update();const s=f.plugin.store.notebooks[source];assert.equal(s.pages["native:1"].text,EMPTY_PAGE_TEXT);assert.equal(s.pages["native:1"].blank,true);assert.equal(s.pageIssues["native:2"].kind,"empty_response");assert.equal(s.pageIssues["native:3"].kind,"incomplete");assert.equal(f.plugin.costs.total.pages,1);assert.equal(f.plugin.costs.total.requests,3);assert.doesNotMatch(f.files.get(s.output),/supernote-empty-page/);await f.plugin.update();assert.equal(f.calls.length,3);
+});
+test("unavailable model holds its notebook while a different profile finishes; auth blocks dispatch",async()=>{
+  const f=folderFixture();f.plugin.config.rules.push({...f.plugin.config.rules[0],id:"nested",source:f.nested,profileId:"valid"});f.plugin.config.profiles.push({...f.plugin.config.profiles[0],id:"valid",model:"test"});
+  globalThis.__response=async request=>{const body=JSON.parse(request.body);f.calls.push(body);return body.model==="test-model"?{status:400,json:{error:{code:"invalid_model"}}}:answer("valid model",body);};await f.plugin.update();assert.equal(f.calls.length,3);assert.equal(f.plugin.store.notebooks[source].executionIssue.scope,"source");assert.equal(f.plugin.store.notebooks[f.nested].status,"current");await f.plugin.update();assert.equal(f.calls.length,3);
+  const g=fixture(3);g.plugin.config.continuous=true;g.plugin.concurrency=3;globalThis.__response=async request=>{g.calls.push(JSON.parse(request.body));return {status:401,json:{error:{code:"invalid_api_key"}}};};await g.plugin.update();assert.ok(g.plugin.progress.executionBlocked);assert.ok(g.calls.length<=3);assert.equal(g.plugin.store.notebooks[source].executionIssue.scope,"batch");
+});
+test("subscription interrupted attempts count once and remaining pages continue within the daily cap",async()=>{
+  const f=fixture(3);f.plugin.config.continuous=true;f.plugin.provider="subscription";f.plugin.saveCostSettings({...f.plugin.costs.settings,dailyRequests:3});let calls=0;
+  f.plugin.session.recognize=async(model,image,instructions,beforeSend)=>{if(!await beforeSend())return null;calls++;if(calls===2)throw new RecognitionFailure("missing_terminal","Stream did not complete with text.");return {text:answer("saved",{input:[{content:[{type:"input_text",text:instructions}]}]}).json.output[0].content[0].text,usage:{input_tokens:10,output_tokens:2}};};
+  await f.plugin.update();assert.equal(calls,3);assert.equal(f.plugin.subscriptionUsage.requests,3);assert.equal(f.plugin.subscriptionUsage.pages,2);assert.equal(f.plugin.subscriptionUsage.unconfirmed,1);assert.equal(f.plugin.subscriptionUsage.todayRequests,3);assert.equal(f.plugin.store.notebooks[source].status,"partial");await f.plugin.update();assert.equal(calls,3);
+  await f.plugin.retryPage(source,"native:2");await f.plugin.update();assert.equal(calls,3);assert.match(f.plugin.progress.budgetBlocked,/Daily ChatGPT request limit/);
+});
+test("page actions require idle and force never replays held failures",async()=>{
+  const f=fixture(1);globalThis.__response=async request=>{f.calls.push(JSON.parse(request.body));throw Error("failed");};await f.plugin.update();f.plugin.progress.running=true;await assert.rejects(f.plugin.retryPage(source,"native:1"),/wait for active/);await assert.rejects(f.plugin.skipPage(source,"native:1"),/wait for active/);f.plugin.progress.running=false;
+  await f.plugin.manual(source,"1",true);assert.equal(f.calls.length,1);assert.equal(f.plugin.store.notebooks[source].pageIssues["native:1"].attempts,1);
+});
+test("a consumed selective task leaves unrelated eligible pages for the next Update and never retries other holds",async()=>{
+  const f=fixture(3);f.plugin.config.continuous=false;f.plugin.config.batchPages=1;globalThis.__response=async request=>{f.calls.push(JSON.parse(request.body));throw Error("failed");};await f.plugin.update();assert.equal(f.calls.length,1);
+  f.plugin.store.queue=[];await f.plugin.retryPage(source,"native:1");globalThis.__response=async request=>{const body=JSON.parse(request.body);f.calls.push(body);return answer("success",body);};await f.plugin.update();assert.equal(f.calls.length,2);assert.equal(f.plugin.store.queue.length,0);assert.equal(f.plugin.store.notebooks[source].status,"queued");await f.plugin.update();assert.equal(f.calls.length,3);assert.ok(f.plugin.store.notebooks[source].pages["native:2"]);
+  const state=f.plugin.store.notebooks[source];state.pageIssues={"native:3":{fingerprint:"f3",number:3,status:"failed",kind:"provider",reason:"failed",attempts:1,updatedAt:new Date().toISOString()}};f.plugin.enqueue(source);await f.plugin.retryPage(source,"native:3");assert.equal(f.plugin.store.queue[0].pageIds,undefined);await f.plugin.update();assert.equal(f.calls.length,4);
+});
+test("legacy notebook stream failures hold without guessing a page and resume only by explicit notebook action",async()=>{
+  const f=fixture(2);await f.plugin.saveConfig();f.plugin.aiEnabled=false;await f.plugin.update();const state=f.plugin.store.notebooks[source];state.status="failed";state.error="Stream did not complete with text.";await f.plugin.persist();
+  const restarted=new Runtime(f.app);await restarted.onload();restarted.reader=()=>f.reader;restarted.apiKey="fake";restarted.aiEnabled=true;await restarted.update();assert.equal(f.calls.length,0);assert.ok(restarted.store.notebooks[source].legacyPageFailure);assert.equal(restarted.store.notebooks[source].pageIssues,undefined);await restarted.retryNotebook(source);assert.equal(f.calls.length,0);await restarted.update();assert.equal(f.calls.length,2);
+});
+test("batch authorization failure blocks another worker still awaiting token-count admission",async()=>{
+  const f=fixture(2);f.plugin.config.continuous=true;f.plugin.concurrency=2;let resolveSecond,secondStarted;const second=new Promise(r=>secondStarted=r),wait=new Promise(r=>resolveSecond=r);
+  globalThis.__tokenCount=async request=>{if(requestedPages(JSON.parse(request.body)).includes(2)){secondStarted();await wait;}return {status:200,json:{input_tokens:100}};};
+  globalThis.__response=async request=>{f.calls.push(JSON.parse(request.body));await second;return {status:401,json:{error:{code:"invalid_api_key"}}};};
+  const operation=f.plugin.update();await second;for(let i=0;i<100&&!f.plugin.progress.executionBlocked;i++)await new Promise(r=>setImmediate(r));assert.ok(f.plugin.progress.executionBlocked);resolveSecond();await operation;assert.equal(f.calls.length,1);assert.equal(f.plugin.costs.total.requests,1);
+});
+test("subscription terminal incomplete retains reported tokens as failed outcome and allows remaining pages",async()=>{
+  const f=fixture(2);f.plugin.provider="subscription";f.plugin.config.continuous=true;let calls=0;
+  f.plugin.session.recognize=async(model,image,instructions,beforeSend)=>{if(!await beforeSend())return null;calls++;if(calls===1)throw new RecognitionFailure("incomplete","Output token limit.",{usage:{input_tokens:13,output_tokens:7},outcomeKnown:true});return {text:answer("successful",{input:[{content:[{type:"input_text",text:instructions}]}]}).json.output[0].content[0].text,usage:{input_tokens:5,output_tokens:2}};};await f.plugin.update();
+  assert.equal(calls,2);assert.equal(f.plugin.subscriptionUsage.requests,2);assert.equal(f.plugin.subscriptionUsage.pages,1);assert.equal(f.plugin.subscriptionUsage.unconfirmed,0);assert.equal(f.plugin.subscriptionUsage.inputTokens,18);assert.equal(f.plugin.subscriptionUsage.outputTokens,9);
+});
+test("a folder drains all included notebooks, preserves hierarchy and skips exclusions", async () => {
+  const f = folderFixture();
+  await f.plugin.update();
+  assert.equal(f.calls.length, 5);
+  assert.equal(f.plugin.store.queue.length, 0);
+  assert.ok(f.files.has("Mirror/a.md"));
+  assert.ok(f.files.has("Mirror/Branch/b.md"));
+  assert.equal(f.plugin.store.notebooks[f.skip], undefined);
+});
+test("Do next preempts after saving the current page and finishes the remaining work once", async () => {
+  const f = folderFixture(),
+    usual = globalThis.__response,
+    order = [];
+  let first = true;
+  globalThis.__response = async (request) => {
+    order.push(f.plugin.queueView.working.source);
+    if (first) {
+      first = false;
+      await f.plugin.prioritizeNotebook(f.nested);
+      assert.deepEqual(f.plugin.queueView.waiting, [f.nested]);
+    }
+    return usual(request);
+  };
+  await f.plugin.update();
+  assert.deepEqual(order, [source, f.nested, f.nested, source, source]);
+  assert.equal(f.calls.length, 5);
+  assert.equal(f.plugin.store.queue.length, 0);
+  assert.equal(f.plugin.queueView.working, undefined);
+});
+test("a source paused then resumed during another notebook rejoins this update", async () => {
+  const f = folderFixture(),
+    usual = globalThis.__response,
+    order = [];
+  let first = true;
+  globalThis.__response = async (request) => {
+    const active = f.plugin.queueView.working.source;
+    order.push(active);
+    if (first) {
+      first = false;
+      await f.plugin.setNotebookPaused(source, true);
+    } else if (active === f.nested)
+      await f.plugin.setNotebookPaused(source, false);
+    return usual(request);
+  };
+  await f.plugin.update();
+  assert.equal(f.calls.length, 5);
+  assert.equal(f.plugin.store.queue.length, 0);
+  assert.deepEqual(order, [source, f.nested, f.nested, source, source]);
+});
+test("manual recognition also appears as the current named work", async () => {
+  const f = fixture(1),
+    usual = globalThis.__response;
+  globalThis.__response = async (request) => {
+    assert.equal(f.plugin.queueView.working.source, source);
+    return usual(request);
+  };
+  await f.plugin.manual(source, "1");
+  assert.equal(f.plugin.queueView.working, undefined);
+});
+test("priority survives restart and never overrides AI, global pause, source pause or budget stop", async () => {
+  const f = folderFixture();
+  f.plugin.aiEnabled = false;
+  await f.plugin.update();
+  await f.plugin.saveConfig();
+  f.plugin.pause();
+  await f.plugin.prioritizeNotebook(f.nested);
+  assert.equal(f.calls.length, 0);
+  assert.equal(f.plugin.progress.paused, true);
+  const restarted = new Runtime(f.app);
+  restarted.reader = () => f.reader;
+  await restarted.onload();
+  assert.equal(restarted.queueView.waiting[0], f.nested);
+  restarted.aiEnabled = true;
+  restarted.progress.budgetBlocked = "Limit";
+  restarted.progress.paused = false;
+  await restarted.prioritizeNotebook(source);
+  assert.equal(f.calls.length, 0);
+  restarted.progress.budgetBlocked = undefined;
+  restarted.config.rules[0].paused = true;
+  await restarted.prioritizeNotebook(source);
+  assert.equal(f.calls.length, 0);
+  assert.equal(restarted.queueView.paused.length, 2);
+});
+test("exclude during a request preserves its paid page then prevents rediscovery without archiving", async () => {
+  const f = folderFixture(),
+    usual = globalThis.__response;
+  let first = true;
+  globalThis.__response = async (request) => {
+    if (first) {
+      first = false;
+      await f.plugin.excludeNotebook(source);
+    }
+    return usual(request);
+  };
+  await f.plugin.update();
+  assert.equal(f.calls.length, 3);
+  assert.equal(f.plugin.store.notebooks[source].status, "excluded");
+  assert.equal(Object.keys(f.plugin.store.notebooks[source].pages).length, 1);
+  const original = f.files.get("Mirror/a.md");
+  await f.plugin.update();
+  assert.equal(f.calls.length, 3);
+  assert.equal(f.files.get("Mirror/a.md"), original);
+  assert.equal(
+    f.plugin.store.history.filter((x) => x.includes("Archive")).length,
+    0,
+  );
+});
+test("notebook catalog and existing transcript suggestions are opt-in and read-only", async () => {
+  const f = folderFixture();
+  let inventories = 0;
+  f.app.vault.getFiles = () => {
+    inventories++;
+    return [
+      { path: "Satsang/a.md" },
+      { path: "Other/a.md" },
+      { path: ".obsidian/a.md" },
+      { path: "Supernote Transcripts/History/a.md" },
+      { path: "Other/unrelated.md" },
+    ];
+  };
+  let choices = await f.plugin.listNotebookChoices(f.plugin.config.rules[0]);
+  assert.equal(inventories, 0);
+  assert.equal(choices.length, 3);
+  assert.equal(choices[0].existingTranscripts.length, 0);
+  choices = await f.plugin.listNotebookChoices(f.plugin.config.rules[0], true);
+  assert.deepEqual(
+    choices.find((c) => c.source === source).existingTranscripts,
+    ["Satsang/a.md", "Other/a.md"],
+  );
+  assert.equal(f.plugin.store.queue.length, 0);
+  assert.equal(f.calls.length, 0);
+  assert.equal(f.files.size, 0);
+});
+test("wildcard exclusions prune cached tasks without modifying saved output", async () => {
+  const f = folderFixture();
+  await f.plugin.update();
+  const original = f.files.get("Mirror/Branch/b.md");
+  f.plugin.config.rules[0].exclude = ["Skip", "**/b?.note", "**/b.note"];
+  await f.plugin.update();
+  assert.equal(f.plugin.store.notebooks[f.nested].status, "excluded");
+  assert.equal(f.files.get("Mirror/Branch/b.md"), original);
+  assert.equal(f.calls.length, 5);
+});
+test("one notebook can pause while the other folder contents finish", async () => {
+  const f = folderFixture();
+  f.plugin.aiEnabled = false;
+  await f.plugin.update();
+  await f.plugin.setNotebookPaused(source, true);
+  f.plugin.aiEnabled = true;
+  await f.plugin.update();
+  assert.equal(f.calls.length, 2);
+  assert.equal(f.plugin.store.notebooks[source].paused, true);
+  assert.equal(f.plugin.store.notebooks[f.nested].status, "current");
+  assert.ok(f.plugin.store.queue.some((t) => t.source === source));
+  await f.plugin.setNotebookPaused(source, false);
+  assert.equal(f.calls.length, 5);
+});
+test("a source pause finishes the current paid page and stops its subsequent requests", async () => {
+  const f = folderFixture(),
+    usual = globalThis.__response;
+  let first = true;
+  globalThis.__response = async (request) => {
+    if (first) {
+      first = false;
+      await f.plugin.setSourcePaused("r", true);
+    }
+    return usual(request);
+  };
+  await f.plugin.update();
+  assert.equal(f.calls.length, 1);
+  assert.equal(Object.keys(f.plugin.store.notebooks[source].pages).length, 1);
+  assert.equal(f.plugin.store.queue.length, 2);
+  await f.plugin.setSourcePaused("r", false);
+  assert.equal(f.calls.length, 5);
+  assert.equal(f.plugin.store.queue.length, 0);
+});
+test("global pause stops the continuous queue after the active page; resume reuses it", async () => {
+  const f = fixture(5),
+    usual = globalThis.__response;
+  f.plugin.config.continuous = true;
+  let first = true;
+  globalThis.__response = async (request) => {
+    if (first) {
+      first = false;
+      f.plugin.pause();
+    }
+    return usual(request);
+  };
+  await f.plugin.update();
+  assert.equal(f.calls.length, 1);
+  assert.equal(f.plugin.progress.paused, true);
+  await f.plugin.resume();
+  assert.equal(f.calls.length, 5);
+  assert.equal(f.plugin.store.queue.length, 0);
+});
+test("source and notebook pause state survive restart without overriding global pause", async () => {
+  const f = folderFixture();
+  f.plugin.aiEnabled = false;
+  await f.plugin.update();
+  await f.plugin.setSourcePaused("r", true);
+  await f.plugin.setNotebookPaused(source, true);
+  f.plugin.pause();
+  const restarted = new Runtime(f.app);
+  restarted.reader = () => f.reader;
+  await restarted.onload();
+  assert.equal(restarted.config.rules[0].paused, true);
+  assert.equal(restarted.store.notebooks[source].paused, true);
+  restarted.aiEnabled = true;
+  await restarted.setSourcePaused("r", false);
+  await restarted.setNotebookPaused(source, false);
+  assert.equal(f.calls.length, 0);
+  assert.equal(restarted.progress.paused, true);
+});
+test("budget admission blocks before recognition and retains unfinished queue", async () => {
+  const f = fixture(5);
+  f.plugin.config.continuous = true;
+  await f.plugin.saveCostSettings({
+    ...f.plugin.costs.settings,
+    dailyUsd: 0.000001,
+  });
+  await f.plugin.update();
+  assert.equal(f.calls.length, 0);
+  assert.equal(f.plugin.store.queue.length, 1);
+  assert.equal(f.plugin.store.notebooks[source].status, "queued");
+  assert.equal(f.plugin.progress.stage, "Spending paused");
+});
+test("missing prices or counting support never silently bypasses budgets", async () => {
+  const f = fixture(1);
+  f.plugin.config.profiles[0].model = "unknown";
+  let counts = 0;
+  globalThis.__tokenCount = async () => {
+    counts++;
+    return { status: 404, json: {} };
+  };
+  await f.plugin.update();
+  assert.equal(counts, 0);
+  assert.equal(f.calls.length, 0);
+  f.plugin.config.profiles[0].model = "test-model";
+  await f.plugin.update();
+  assert.equal(counts, 1);
+  assert.equal(f.calls.length, 0);
+});
+test("pause during token counting prevents recognition without creating a reservation", async () => {
+  const f = fixture(1);
+  globalThis.__tokenCount = async () => {
+    f.plugin.pause();
+    return { status: 200, json: { input_tokens: 100 } };
+  };
+  await f.plugin.update();
+  assert.equal(f.calls.length, 0);
+  assert.equal(f.plugin.costs.total.requests, 0);
+});
+test("new limits set during the active request stop the next page while preserving its result", async () => {
+  const f = fixture(4),
+    usual = globalThis.__response;
+  f.plugin.config.continuous = true;
+  globalThis.__response = async (request) => {
+    await f.plugin.saveCostSettings({
+      ...f.plugin.costs.settings,
+      dailyUsd: 0,
+    });
+    return usual(request);
+  };
+  await f.plugin.update();
+  assert.equal(f.calls.length, 1);
+  assert.equal(Object.keys(f.plugin.store.notebooks[source].pages).length, 1);
+  assert.equal(f.plugin.progress.stage, "Spending paused");
+});
+test("failure to save settled accounting preserves the paid transcript and blocks new requests", async () => {
+  const f = fixture(3),
+    usual = globalThis.__response;
+  f.plugin.config.continuous = true;
+  const write = globalThis.localStorage.setItem;
+  globalThis.__response = async (request) => {
+    const result = await usual(request);
+    globalThis.localStorage.setItem = (key, value) => {
+      if (key.endsWith(":spending-v1")) throw Error("Storage full");
+      write(key, value);
+    };
+    return result;
+  };
+  await f.plugin.update();
+  assert.equal(f.calls.length, 1);
+  assert.equal(Object.keys(f.plugin.store.notebooks[source].pages).length, 1);
+  assert.equal(f.plugin.progress.stage, "Spending paused");
+});
+test("one edit only calls AI once and reorder/deletion preserve correct text/history", async () => {
+  const f = fixture(2);
+  await f.plugin.update();
+  const first = f.plugin.store.notebooks[source].pages["native:1"].text;
+  f.change([
+    { id: "native:2", number: 1, fingerprint: "f2" },
+    { id: "native:1", number: 2, fingerprint: "changed" },
+  ]);
+  await f.plugin.update();
+  assert.equal(f.calls.length, 3);
+  assert.deepEqual(requestedPages(f.calls[2]),[2]);
+  assert.equal(
+    f.plugin.store.notebooks[source].pages["native:2"].text,
+    "text 2",
+  );
+  assert.notEqual(
+    f.plugin.store.notebooks[source].pages["native:1"].text,
+    first,
+  );
+  assert.ok(f.plugin.store.history.length);
+  f.change([{ id: "native:1", number: 1, fingerprint: "changed" }]);
+  await f.plugin.update();
+  assert.equal(f.calls.length, 3);
+  assert.match(f.files.get("Mirror/a.md"), /text 3/);
+  assert.doesNotMatch(f.files.get("Mirror/a.md"), /text 2/);
+});
+test("metadata-only changes do not pay again or change the last saved time", async () => {
+  const f = fixture(2);
+  await f.plugin.update();
+  const state = f.plugin.store.notebooks[source];
+  const saved = state.lastSaved;
+  const output = f.files.get("Mirror/a.md");
+  f.change([
+    { id: "native:1", number: 1, fingerprint: "f1" },
+    { id: "native:2", number: 2, fingerprint: "f2" },
+  ]);
+  await f.plugin.update();
+  assert.equal(f.calls.length, 2);
+  assert.equal(state.lastSaved, saved);
+  assert.equal(f.files.get("Mirror/a.md"), output);
+  assert.equal(f.plugin.store.queue.length, 0);
+});
+test("AI-off mode indexes and resumes without paying or storing mock transcripts", async () => {
+  const f = fixture(3);
+  f.plugin.aiEnabled = false;
+  await f.plugin.update();
+  const state = f.plugin.store.notebooks[source];
+  assert.equal(f.calls.length, 0);
+  await assert.rejects(f.plugin.manual(source, "1", true), /Switch on AI/);
+  assert.deepEqual(state.forcePending, []);
+  assert.equal(state.desired.length, 3);
+  assert.equal(Object.keys(state.pages).length, 0);
+  assert.equal(f.files.has("Mirror/a.md"), false);
+  assert.equal(state.status, "queued");
+  await assert.rejects(
+    f.plugin.transcribe("image", 1, f.plugin.config.profiles[0], ""),
+    /switched off/,
+  );
+  assert.equal(f.calls.length, 0);
+  f.plugin.aiEnabled = true;
+  await f.plugin.update();
+  assert.equal(f.calls.length, 2);
+});
+test("failed second request preserves first paid result and retry does not repeat it", async () => {
+  const f = fixture(2);
+  let attempt = 0;
+  globalThis.__response = async (request) => {
+    f.calls.push(JSON.parse(request.body));
+    attempt++;
+    if (attempt === 2) throw Error("network failed");
+    return answer("saved",JSON.parse(request.body));
+  };
+  await f.plugin.update();
+  assert.equal(f.plugin.store.notebooks[source].status, "partial");
+  assert.equal(f.plugin.progress.stage, "Needs attention");
+  await f.plugin.retry();
+  assert.equal(f.calls.length, 2); // The failed page requires its own explicit retry, not a general Update.
+  await f.plugin.retryPage(source,"native:2");
+  await f.plugin.update();
+  assert.equal(f.calls.length, 3);
+  assert.equal(f.plugin.store.notebooks[source].status, "current");
+});
+test("user edits block publishing and profile changes do not charge unchanged pages", async () => {
+  const f = fixture(1);
+  await f.plugin.update();
+  f.plugin.config.profiles[0].prompt = "new profile";
+  await f.plugin.update();
+  assert.equal(f.calls.length, 1);
+  assert.equal(f.plugin.store.notebooks[source].profileOutdated, true);
+  f.files.set("Mirror/a.md", f.files.get("Mirror/a.md") + "\nMy annotation");
+  f.change([{ id: "native:1", number: 1, fingerprint: "edit" }]);
+  await f.plugin.update();
+  assert.equal(f.plugin.store.notebooks[source].status, "conflict");
+  assert.match(f.files.get("Mirror/a.md"), /My annotation/);
+});
+test("incomplete inventory never archives source; completed absence safely archives owned Markdown", async () => {
+  const f = fixture(3);
+  await f.plugin.update();
+  f.reader.list = async () => {
+    throw Error("storage unavailable");
+  };
+  await assert.rejects(f.plugin.update(), /storage unavailable/);
+  assert.notEqual(f.plugin.store.notebooks[source].status, "missing");
+  f.reader.list = async () => [];
+  await f.plugin.update();
+  assert.equal(f.plugin.store.queue.length, 0);
+  const state = f.plugin.store.notebooks[source];
+  assert.equal(state.status, "missing");
+  assert.ok(state.output.startsWith("Supernote Transcripts/Archive/"));
+  assert.ok(f.files.has(state.output));
+  assert.equal(f.files.has("Mirror/a.md"), false);
+});
+test("sources without a glossary omit reference text while a custom profile includes it", async () => {
+  const f = fixture(1);
+  f.files.set("Glossary.txt", "acetylcholine");
+  f.plugin.config.profiles.push({
+    id: "custom",
+    name: "Custom vocabulary",
+    model: "test",
+    endpoint: "https://example.invalid/responses",
+    prompt: "transcribe",
+    glossaries: ["Glossary.txt"],
+  });
+  await f.plugin.manual(source, "1");
+  assert.doesNotMatch(f.calls[0].input[0].content[0].text, /acetylcholine/);
+  f.plugin.config.rules[0].profileId = "custom";
+  await f.plugin.manual(source, "1", true);
+  assert.match(f.calls[1].input[0].content[0].text, /acetylcholine/);
+});
+
+test("a fresh installation has no selected sources or bundled glossary", async () => {
+  const f = fixture(1),
+    fresh = new Runtime(f.app);
+  fresh.aiEnabled = false;
+  await fresh.onload();
+  assert.deepEqual(fresh.config.rules, []);
+  assert.deepEqual(fresh.config.profiles[0].glossaries, []);
+  assert.equal(
+    [...f.files.keys()].some((p) => p.includes("Glossaries/")),
+    false,
+  );
+  assert.equal(f.calls.length, 0);
+});
+
+test("prototype migration preserves supplied vocabulary and cached recognition", async () => {
+  const f = fixture(1);
+  f.app.data = {
+    config: {
+      source: "/storage/emulated/0/Note/Work",
+      output: "Work mirror",
+      prompt: "Original instructions",
+      glossary: "my technical vocabulary",
+    },
+    cache: {
+      [source]: {
+        1: { text: "Paid result", hash: "render-hash", recipe: "old-recipe" },
+      },
+    },
+  };
+  const migrated = new Runtime(f.app);
+  migrated.aiEnabled = false;
+  await migrated.onload();
+  const profile = migrated.config.profiles.find((p) => p.id !== "general");
+  assert.equal(profile.name, "Imported settings");
+  assert.equal(profile.prompt, "Original instructions");
+  assert.equal(f.files.get(profile.glossaries[0]), "my technical vocabulary");
+  assert.equal(
+    migrated.config.rules[0].source,
+    "/storage/emulated/0/Note/Work",
+  );
+  assert.equal(migrated.config.rules[0].output, "Work mirror");
+  assert.equal(
+    migrated.store.notebooks[source].pages["legacy:1"].text,
+    "Paid result",
+  );
+  assert.equal(f.calls.length, 0);
+});
+
+test("prototype migration without user vocabulary creates no glossary", async () => {
+  const f = fixture(1);
+  f.app.data = { config: { prompt: "Original instructions" }, cache: {} };
+  const migrated = new Runtime(f.app);
+  migrated.aiEnabled = false;
+  await migrated.onload();
+  assert.equal(
+    migrated.config.profiles.every((p) => p.glossaries.length === 0),
+    true,
+  );
+  assert.equal(
+    [...f.files.keys()].some((p) => p.includes("Glossaries/")),
+    false,
+  );
+  assert.equal(migrated.config.rules[0].source, "/storage/emulated/0/Note");
+  assert.equal(f.calls.length, 0);
+});
+
+test("migrating a glossary preserves an existing unrelated reference file", async () => {
+  const f = fixture(1),
+    path = "Supernote Transcripts/Glossaries/Imported glossary.txt";
+  f.files.set(path, "Existing user glossary");
+  f.app.data = { config: { glossary: "Imported user vocabulary" }, cache: {} };
+  const migrated = new Runtime(f.app);
+  migrated.aiEnabled = false;
+  await migrated.onload();
+  assert.equal(f.files.get(path), "Existing user glossary");
+  const profile = migrated.config.profiles.find((p) => p.id !== "general");
+  assert.notEqual(profile.glossaries[0], path);
+  assert.equal(f.files.get(profile.glossaries[0]), "Imported user vocabulary");
+});
+
+test("confirmed notebook rename relocates owned output and reuses paid pages", async () => {
+  const f = fixture(2);
+  await f.plugin.update();
+  const original = f.plugin.store.notebooks[source];
+  const id = original.id,
+    text = original.pages["native:1"].text;
+  const renamed = "/storage/emulated/0/Note/Reflections/renamed.note";
+  f.rename(renamed);
+  await f.plugin.update();
+  assert.equal(f.calls.length, 2);
+  assert.equal(f.plugin.store.notebooks[source], undefined);
+  const state = f.plugin.store.notebooks[renamed];
+  assert.equal(state.id, id);
+  assert.equal(state.pages["native:1"].text, text);
+  assert.equal(state.status, "current");
+  assert.equal(state.output, "Mirror/renamed.md");
+  assert.ok(f.files.has("Mirror/renamed.md"));
+  assert.equal(f.files.has("Mirror/a.md"), false);
+  assert.match(f.files.get(state.output), /# renamed/);
+});
+test("confirmed deletion archives owned output and returning notebook restores without paid work", async () => {
+  const f = fixture(2);
+  await f.plugin.update();
+  const text = f.files.get("Mirror/a.md");
+  f.missing();
+  await f.plugin.update();
+  const archived = f.plugin.store.notebooks[source].output;
+  assert.ok(archived.startsWith("Supernote Transcripts/Archive/"));
+  assert.equal(f.files.get(archived), text);
+  assert.equal(f.files.has("Mirror/a.md"), false);
+  f.restore();
+  await f.plugin.update();
+  const state = f.plugin.store.notebooks[source];
+  assert.equal(f.calls.length, 2);
+  assert.equal(state.status, "current");
+  assert.equal(state.output, "Mirror/a.md");
+  assert.equal(f.files.get(state.output), text);
+  assert.equal(f.files.has(archived), false);
+});
+test("changed output folder relocates owned Markdown without recognizing unchanged pages", async () => {
+  const f = fixture(2);
+  await f.plugin.update();
+  f.plugin.config.rules[0].output = "Moved mirror";
+  await f.plugin.update();
+  assert.equal(f.calls.length, 2);
+  assert.equal(f.plugin.store.notebooks[source].output, "Moved mirror/a.md");
+  assert.equal(f.files.has("Mirror/a.md"), false);
+  assert.ok(f.files.has("Moved mirror/a.md"));
+});
+test("force batch consumes queue flag and restart only recognizes remaining forced pages", async () => {
+  const f = fixture(3);
+  await f.plugin.saveConfig();
+  await f.plugin.update();
+  await f.plugin.update();
+  assert.equal(f.calls.length, 3);
+  f.plugin.store.queue.push({ source, force: true });
+  await f.plugin.update();
+  assert.equal(f.calls.length, 5);
+  assert.deepEqual(f.plugin.store.notebooks[source].forcePending, ["native:3"]);
+  assert.equal(f.plugin.store.queue[0].force, false);
+  const firstReplacement =
+    f.plugin.store.notebooks[source].pages["native:1"].text;
+  const restarted = new Runtime(f.app);
+  restarted.reader = () => f.reader;
+  await restarted.onload();
+  await restarted.update();
+  assert.equal(f.calls.length, 6);
+  assert.equal(
+    restarted.store.notebooks[source].pages["native:1"].text,
+    firstReplacement,
+  );
+  assert.deepEqual(restarted.store.notebooks[source].forcePending, []);
+  assert.equal(restarted.store.notebooks[source].status, "current");
+  assert.equal(restarted.store.queue.length, 0);
+  assert.ok(restarted.store.history.length);
+});
+test("pausing during forced request checkpoints its result and resumes remaining pages", async () => {
+  const f = fixture(2);
+  await f.plugin.update();
+  const usual = globalThis.__response;
+  let paused = false;
+  globalThis.__response = async (request) => {
+    const result = await usual(request);
+    if (!paused) {
+      paused = true;
+      f.plugin.pause();
+    }
+    return result;
+  };
+  f.plugin.store.queue.push({ source, force: true });
+  await f.plugin.update();
+  assert.equal(f.calls.length, 3);
+  assert.deepEqual(f.plugin.store.notebooks[source].forcePending, ["native:2"]);
+  assert.equal(f.plugin.store.queue[0].force, false);
+  assert.equal(f.plugin.progress.stage, "Paused");
+  const paid = f.plugin.store.notebooks[source].pages["native:1"].text;
+  globalThis.__response = usual;
+  await f.plugin.resume();
+  assert.equal(f.calls.length, 4);
+  assert.equal(f.plugin.store.notebooks[source].pages["native:1"].text, paid);
+  assert.equal(f.plugin.store.notebooks[source].status, "current");
+});
+test("modified owned output conflicts before any further paid request", async () => {
+  const f = fixture(1);
+  await f.plugin.update();
+  const modified = f.files.get("Mirror/a.md") + "\nPersonal correction";
+  f.files.set("Mirror/a.md", modified);
+  f.change([{ id: "native:1", number: 1, fingerprint: "changed" }]);
+  await f.plugin.update();
+  assert.equal(f.calls.length, 1);
+  assert.equal(f.plugin.store.notebooks[source].status, "conflict");
+  assert.equal(f.files.get("Mirror/a.md"), modified);
+  await assert.rejects(f.plugin.manual(source, "1", true), /manually edited/);
+  assert.equal(f.calls.length, 1);
+  assert.equal(f.files.get("Mirror/a.md"), modified);
+});
+test("profile edits during recognition cannot mutate in-flight notebook recipe or subsequent page request", async () => {
+  const f = fixture(2);
+  const usual = globalThis.__response;
+  let modified = false;
+  globalThis.__response = async (request) => {
+    const result = await usual(request);
+    if (!modified) {
+      modified = true;
+      f.plugin.config.profiles[0].prompt = "changed instructions";
+      f.plugin.config.profiles[0].model = "changed-model";
+      f.plugin.config.profiles[0].endpoint =
+        "https://changed.invalid/responses";
+    }
+    return result;
+  };
+  await f.plugin.update();
+  assert.equal(f.calls.length, 2);
+  assert.equal(f.calls[0].model, "test-model");
+  assert.equal(f.calls[1].model, "test-model");
+  assert.match(f.calls[1].input[0].content[0].text, /^transcribe/);
+  assert.doesNotMatch(
+    f.calls[1].input[0].content[0].text,
+    /changed instructions/,
+  );
+  const pages = f.plugin.store.notebooks[source].pages;
+  assert.equal(pages["native:1"].recipe, pages["native:2"].recipe);
+  await f.plugin.update();
+  assert.equal(f.calls.length, 2);
+  assert.equal(f.plugin.store.notebooks[source].profileOutdated, true);
+});
+test("excluding a source prunes work without archiving it; re-enabling reuses completed pages", async () => {
+  const f = fixture(3);
+  await f.plugin.update();
+  f.plugin.config.rules[0].exclude = ["a.note"];
+  await f.plugin.update();
+  assert.equal(f.plugin.store.notebooks[source].status, "excluded");
+  assert.equal(f.plugin.store.queue.length, 0);
+  assert.ok(f.files.has("Mirror/a.md"));
+  f.plugin.config.rules[0].exclude = [];
+  await f.plugin.update();
+  assert.equal(f.calls.length, 3);
+  assert.equal(f.plugin.store.notebooks[source].status, "current");
+});
+test("source revision changes preserve paid cache and refuse stale publication", async () => {
+  const f = fixture(1),
+    usual = globalThis.__response;
+  globalThis.__response = async (request) => {
+    const result = await usual(request);
+    f.change([{ id: "native:1", number: 1, fingerprint: "f1" }]);
+    return result;
+  };
+  await f.plugin.update();
+  assert.equal(f.plugin.store.notebooks[source].status, "failed");
+  assert.equal(f.files.has("Mirror/a.md"), false);
+  assert.equal(f.calls.length, 1);
+  globalThis.__response = usual;
+  await f.plugin.retry();
+  assert.equal(f.calls.length, 1);
+  assert.equal(f.plugin.store.notebooks[source].status, "current");
+  assert.match(f.files.get("Mirror/a.md"), /text 1/);
+});
+test("new personal file appearing while publishing cannot be overwritten", async () => {
+  const f = fixture(1),
+    usual = f.app.vault.create;
+  f.app.vault.create = async (path, text) => {
+    if (path === "Mirror/a.md") f.files.set(path, "My personal note");
+    return usual(path, text);
+  };
+  await f.plugin.update();
+  assert.equal(f.files.get("Mirror/a.md"), "My personal note");
+  assert.equal(f.plugin.store.notebooks[source].status, "failed");
+  assert.equal(f.calls.length, 1);
+});
+test("choosing a new output preserves personal corrections and reuses cached recognition", async () => {
+  const f = fixture(1);
+  await f.plugin.update();
+  f.files.set(
+    "Mirror/a.md",
+    "---\nnomad_transcripts: true\n---\nMy corrections",
+  );
+  f.plugin.config.rules[0].output = "Safe new mirror";
+  await f.plugin.update();
+  assert.equal(f.calls.length, 1);
+  assert.match(f.files.get("Mirror/a.md"), /My corrections/);
+  assert.match(f.files.get("Safe new mirror/a.md"), /text 1/);
+  assert.equal(f.plugin.store.notebooks[source].status, "current");
+});
+
+test("new additions and edits outrank older backfill and retain priority over restart", async () => {
+  const f = fixture(3);
+  f.plugin.config.batchPages = 1;
+  await f.plugin.saveConfig();
+  await f.plugin.update();
+  f.change([
+    { id: "native:1", number: 1, fingerprint: "f1" },
+    { id: "native:2", number: 2, fingerprint: "f2" },
+    { id: "native:3", number: 3, fingerprint: "f3" },
+    { id: "native:4", number: 4, fingerprint: "f4" },
+    { id: "native:5", number: 5, fingerprint: "f5" },
+  ]);
+  await f.plugin.update();
+  assert.ok(f.plugin.store.notebooks[source].pages["native:4"]);
+  assert.equal(f.plugin.store.notebooks[source].pages["native:2"], undefined);
+  assert.deepEqual(f.plugin.store.notebooks[source].priorityPages, [
+    "native:5",
+  ]);
+  const restarted = new Runtime(f.app);
+  restarted.reader = () => f.reader;
+  await restarted.onload();
+  await restarted.update();
+  assert.ok(restarted.store.notebooks[source].pages["native:5"]);
+  assert.equal(restarted.store.notebooks[source].pages["native:2"], undefined);
+  f.change([
+    { id: "native:1", number: 1, fingerprint: "edited" },
+    { id: "native:2", number: 2, fingerprint: "f2" },
+    { id: "native:3", number: 3, fingerprint: "f3" },
+    { id: "native:4", number: 4, fingerprint: "f4" },
+    { id: "native:5", number: 5, fingerprint: "f5" },
+  ]);
+  await restarted.update();
+  assert.equal(
+    restarted.store.notebooks[source].pages["native:1"].fingerprint,
+    "edited",
+  );
+  assert.equal(restarted.store.notebooks[source].pages["native:2"], undefined);
+});
+test("recently changed notebook runs before an older queued notebook", async () => {
+  const f = fixture(3);
+  f.plugin.config.batchPages = 1;
+  await f.plugin.update();
+  const newer = "/storage/emulated/0/Note/Reflections/newer.note";
+  const usual = f.reader.open;
+  f.reader.list = async () => [
+    { path: source, size: 100, mtime: 1 },
+    { path: newer, size: 100, mtime: 10 },
+  ];
+  f.reader.open = async (path) => {
+    const opened = await usual();
+    opened.descriptor.path = path;
+    opened.descriptor.revision = path === newer ? "10:100" : "1:100";
+    return opened;
+  };
+  f.reader.revision = async (path) => (path === newer ? "10:100" : "1:100");
+  await f.plugin.update();
+  assert.ok(f.plugin.store.notebooks[newer].pages["native:1"]);
+  assert.equal(Object.keys(f.plugin.store.notebooks[source].pages).length, 1);
+});
+test("native inactive state blocks new requests even before document visibility updates", async () => {
+  const f = fixture(1),
+    events = {};
+  await f.plugin.saveConfig();
+  window.Capacitor = {
+    Plugins: {
+      App: {
+        getState: async () => ({ isActive: false }),
+        addListener: async (name, handler) => {
+          events[name] = handler;
+          return { remove: async () => {} };
+        },
+      },
+    },
+  };
+  await f.plugin.onload();
+  assert.equal(document.hidden, false);
+  await f.plugin.update();
+  assert.equal(f.calls.length, 0);
+  assert.equal(f.plugin.progress.stage, "Waiting for Obsidian");
+  events.appStateChange({ isActive: true });
+  await f.plugin.update();
+  assert.equal(f.calls.length, 1);
+  assert.equal(f.plugin.store.notebooks[source].status, "current");
+});
+test("native pause saves current paid response and defers subsequent pages", async () => {
+  const f = fixture(2),
+    events = {};
+  await f.plugin.saveConfig();
+  window.Capacitor = {
+    Plugins: {
+      App: {
+        getState: async () => ({ isActive: true }),
+        addListener: async (name, handler) => {
+          events[name] = handler;
+          return { remove: async () => {} };
+        },
+      },
+    },
+  };
+  await f.plugin.onload();
+  const usual = globalThis.__response;
+  globalThis.__response = async (request) => {
+    const result = await usual(request);
+    events.pause();
+    return result;
+  };
+  await f.plugin.update();
+  assert.equal(f.calls.length, 1);
+  assert.ok(f.plugin.store.notebooks[source].pages["native:1"]);
+  assert.equal(f.plugin.progress.stage, "Waiting for Obsidian");
+  assert.equal(f.plugin.progress.paused, false);
+  globalThis.__response = usual;
+  events.appStateChange({ isActive: true });
+  await f.plugin.update();
+  assert.equal(f.calls.length, 2);
+  assert.equal(f.plugin.store.notebooks[source].status, "current");
+});
+
+const flush=()=>new Promise(resolve=>setTimeout(resolve,1));
+async function waitFor(predicate){for(let i=0;i<100;i++){if(predicate())return;await flush();}throw Error("Mock work did not reach expected stage");}
+test("parallel pages finish out of order, pause stops dispatch and every paid result survives",async()=>{
+  const f=fixture(7);f.plugin.config.continuous=true;f.plugin.concurrency=3;
+  const finish=new Map(),sent=[];
+  globalThis.__response=async request=>{
+    const body=JSON.parse(request.body),page=requestedPages(body)[0];sent.push(page);
+    await new Promise(resolve=>finish.set(page,resolve));
+    return answer(`page-${page}`,body);
+  };
+  const work=f.plugin.update();await waitFor(()=>sent.length===3);
+  f.plugin.pause();finish.get(3)();await waitFor(()=>!!f.plugin.store.notebooks[source].pages["native:3"]);
+  finish.get(1)();finish.get(2)();await work;
+  assert.deepEqual(sent,[1,2,3]);assert.equal(Object.keys(f.plugin.store.notebooks[source].pages).length,3);
+  const md=f.files.get("Mirror/a.md");assert.ok(md.indexOf("page-1")<md.indexOf("page-2")&&md.indexOf("page-2")<md.indexOf("page-3"));
+  assert.equal(f.plugin.costs.total.requests,3);assert.equal(f.plugin.progress.paused,true);
+});
+test("parallel admission respects request caps before sending additional recognition",async()=>{
+  const f=fixture(7);f.plugin.config.continuous=true;f.plugin.concurrency=4;
+  await f.plugin.saveCostSettings({...f.plugin.costs.settings,dailyRequests:2});
+  await f.plugin.update();assert.equal(f.calls.length,2);assert.equal(Object.keys(f.plugin.store.notebooks[source].pages).length,2);
+  assert.ok(f.plugin.progress.budgetBlocked);assert.equal(f.plugin.costs.total.requests,2);
+});
+function sharing(f,device){
+  const adapter=f.app.vault.adapter;
+  adapter.list=async path=>{
+    const prefix=path?path+"/":"",files=[],folders=[];
+    for(const [p,text]of f.files)if(p.startsWith(prefix)&&!p.slice(prefix.length).includes("/")){(text==="folder"?folders:files).push(p);}
+    return {files,folders};
+  };
+  const io={exists:adapter.exists,read:adapter.read,write:adapter.write,create:f.app.vault.create,mkdir:f.app.vault.createFolder,list:adapter.list};
+  f.plugin.sharedCache=new SharedNotebookCache(io,device,{settleMs:0});f.plugin.config.rules[0].sharedId="linked-reflections";
+}
+test("a desktop mount reuses Nomad results and publishes safely without paying twice",async()=>{
+  const a=fixture(3);sharing(a,"nomad");await a.plugin.update();assert.equal(a.calls.length,2);
+  const b=fixture(3);sharing(b,"desktop");const local="C:/Cloud/Reflections/a.note";
+  globalThis.__desktop=true;
+  b.rename(local);b.plugin.config.rules[0].source="C:/Cloud/Reflections";
+  for(const [p,text]of a.files)if(!p.startsWith(".obsidian"))b.files.set(p,text);
+  await b.plugin.update();assert.equal(b.calls.length,1);
+  assert.equal(Object.keys(b.plugin.store.notebooks[local].pages).length,3);
+  await b.plugin.update();assert.equal(b.calls.length,1);
+});
+test("header presentation changes reuse cached pages and preserve hidden page provenance",async()=>{
+  const f=fixture(2);await f.plugin.update();assert.ok(f.files.get("Mirror/a.md").includes("## Page 1"));
+  f.plugin.showPageHeadings=false;await f.plugin.update();
+  assert.equal(f.calls.length,2);assert.ok(f.files.get("Mirror/a.md").includes("supernote-page:"));assert.ok(!f.files.get("Mirror/a.md").includes("## Page 1"));
+});
+
+test("subscription interruption acknowledgement retains request counts and leaves API accounting untouched", async () => {
+  const f=fixture(1), before=JSON.stringify(f.plugin.costs);
+  f.plugin.provider='subscription';
+  const id=f.plugin.subscriptionBook.reserve(source,'test-model','recipe',2);
+  f.plugin.subscriptionBook.finish(id);
+  assert.equal(f.plugin.subscriptionUsage.unconfirmed,1);
+  const next=f.plugin.subscriptionBook.reserve(source,'test-model','recipe',2);f.plugin.subscriptionBook.finish(next,{usage:{}},false);
+  await f.plugin.resolveUnconfirmedCosts();
+  assert.equal(f.plugin.subscriptionUsage.unconfirmed,0);
+  assert.equal(f.plugin.subscriptionUsage.requests,2);
+  assert.equal(JSON.stringify(f.plugin.costs),before);
+  assert.throws(()=>f.plugin.subscriptionBook.reserve(source,'test-model','recipe',2),/Daily ChatGPT request limit/);
+});
+
+test("production accepts the old Android callback after the test plugin is removed", async () => {
+  const f=fixture(1); await f.plugin.onload();
+  let finished=0; f.plugin.finishSubscriptionLogin=async()=>{finished++;};
+  for(const action of ['nomad-transcripts-subscription-return','nomad-subscription-return']) {
+    assert.ok(f.plugin.protocolHandlers.has(action));
+    f.plugin.protocolHandlers.get(action)();
+  }
+  assert.equal(finished,2); assert.equal(f.calls.length,0);
+  const other=fixture(1);other.app.plugins={plugins:{'nomad-subscription-test':{}}};
+  await other.plugin.onload();
+  assert.ok(other.plugin.protocolHandlers.has('nomad-transcripts-subscription-return'));
+  assert.equal(other.plugin.protocolHandlers.has('nomad-subscription-return'),false);
+});
+
+test("unreadable glossary gives an actionable error before making AI calls", async () => {
+  const f=fixture(1); f.plugin.config.profiles[0].glossaries=['Glossaries/missing.txt'];
+  await f.plugin.update();
+  assert.equal(f.calls.length,0);
+  assert.match(f.plugin.store.notebooks[source].error,/Cannot read glossary "Glossaries\/missing.txt".*Restore it/);
+});
+
+async function editedTranscriptFixture(count=1, shared=false, changePages) {
+  const f=fixture(count);if(shared)sharing(f,"recovery-device");
+  await f.plugin.saveConfig();await f.plugin.update();
+  const state=f.plugin.store.notebooks[source], original=f.files.get(state.output);
+  const edited=original+"\nMy exact manual correction.\n";
+  f.files.set(state.output,edited);
+  f.change(changePages??structuredClone(state.desired));
+  await f.plugin.update();
+  assert.equal(f.plugin.store.notebooks[source].status,"conflict");
+  assert.match(f.plugin.store.notebooks[source].error,/manually edited|ownership record/);
+  return {...f,edited,original};
+}
+
+test("replace recovery backs up exact edits, reuses cache, leaves switches alone and queues pending pages for explicit retry",async()=>{
+  const f=await editedTranscriptFixture(3,false,[
+    {id:"native:1",number:1,fingerprint:"edited-page"},
+    {id:"native:2",number:2,fingerprint:"f2"},
+    {id:"native:3",number:3,fingerprint:"f3"},
+  ]);
+  f.plugin.pause();f.plugin.autoEnabled=true;
+  const paid=f.calls.length,cache=JSON.stringify(f.plugin.store.notebooks[source].pages),ledger=JSON.stringify(f.plugin.costs);
+  const flags={ai:f.plugin.aiEnabled,auto:f.plugin.autoEnabled,paused:f.plugin.progress.paused};
+  const preview=await f.plugin.previewTranscriptRecovery(source);
+  assert.equal(preview.current,f.edited);assert.match(preview.generated,/Previous transcription; this page has changed/);
+  const result=await f.plugin.resolveTranscriptConflict(source,"replace",preview.current);
+  assert.match(result.backup,/^Supernote Transcripts\/History\/a\/[\w-]+\.md$/);
+  assert.equal(f.files.get(result.backup),f.edited);assert.ok(f.plugin.store.history.includes(result.backup));
+  assert.equal(f.files.get(result.output),preview.generated);assert.equal(f.calls.length,paid);
+  assert.equal(JSON.stringify(f.plugin.store.notebooks[source].pages),cache);assert.equal(JSON.stringify(f.plugin.costs),ledger);
+  assert.deepEqual({ai:f.plugin.aiEnabled,auto:f.plugin.autoEnabled,paused:f.plugin.progress.paused},flags);
+  assert.equal(f.plugin.store.notebooks[source].status,"queued");assert.equal(f.plugin.store.notebooks[source].error,undefined);
+  assert.deepEqual(f.plugin.store.queue.map(t=>[t.source,t.force]),[[source,false]]);
+  await f.plugin.retry();assert.equal(f.calls.length,paid+2);assert.equal(f.plugin.store.notebooks[source].status,"current");
+  assert.equal(f.plugin.store.notebooks[source].pages["native:2"].text,"text 2");
+});
+
+test("keep recovery preserves the edited original and collision file while output override survives rule edit and restart",async()=>{
+  const f=await editedTranscriptFixture();f.files.set("Mirror/a (mirror).md","Unrelated personal note");
+  const preview=await f.plugin.previewTranscriptRecovery(source),paid=f.calls.length;
+  const result=await f.plugin.resolveTranscriptConflict(source,"keep",preview.current);
+  assert.equal(result.backup,undefined);assert.equal(result.output,"Mirror/a (mirror 2).md");
+  assert.equal(f.files.get("Mirror/a.md"),f.edited);assert.equal(f.files.get("Mirror/a (mirror).md"),"Unrelated personal note");
+  assert.match(f.files.get(result.output),/# a \(mirror 2\)/);assert.doesNotMatch(f.files.get(result.output),/My exact manual correction/);
+  f.plugin.config.rules[0].output="New rule default";await f.plugin.saveConfig();await f.plugin.update();
+  assert.equal(f.plugin.store.notebooks[source].outputOverride,result.output);assert.equal(f.plugin.store.notebooks[source].output,result.output);
+  const restarted=new Runtime(f.app);restarted.reader=()=>f.reader;await restarted.onload();await restarted.update();
+  assert.equal(restarted.store.notebooks[source].outputOverride,result.output);assert.equal(restarted.store.notebooks[source].output,result.output);
+  assert.equal(f.calls.length,paid);assert.equal(f.files.get("Mirror/a.md"),f.edited);assert.equal(f.files.has("New rule default/a.md"),false);
+});
+
+test("recovery refuses text changed since preview and an edit racing compare-before-write",async()=>{
+  const f=await editedTranscriptFixture(),preview=await f.plugin.previewTranscriptRecovery(source);
+  f.files.set(preview.output,preview.current+"Later correction");
+  await assert.rejects(f.plugin.resolveTranscriptConflict(source,"replace",preview.current),/since the preview/);
+  assert.equal(f.plugin.store.history.length,0);assert.equal(f.files.get(preview.output),preview.current+"Later correction");
+  const latest=await f.plugin.previewTranscriptRecovery(source),process=f.app.vault.adapter.process;
+  f.app.vault.adapter.process=async(path,transform)=>{
+    if(path===latest.output)f.files.set(path,latest.current+"Concurrent edit while saving");
+    return process(path,transform);
+  };
+  await assert.rejects(f.plugin.resolveTranscriptConflict(source,"replace",latest.current),/manually edited while saving/);
+  assert.equal(f.files.get(latest.output),latest.current+"Concurrent edit while saving");
+  assert.equal(f.files.get(f.plugin.store.history.at(-1)),latest.current);assert.equal(f.plugin.store.notebooks[source].status,"conflict");
+  assert.equal(f.calls.length,1);
+});
+
+test("failed backup leaves the original, ownership and cached results untouched",async()=>{
+  const f=await editedTranscriptFixture(),preview=await f.plugin.previewTranscriptRecovery(source);
+  const state=JSON.stringify(f.plugin.store.notebooks[source]),create=f.app.vault.create;
+  f.app.vault.create=async(path,text)=>{if(path.startsWith("Supernote Transcripts/History/"))throw Error("Backup disk unavailable");return create(path,text);};
+  await assert.rejects(f.plugin.resolveTranscriptConflict(source,"replace",preview.current),/Backup disk unavailable/);
+  assert.equal(f.files.get(preview.output),preview.current);assert.equal(JSON.stringify(f.plugin.store.notebooks[source]),state);
+  assert.equal(f.plugin.store.history.length,0);assert.equal(f.calls.length,1);
+});
+
+test("recovery refuses personal notes, wrong notebook content and active work, while preview refreshes source metadata",async()=>{
+  const f=await editedTranscriptFixture();
+  f.files.set("Mirror/a.md","# Personal note\nKeep this.");
+  await assert.rejects(f.plugin.previewTranscriptRecovery(source),/personal note/);
+  f.files.set("Mirror/a.md",f.edited.replace("nomad_transcripts: true\n","nomad_transcripts: true\nsupernote_notebook_id: another-notebook\n"));
+  await assert.rejects(f.plugin.previewTranscriptRecovery(source),/different notebook/);
+  f.files.set("Mirror/a.md",f.edited);f.plugin.task=Promise.resolve();
+  await assert.rejects(f.plugin.previewTranscriptRecovery(source),/active work/);f.plugin.task=null;
+  const original=JSON.stringify(f.plugin.store);
+  f.change([{id:"native:1",number:1,fingerprint:"newer-source"}]);
+  const fresh=await f.plugin.previewTranscriptRecovery(source);
+  assert.ok(fresh.revision.startsWith(await f.reader.revision(source)));assert.match(fresh.generated,/Previous transcription; this page has changed/);
+  assert.equal(JSON.stringify(f.plugin.store),original);
+  assert.equal(f.files.get("Mirror/a.md"),f.edited);assert.equal(f.calls.length,1);
+});
+
+test("fresh recovery preview reconciles only a working copy and later retries only edited or new pages",async()=>{
+  const f=await editedTranscriptFixture(2,true),state=f.plugin.store.notebooks[source];
+  delete state.publishedPages; // Prove the old local inventory from its cached Markdown hash.
+  const before={store:JSON.stringify(f.plugin.store),files:JSON.stringify([...f.files]),costs:JSON.stringify(f.plugin.costs)};
+  const persist=f.plugin.persist;let persistence=0;
+  f.plugin.persist=async()=>{persistence++;throw Error("Preview must not persist");};
+  f.change([{id:"native:1",number:1,fingerprint:"edited-first"},{id:"native:2",number:2,fingerprint:"f2"},{id:"native:3",number:3,fingerprint:"f3"}]);
+  const preview=await f.plugin.previewTranscriptRecovery(source);
+  assert.ok(preview.revision.startsWith(await f.reader.revision(source)));assert.equal(preview.current,f.edited);
+  assert.match(preview.generated,/2 page\(s\) awaiting/);assert.match(preview.generated,/Previous transcription; this page has changed/);
+  assert.equal(persistence,0);assert.equal(f.calls.length,2);assert.strictEqual(f.plugin.store.notebooks[source],state);
+  assert.equal(JSON.stringify(f.plugin.store),before.store);assert.equal(JSON.stringify([...f.files]),before.files);assert.equal(JSON.stringify(f.plugin.costs),before.costs);
+  assert.equal(state.publishedPages,undefined);
+  f.plugin.persist=persist;
+  const result=await f.plugin.resolveTranscriptConflict(source,"replace",preview.current,preview.revision);
+  assert.equal(f.files.get(result.backup),f.edited);assert.equal(f.files.get(result.output),preview.generated);assert.equal(f.calls.length,2);
+  const resolved=f.plugin.store.notebooks[source];assert.equal(resolved.revision,await f.reader.revision(source));assert.equal(resolved.desired.length,3);
+  assert.equal(resolved.status,"queued");assert.equal(resolved.pages["native:2"].text,"text 2");
+  await f.plugin.retry();assert.equal(f.calls.length,4);assert.equal(f.plugin.store.notebooks[source].pages["native:2"].text,"text 2");
+  assert.equal(f.plugin.store.notebooks[source].status,"current");
+});
+
+test("source edits after recovery preview reject the expected revision without committing state or Markdown",async()=>{
+  const f=await editedTranscriptFixture(1,true),preview=await f.plugin.previewTranscriptRecovery(source);
+  const state=f.plugin.store.notebooks[source],before=JSON.stringify(f.plugin.store),files=JSON.stringify([...f.files]);
+  f.change([{id:"native:1",number:1,fingerprint:"later-edit"}]);
+  await assert.rejects(f.plugin.resolveTranscriptConflict(source,"replace",preview.current,preview.revision),/changed since the recovery preview/);
+  assert.strictEqual(f.plugin.store.notebooks[source],state);assert.equal(JSON.stringify(f.plugin.store),before);
+  assert.equal(JSON.stringify([...f.files]),files);assert.equal(f.files.get(preview.output),preview.current);assert.equal(f.calls.length,1);
+});
+
+test("source changing during metadata-only recovery reading cannot produce a fresh preview",async()=>{
+  const f=await editedTranscriptFixture(),before=JSON.stringify(f.plugin.store),open=f.reader.open;
+  f.reader.open=async(path)=>{const opened=await open(path);f.change([{id:"native:1",number:1,fingerprint:"mid-read-edit"}]);return opened;};
+  await assert.rejects(f.plugin.previewTranscriptRecovery(source),/changed while reading its recovery snapshot/);
+  assert.equal(JSON.stringify(f.plugin.store),before);assert.equal(f.files.get("Mirror/a.md"),f.edited);assert.equal(f.calls.length,1);
+});
+
+test("recovery preview token rejects changed page content even when filesystem revision is unchanged",async()=>{
+  const f=await editedTranscriptFixture(),preview=await f.plugin.previewTranscriptRecovery(source),open=f.reader.open;
+  const statRevision=await f.reader.revision(source),before=JSON.stringify(f.plugin.store);
+  f.reader.open=async(path)=>{const opened=await open(path);opened.descriptor.pages[0].fingerprint="changed-with-same-stat";return opened;};
+  assert.equal(await f.reader.revision(source),statRevision);
+  await assert.rejects(f.plugin.resolveTranscriptConflict(source,"replace",preview.current,preview.revision),/changed since the recovery preview/);
+  assert.equal(JSON.stringify(f.plugin.store),before);assert.equal(f.files.get(preview.output),preview.current);assert.equal(f.calls.length,1);
+});
+
+test("source mutation during recovery write rolls back only the generated replacement",async()=>{
+  const f=await editedTranscriptFixture(),preview=await f.plugin.previewTranscriptRecovery(source),process=f.app.vault.adapter.process;
+  let mutated=false;
+  f.app.vault.adapter.process=async(path,transform)=>{
+    await process(path,transform);
+    if(path===preview.output&&!mutated){mutated=true;f.change([{id:"native:1",number:1,fingerprint:"changed-while-saving"}]);}
+  };
+  await assert.rejects(f.plugin.resolveTranscriptConflict(source,"replace",preview.current),/changed before recovery/);
+  assert.equal(f.files.get(preview.output),preview.current);assert.equal(f.files.get(f.plugin.store.history.at(-1)),preview.current);
+  assert.equal(f.plugin.store.notebooks[source].status,"conflict");assert.equal(f.calls.length,1);
+});
+
+test("explicit ownership recovery requires fresh cached pages and writes no manual text into page cache",async()=>{
+  const f=await editedTranscriptFixture();delete f.plugin.store.notebooks[source].publishedHash;delete f.plugin.store.notebooks[source].publishedPages;
+  f.plugin.store.notebooks[source].error="Existing generated transcript has no ownership record; choose another output folder.";
+  const cache=JSON.stringify(f.plugin.store.notebooks[source].pages),preview=await f.plugin.previewTranscriptRecovery(source);
+  await f.plugin.resolveTranscriptConflict(source,"replace",preview.current);
+  assert.equal(JSON.stringify(f.plugin.store.notebooks[source].pages),cache);assert.equal(f.calls.length,1);
+  assert.equal(f.files.get(f.plugin.store.history.at(-1)),f.edited);
+});
+
+test("owned transcript recovery permits edited headings and removed page markers while preserving the exact edits",async()=>{
+  const f=await editedTranscriptFixture(1,true);
+  const edited=f.edited.replace("# a\n","# My corrected notebook title\n").replace("## Page 1\n","");
+  f.files.set("Mirror/a.md",edited);
+  const preview=await f.plugin.previewTranscriptRecovery(source),result=await f.plugin.resolveTranscriptConflict(source,"replace",preview.current);
+  assert.equal(f.files.get(result.backup),edited);assert.equal(f.files.get(result.output),preview.generated);assert.equal(f.calls.length,1);
+  assert.equal(f.plugin.store.notebooks[source].status,"current");
+});
+
+test("manual recovery cannot bypass stale shared publication inventory or missing shared results when edited text has no receipt",async()=>{
+  const f=await editedTranscriptFixture(1,true),state=f.plugin.store.notebooks[source],id=await notebookIdentity("linked-reflections","a.note");
+  const io=f.plugin.sharedIO(),book=new PublicationReceipts(io);
+  assert.equal(await book.find(id,f.edited),undefined);
+  await book.save(id,f.original,[{id:"native:1",number:1,fingerprint:"remote-newer"}],{});
+  await assert.rejects(f.plugin.previewTranscriptRecovery(source),/newer or conflicting page inventory/);
+  await assert.rejects(f.plugin.resolveTranscriptConflict(source,"replace",f.edited),/newer or conflicting page inventory/);
+  assert.equal(f.files.get(state.output),f.edited);assert.equal(f.plugin.store.history.length,0);
+  state.error="Shared transcript has a newer or conflicting page inventory. Wait for synchronization.";
+  await assert.rejects(f.plugin.previewTranscriptRecovery(source),/Only manually edited/);
+  const missing=await editedTranscriptFixture(2,true);delete missing.plugin.store.notebooks[source].pages["native:2"];
+  await assert.rejects(missing.plugin.previewTranscriptRecovery(source),/results have not arrived/);
+  assert.equal(missing.files.get("Mirror/a.md"),missing.edited);assert.equal(missing.calls.length,2);
+});
+
+test("hash lookup retains receipt validation and damaged recovery evidence fails closed",async()=>{
+  const f=await editedTranscriptFixture(1,true),id=await notebookIdentity("linked-reflections","a.note"),book=new PublicationReceipts(f.plugin.sharedIO());
+  assert.equal((await book.findHash(id,await sharedHash(f.original))).pages[0].id,"native:1");
+  const record=[...f.files.keys()].find(p=>p.includes("/publications/")&&p.endsWith(".md"));
+  f.files.set(record,"Malformed receipt");
+  await assert.rejects(book.findHash(id,await sharedHash(f.original)),/receipt is damaged/);
+  await assert.rejects(f.plugin.previewTranscriptRecovery(source),/receipt is damaged/);
+  assert.equal(f.files.get("Mirror/a.md"),f.edited);assert.equal(f.calls.length,1);
+});
+
+test("legacy manual-edit conflict with appended pages recovers from its owned prefix receipt without recognizing new pages",async()=>{
+  const pages=Array.from({length:8},(_,i)=>({id:`native:${i+1}`,number:i+1,fingerprint:`f${i+1}`}));
+  const f=await editedTranscriptFixture(2,true,pages),state=f.plugin.store.notebooks[source];
+  // 0.6.1 persisted the advanced desired inventory when CheckOutput failed,
+  // but did not record the older published inventory.
+  delete state.publishedPages;
+  const oldHash=state.publishedHash,paid=f.calls.length,preview=await f.plugin.previewTranscriptRecovery(source);
+  assert.equal(state.publishedPages,undefined);assert.match(preview.generated,/6 page\(s\) awaiting/);
+  const result=await f.plugin.resolveTranscriptConflict(source,"replace",preview.current);
+  assert.equal(f.files.get(result.backup),f.edited);assert.equal(f.files.get(result.output),preview.generated);
+  assert.equal(f.calls.length,paid);assert.equal(f.plugin.store.notebooks[source].status,"queued");
+  assert.equal(f.plugin.store.notebooks[source].publishedPages.length,8);
+  assert.notEqual(f.plugin.store.notebooks[source].publishedHash,oldHash);
+});
+
+test("legacy recovery cannot invent a baseline for changed earlier pages or a larger remote inventory",async()=>{
+  const f=await editedTranscriptFixture(1,true,[{id:"native:1",number:1,fingerprint:"changed-local"}]);
+  delete f.plugin.store.notebooks[source].publishedPages;
+  await assert.rejects(f.plugin.previewTranscriptRecovery(source),/cannot validate the older snapshot.*check sources/);
+  const old=await editedTranscriptFixture(1,true),id=await notebookIdentity("linked-reflections","a.note");
+  delete old.plugin.store.notebooks[source].publishedPages;
+  await new PublicationReceipts(old.plugin.sharedIO()).save(id,old.original,[
+    {id:"native:1",number:1,fingerprint:"f1"},{id:"native:2",number:2,fingerprint:"remote-new-page"},
+  ]);
+  await assert.rejects(old.plugin.previewTranscriptRecovery(source),/newer or conflicting page inventory/);
+  assert.equal(old.files.get("Mirror/a.md"),old.edited);assert.equal(old.calls.length,1);
+});
+
+test("normal AI-off retry advances a legacy owned prefix after an earlier failed check lost its published inventory",async()=>{
+  const f=fixture(2);sharing(f,"legacy-append-device");await f.plugin.update();
+  const original=f.files.get("Mirror/a.md"),state=f.plugin.store.notebooks[source],pages=Array.from({length:5},(_,i)=>({id:`native:${i+1}`,number:i+1,fingerprint:`f${i+1}`}));
+  f.change(pages);
+  // Mimic 0.6.1 persisting desired=5/revision=2 during a failed guard, while
+  // the generated file and personally owned hash still describe the first two.
+  state.desired=structuredClone(pages);state.order=pages.map(p=>p.id);state.revision=await f.reader.revision(source);
+  state.status="conflict";state.error="Shared transcript has a newer or conflicting page inventory. Wait for source synchronization before retrying.";
+  delete state.publishedPages;f.plugin.aiEnabled=false;
+  assert.equal(state.publishedHash,await sharedHash(original));
+  await f.plugin.update();
+  assert.equal(f.calls.length,2);assert.equal(state.status,"queued");assert.equal(state.error,undefined);
+  assert.equal(state.publishedPages.length,5);assert.match(f.files.get(state.output),/3 page\(s\) awaiting/);
+  assert.match(f.files.get(state.output),/text 1/);assert.match(f.files.get(state.output),/text 2/);
+  const receipt=await new PublicationReceipts(f.plugin.sharedIO()).find(await notebookIdentity("linked-reflections","a.note"),f.files.get(state.output));
+  assert.equal(receipt.pages.length,5);assert.equal(receipt.results.length,2);
+});
+
+test("normal legacy prefix adoption never accepts manually edited Markdown as the owned baseline",async()=>{
+  const pages=Array.from({length:5},(_,i)=>({id:`native:${i+1}`,number:i+1,fingerprint:`f${i+1}`}));
+  const f=await editedTranscriptFixture(2,true,pages),state=f.plugin.store.notebooks[source];
+  delete state.publishedPages;state.status="conflict";state.error="Shared transcript has a newer or conflicting page inventory. Wait for source synchronization before retrying.";
+  f.plugin.aiEnabled=false;await f.plugin.update();
+  assert.equal(state.status,"conflict");assert.match(state.error,/manually edited/);
+  assert.equal(f.files.get(state.output),f.edited);assert.equal(state.publishedPages,undefined);assert.equal(f.calls.length,2);
+});
+
+test("32-worker configuration is available on each platform while admission still caps paid requests",async()=>{
+  const f=fixture(7);f.plugin.config.continuous=true;
+  for(const desktop of [false,true]){
+    globalThis.__desktop=desktop;f.plugin.concurrency=32;assert.equal(f.plugin.concurrency,32);
+    assert.throws(()=>{f.plugin.concurrency=33;},/1 and 32/);
+  }
+  globalThis.__desktop=false;
+  await f.plugin.saveCostSettings({...f.plugin.costs.settings,dailyRequests:2});
+  await f.plugin.update();assert.equal(f.calls.length,2);assert.equal(f.plugin.costs.total.requests,2);
+  assert.ok(f.plugin.progress.budgetBlocked);
+});
+
+test("desktop dispatch follows the visible active popout while a hidden active document blocks requests",async(t)=>{
+  const hadActive=Object.hasOwn(globalThis,"activeDocument"),previousActive=globalThis.activeDocument;
+  t.after(()=>{
+    if(hadActive)globalThis.activeDocument=previousActive;else delete globalThis.activeDocument;
+    globalThis.__desktop=false;
+  });
+  const visible=fixture(1);globalThis.__desktop=true;globalThis.document.hidden=true;globalThis.activeDocument={hidden:false};
+  await visible.plugin.update();assert.equal(visible.calls.length,1);assert.equal(visible.plugin.store.notebooks[source].status,"current");
+  const hidden=fixture(1);globalThis.__desktop=true;globalThis.document.hidden=false;globalThis.activeDocument={hidden:true};
+  await hidden.plugin.update();assert.equal(hidden.calls.length,0);assert.equal(hidden.plugin.costs.total.requests,0);
+  assert.equal(hidden.plugin.progress.stage,"Waiting for Obsidian");
+});
+
+test("Nomad activity remains tied to its native state and main document rather than desktop activeDocument",async(t)=>{
+  const hadActive=Object.hasOwn(globalThis,"activeDocument"),previousActive=globalThis.activeDocument;
+  t.after(()=>{if(hadActive)globalThis.activeDocument=previousActive;else delete globalThis.activeDocument;});
+  const f=fixture(1);globalThis.document.hidden=true;globalThis.activeDocument={hidden:false};
+  await f.plugin.update();assert.equal(f.calls.length,0);
+  globalThis.document.hidden=false;f.plugin.nativeActive=false;
+  await f.plugin.update();assert.equal(f.calls.length,0);assert.equal(f.plugin.costs.total.requests,0);
+});
+test("startup selects newest structurally valid slot and preserves a corrupt newer slot until work resumes",async()=>{
+  const f=fixture(1);await f.plugin.saveConfig();await f.plugin.update();const store=structuredClone(f.plugin.store);
+  f.files.set(statePath("a"),JSON.stringify({generation:8,store}));f.files.set(statePath("b"),JSON.stringify({generation:9,store:{version:1,notebooks:{},queue:"broken",history:[]}}));
+  const broken=f.files.get(statePath("b")),restart=new Runtime(f.app);restart.reader=()=>f.reader;await restart.onload();assert.equal(restart.generation,8);assert.equal(restart.progress.stateBlocked,undefined);assert.deepEqual(restart.store,store);assert.equal(f.files.get(statePath("b")),broken);await restart.update();assert.equal(f.calls.length,1);
+});
+test("slot read errors are not missing files and the healthy slot still recovers cached ownership",async()=>{
+  const f=fixture(1);await f.plugin.saveConfig();await f.plugin.update();const cached=structuredClone(f.plugin.store);f.files.set(statePath("a"),JSON.stringify({generation:20,store:cached}));f.files.set(statePath("b"),"unreadable-existing-slot");const read=f.app.vault.adapter.read;
+  f.app.vault.adapter.read=async p=>{if(p===statePath("b"))throw Error("I/O unavailable");return read(p);};const restart=new Runtime(f.app);restart.reader=()=>f.reader;await restart.onload();assert.equal(restart.generation,20);assert.equal(restart.store.notebooks[source].publishedHash,cached.notebooks[source].publishedHash);await restart.update();assert.equal(f.calls.length,1);
+});
+test("both unusable existing slots block every recognition/recovery entry point without replacing raw data",async()=>{
+  const f=fixture(1);await f.plugin.saveConfig();f.files.set(statePath("a"),"truncated-json");f.files.set(statePath("b"),JSON.stringify({generation:4,store:{version:1}}));const before=new Map(f.files),data=JSON.stringify(f.app.data);
+  const restart=new Runtime(f.app);restart.reader=()=>f.reader;await restart.onload();assert.match(restart.progress.stateBlocked,/Restore state-a\.json or state-b\.json/);assert.equal(JSON.stringify(f.app.data),data);
+  for(const action of [()=>restart.update(),()=>restart.resume(),()=>restart.retry(),()=>restart.manual(source,"1"),()=>restart.previewTranscriptRecovery(source),()=>restart.persist()])await assert.rejects(action(),/Saved notebook state could not be loaded safely/);
+  assert.deepEqual(f.files,before);assert.equal(f.calls.length,0);assert.ok(restart.progress.stateBlocked);
+});
+test("existence checks failing block startup; a known installation losing both slots is not treated as fresh",async()=>{
+  const f=fixture(1);await f.plugin.saveConfig();const exists=f.app.vault.adapter.exists;f.app.vault.adapter.exists=async p=>{if(/state-[ab]\.json$/.test(p))throw Error("Filesystem unavailable");return exists(p);};const unreadable=new Runtime(f.app);await unreadable.onload();assert.ok(unreadable.progress.stateBlocked);
+  const g=fixture(1);await g.plugin.saveConfig();await g.plugin.update();assert.equal(g.app.data.stateInitialized,true);g.files.delete(statePath("a"));g.files.delete(statePath("b"));const restarted=new Runtime(g.app);await restarted.onload();await assert.rejects(restarted.update(),/Saved notebook state/);assert.equal(g.calls.length,1);assert.equal(g.files.has(statePath("a")),false);assert.equal(g.files.has(statePath("b")),false);
+});
+test("snapshot validation rejects damaged caches, page inventories, task identities and ownership fields",async()=>{
+  const f=fixture(1);await f.plugin.update();const valid={generation:1,store:structuredClone(f.plugin.store)};assert.doesNotThrow(()=>validateStateSnapshot(valid));
+  const mutations=[s=>s.generation=-1,s=>s.generation=1.5,s=>s.generation=Number.MAX_SAFE_INTEGER+1,s=>s.store.notebooks[source].source="/storage/emulated/0/Note/other.note",s=>s.store.notebooks[source].desired.push({...s.store.notebooks[source].desired[0],number:2}),s=>s.store.notebooks[source].order=[],s=>s.store.notebooks[source].pages["native:1"].text="",s=>s.store.notebooks[source].pages["native:1"].fingerprint=null,s=>s.store.notebooks[source].publishedHash="wrong",s=>s.store.notebooks[source].outputOverride="../personal.md",s=>s.store.queue=[{source,force:false},{source,force:false}],s=>s.store.queue=[{source:"/storage/emulated/0/Note/unknown.note",force:false}],s=>s.store.history=["../personal.md"],s=>s.store.notebooks[source].pageIssues={"native:1":{fingerprint:"f1",status:"failed",number:1,kind:"provider",reason:"failure",attempts:-1,updatedAt:new Date().toISOString()}}];
+  for(const mutate of mutations){const bad=structuredClone(valid);mutate(bad);assert.throws(()=>validateStateSnapshot(bad),/Invalid notebook/);}
+  assert.throws(()=>validateStateSnapshot(JSON.parse(JSON.stringify(valid).replace('"version":1','"version":1,"__proto__":{}'))),/Invalid notebook/);
+});
+test("equal generation with conflicting snapshots blocks rather than guessing; identical copies load",async()=>{
+  const f=fixture(1);await f.plugin.saveConfig();await f.plugin.update();const store=structuredClone(f.plugin.store),other=structuredClone(store);other.notebooks[source].pages["native:1"].text="different cached text";f.files.set(statePath("a"),JSON.stringify({generation:5,store}));f.files.set(statePath("b"),JSON.stringify({generation:5,store:other}));const restart=new Runtime(f.app);await restart.onload();assert.ok(restart.progress.stateBlocked);
+  f.files.set(statePath("b"),f.files.get(statePath("a")));const identical=new Runtime(f.app);await identical.onload();assert.equal(identical.progress.stateBlocked,undefined);assert.equal(identical.store.notebooks[source].pages["native:1"].text,"text 1");
+});
+test("write failure latches through later Update and rescues the exact paid result to immutable shared cache",async()=>{
+  const f=fixture(2);sharing(f,"state-rescue");await f.plugin.saveConfig();const write=f.app.vault.adapter.write;let rejectState=false;
+  f.app.vault.adapter.write=async(p,t)=>{if(rejectState&&/state-[ab]\.json$/.test(p))throw Error("Slot write unavailable");return write(p,t);};const respond=globalThis.__response;globalThis.__response=async request=>{const r=await respond(request);rejectState=true;return r;};
+  await assert.rejects(f.plugin.update(),/Notebook state could not be saved/);assert.equal(f.calls.length,1);assert.equal(f.plugin.store.notebooks[source].pages["native:1"].text,"text 1");assert.equal(f.files.has("Mirror/a.md"),false);assert.ok(f.plugin.progress.stateBlocked);
+  const recipe=f.plugin.store.notebooks[source].pages["native:1"].recipe,hit=await f.plugin.shared.findResult({notebookId:await notebookIdentity("linked-reflections","a.note"),pageId:"native:1",fingerprint:"f1",recipe});assert.equal(hit.chosen.text,"text 1");rejectState=false;const files=new Map(f.files);await assert.rejects(f.plugin.update(),/Notebook state could not be saved/);await assert.rejects(f.plugin.persist(),/Notebook state could not be saved/);assert.deepEqual(f.files,files);assert.equal(f.calls.length,1);
+});
+test("source-rule mutation during an awaited scan never archives a notebook from mixed inventories",async()=>{
+  const f=fixture(1);await f.plugin.update();const before=f.files.get("Mirror/a.md"),state=structuredClone(f.plugin.store.notebooks[source]);f.reader.list=async()=>{f.plugin.config.rules[0].output="Changed while scanning";return [];};await assert.rejects(f.plugin.update(),/Source settings changed during scanning/);assert.equal(f.files.get("Mirror/a.md"),before);assert.deepEqual(f.plugin.store.notebooks[source],state);assert.equal(f.calls.length,1);
+});
+test("removing a profile during its rejected in-flight request cannot mask its source error or stop a valid sibling",async()=>{
+  const f=folderFixture();f.plugin.config.rules.push({...f.plugin.config.rules[0],id:"nested",source:f.nested,profileId:"valid"});f.plugin.config.profiles.push({...f.plugin.config.profiles[0],id:"valid",model:"test"});
+  globalThis.__response=async request=>{const body=JSON.parse(request.body);f.calls.push(body);if(body.model==="test-model"){f.plugin.config.profiles=f.plugin.config.profiles.filter(p=>p.id!=="general");return {status:400,json:{error:{code:"invalid_model"}}};}return answer("sibling saved",body);};await f.plugin.update();assert.equal(f.calls.length,3);assert.match(f.plugin.store.notebooks[source].error,/selected model is unavailable/);assert.equal(f.plugin.store.notebooks[f.nested].status,"current");assert.ok(f.plugin.store.notebooks[source].executionIssue.recipe);
+});
+test("startup holds a completed request whose text is absent in an older valid slot, and explicit page retry survives another restart",async()=>{
+  const f=fixture(2);await f.plugin.saveConfig();f.plugin.aiEnabled=false;await f.plugin.update();f.plugin.aiEnabled=true;const recipe=(await f.plugin.profile("general")).recipe,price=f.plugin.costs.settings.prices[0];
+  const attempt=f.plugin.costBook.reserve(source,1,"test-model",price,100,recipe,{pageId:"native:1",fingerprint:"f1"});f.plugin.costBook.finish(attempt,{usage:{input_tokens:100,output_tokens:10}},true);
+  const restart=new Runtime(f.app);restart.reader=()=>f.reader;await restart.onload();assert.equal(restart.store.notebooks[source].pageIssues["native:1"].kind,"lost_result");assert.equal(restart.store.notebooks[source].pages["native:1"],undefined);await restart.update();assert.equal(f.calls.length,1);assert.ok(restart.store.notebooks[source].pages["native:2"]);
+  await restart.retryPage(source,"native:1");const again=new Runtime(f.app);again.reader=()=>f.reader;await again.onload();assert.equal(again.store.notebooks[source].pageIssues["native:1"],undefined);await again.update();assert.equal(f.calls.length,2);assert.equal(again.costs.total.requests,3);assert.equal(again.store.notebooks[source].status,"current");
+});
+test("startup pending subscription identity becomes one held page; changed source fingerprint remains eligible",async()=>{
+  const f=fixture(2);f.plugin.provider="subscription";await f.plugin.saveConfig();f.plugin.aiEnabled=false;await f.plugin.update();f.plugin.aiEnabled=true;const recipe=(await f.plugin.profile("general")).recipe;
+  f.plugin.subscriptionBook.reserve(source,"test-model",recipe,10,"native:1",1,"f1");let sends=0;
+  const restart=new Runtime(f.app);restart.reader=()=>f.reader;await restart.onload();restart.session.recognize=async(m,image,instructions,beforeSend)=>{if(!await beforeSend())return null;sends++;return {text:answer("saved",{input:[{content:[{type:"input_text",text:instructions}]}]}).json.output[0].content[0].text,usage:{input_tokens:5,output_tokens:2}};};assert.equal(restart.store.notebooks[source].pageIssues["native:1"].kind,"interrupted");await restart.update();assert.equal(sends,1);assert.equal(restart.subscriptionUsage.requests,2);
+  f.change([{id:"native:1",number:1,fingerprint:"edited"},{id:"native:2",number:2,fingerprint:"f2"}]);await restart.update();assert.equal(sends,2);assert.equal(restart.subscriptionUsage.requests,3);assert.equal(restart.store.notebooks[source].pageIssues["native:1"],undefined);
+});
+test("startup recovers an exact immutable paid result before classifying a missing local cache",async()=>{
+  const f=fixture(1);sharing(f,"startup-rescue");await f.plugin.saveConfig();f.plugin.aiEnabled=false;await f.plugin.update();f.plugin.aiEnabled=true;const recipe=(await f.plugin.profile("general")).recipe,price=f.plugin.costs.settings.prices[0],id=await notebookIdentity("linked-reflections","a.note");
+  const attempt=f.plugin.costBook.reserve(source,1,"test-model",price,100,recipe,{pageId:"native:1",fingerprint:"f1"});f.plugin.costBook.finish(attempt,{usage:{input_tokens:100,output_tokens:10}},true);await f.plugin.shared.saveResult({notebookId:id,pageId:"native:1",fingerprint:"f1",recipe},"paid immutable rescue");
+  const restart=new Runtime(f.app);restart.reader=()=>f.reader;await restart.onload();assert.equal(restart.store.notebooks[source].pages["native:1"].text,"paid immutable rescue");assert.equal(restart.store.notebooks[source].pageIssues,undefined);await restart.update();assert.equal(f.calls.length,0);assert.match(f.files.get("Mirror/a.md"),/paid immutable rescue/);
+});
+test("legacy accounting uncertainty holds the notebook without guessing a page; explicit notebook retry acknowledges it",async()=>{
+  const f=fixture(2);await f.plugin.saveConfig();f.plugin.aiEnabled=false;await f.plugin.update();f.plugin.aiEnabled=true;const recipe=(await f.plugin.profile("general")).recipe;f.plugin.costBook.reserve(source,1,"test-model",f.plugin.costs.settings.prices[0],100,recipe);
+  const restart=new Runtime(f.app);restart.reader=()=>f.reader;await restart.onload();assert.match(restart.store.notebooks[source].legacyPageFailure,/cannot be matched reliably/);assert.equal(restart.store.notebooks[source].pageIssues,undefined);await restart.update();assert.equal(f.calls.length,0);await restart.retryNotebook(source);
+  const again=new Runtime(f.app);again.reader=()=>f.reader;await again.onload();assert.equal(again.store.notebooks[source].legacyPageFailure,undefined);await again.update();assert.equal(f.calls.length,2);assert.equal(again.costs.total.requests,3);
+});
+test("acknowledgment storage failure leaves the held page intact and does not send a retry",async()=>{
+  const f=fixture(1);await f.plugin.saveConfig();globalThis.__response=async request=>{f.calls.push(JSON.parse(request.body));throw Error("interrupted");};await f.plugin.update();const issue=structuredClone(f.plugin.store.notebooks[source].pageIssues["native:1"]),set=localStorage.setItem;
+  const costKey=f.plugin.costBook.key;localStorage.setItem=(k,v)=>{if(k===costKey)throw Error("Accounting disk full");return set(k,v);};await assert.rejects(f.plugin.retryPage(source,"native:1"),/could not be saved/);assert.deepEqual(f.plugin.store.notebooks[source].pageIssues["native:1"],issue);assert.equal(f.calls.length,1);
+});
+test("a truly interrupted forced request is held after restart while its old cache remains available",async()=>{
+  const f=fixture(1);await f.plugin.saveConfig();await f.plugin.update();const old=f.plugin.store.notebooks[source].pages["native:1"].text;
+  const respond=globalThis.__response,write=f.app.vault.adapter.write;globalThis.__response=async request=>{const result=await respond(request);f.app.vault.adapter.write=async(p,t)=>{if(/state-[ab]\.json$/.test(p))throw Error("crash before result persistence");return write(p,t);};return result;};
+  await assert.rejects(f.plugin.manual(source,"1",true),/Notebook state could not be saved/);f.app.vault.adapter.write=write;const restart=new Runtime(f.app);restart.reader=()=>f.reader;await restart.onload();assert.equal(restart.progress.stateBlocked,undefined);assert.equal(restart.store.notebooks[source].pages["native:1"].text,old);assert.equal(restart.store.notebooks[source].pageIssues["native:1"].kind,"lost_result");await restart.update();assert.equal(f.calls.length,2);
+});
+test("same-stat source content guard stops only its notebook without creating a page failure or request",async()=>{
+  const f=folderFixture(),open=f.reader.open;let changed=true;f.reader.open=async path=>{const o=await open(path);if(path===source&&changed)o.render=async()=>{const error=Error("Source bytes changed while rendering.");error.name="SourceChangedError";throw error;};return o;};await f.plugin.update();assert.equal(f.calls.length,2);assert.equal(f.plugin.store.notebooks[source].status,"failed");assert.equal(f.plugin.store.notebooks[source].pageIssues,undefined);assert.equal(f.plugin.store.notebooks[source].executionIssue.scope,"source");assert.equal(f.plugin.store.notebooks[f.nested].status,"current");await f.plugin.update();assert.equal(f.calls.length,2);changed=false;await f.plugin.retryNotebook(source);assert.equal(f.calls.length,2);await f.plugin.update();assert.equal(f.calls.length,5);assert.equal(f.plugin.store.notebooks[source].status,"current");
+});
+test("failed explicit reprocessing retains its force intent for Retry and preserves previous text when skipped",async()=>{
+  const f=fixture(1);await f.plugin.saveConfig();await f.plugin.update();const old=f.plugin.store.notebooks[source].pages["native:1"].text;
+  globalThis.__response=async request=>{f.calls.push(JSON.parse(request.body));throw Error("enhancement interrupted");};await f.plugin.manual(source,"1",true);assert.equal(f.plugin.store.notebooks[source].pageIssues["native:1"].force,true);await f.plugin.update();assert.equal(f.calls.length,2);
+  await f.plugin.skipPage(source,"native:1");await f.plugin.update();assert.equal(f.calls.length,2);assert.equal(f.plugin.store.notebooks[source].pages["native:1"].text,old);assert.match(f.files.get("Mirror/a.md"),/Requested reprocessing skipped; previous transcription retained/);assert.equal(f.plugin.queueView.attention.includes(source),false);
+  await f.plugin.retryPage(source,"native:1");assert.deepEqual(f.plugin.store.notebooks[source].forcePending,["native:1"]);globalThis.__response=async request=>{const body=JSON.parse(request.body);f.calls.push(body);return answer("new improved result",body);};await f.plugin.update();assert.equal(f.calls.length,3);assert.equal(f.plugin.store.notebooks[source].pages["native:1"].text,"new improved result");assert.equal(f.plugin.store.notebooks[source].pageIssues["native:1"],undefined);
+});
+test("a corrupt other-provider ledger cannot bypass interrupted-attempt reconciliation through Update",async()=>{
+  const f=fixture(1);await f.plugin.saveConfig();f.plugin.aiEnabled=false;await f.plugin.update();f.plugin.aiEnabled=true;f.plugin.provider="subscription";
+  localStorage.setItem(f.plugin.costBook.key,"malformed ledger");const restart=new Runtime(f.app);restart.reader=()=>f.reader;await restart.onload();let sends=0;restart.session.recognize=async()=>{sends++;return {text:"unexpected"};};await assert.rejects(restart.update(),/could not be read safely/);await assert.rejects(restart.manual(source,"1"),/could not be read safely/);assert.equal(sends,0);assert.equal(f.calls.length,0);
+});
+test("schema-valid cached text or generation tampering invalidates a checksum and falls back to a verified slot",async()=>{
+  const f=fixture(1);await f.plugin.saveConfig();await f.plugin.update();const store=structuredClone(f.plugin.store),healthy=await encodeStateSnapshot({generation:5,store});
+  f.files.set(statePath("a"),healthy);const corrupt=JSON.parse(await encodeStateSnapshot({generation:6,store}));corrupt.store.notebooks[source].pages["native:1"].text="valid JSON but damaged paid text";f.files.set(statePath("b"),JSON.stringify(corrupt));const restart=new Runtime(f.app);await restart.onload();assert.equal(restart.generation,5);assert.equal(restart.store.notebooks[source].pages["native:1"].text,"text 1");
+  corrupt.store=store;corrupt.generation=50;f.files.set(statePath("b"),JSON.stringify(corrupt));const again=new Runtime(f.app);await again.onload();assert.equal(again.generation,5);assert.equal(again.progress.stateBlocked,undefined);
+});
+test("invalid outgoing state cannot overwrite either recoverable slot",async()=>{
+  const f=fixture(1);await f.plugin.update();const slots=new Map(["a","b"].map(s=>[statePath(s),f.files.get(statePath(s))]));f.plugin.store.notebooks[source].pages["native:1"].text="";await assert.rejects(f.plugin.persist(),/Notebook state could not be saved/);assert.ok(f.plugin.progress.stateBlocked);for(const [p,raw]of slots)assert.equal(f.files.get(p),raw);
+});
+test("fresh metadata reveals a paid page absent from the older journal and holds it before dispatch",async()=>{
+  const f=fixture(1);await f.plugin.saveConfig();await f.plugin.update();const recipe=(await f.plugin.profile("general")).recipe;f.change([{id:"native:1",number:1,fingerprint:"f1"},{id:"native:2",number:2,fingerprint:"f2"}]);
+  const attempt=f.plugin.costBook.reserve(source,2,"test-model",f.plugin.costs.settings.prices[0],100,recipe,{pageId:"native:2",fingerprint:"f2"});f.plugin.costBook.finish(attempt,{usage:{input_tokens:100,output_tokens:10}},true);
+  const restart=new Runtime(f.app);restart.reader=()=>f.reader;await restart.onload();assert.equal(restart.store.notebooks[source].desired.length,1);assert.equal(restart.store.notebooks[source].pageIssues,undefined);await restart.update();assert.equal(f.calls.length,1);assert.equal(restart.store.notebooks[source].desired.length,2);assert.equal(restart.store.notebooks[source].pageIssues["native:2"].kind,"lost_result");assert.equal(restart.store.notebooks[source].pages["native:2"],undefined);
+  await restart.retryPage(source,"native:2");await restart.update();assert.equal(f.calls.length,2);assert.equal(restart.costs.total.requests,3);
+});
+test("fresh metadata rescues an appended paid page using its exact earlier recipe after a profile edit",async()=>{
+  const f=fixture(1);sharing(f,"metadata-rescue");await f.plugin.saveConfig();await f.plugin.update();const recipe=(await f.plugin.profile("general")).recipe,id=await notebookIdentity("linked-reflections","a.note");f.change([{id:"native:1",number:1,fingerprint:"f1"},{id:"native:2",number:2,fingerprint:"f2"}]);
+  const attempt=f.plugin.costBook.reserve(source,2,"test-model",f.plugin.costs.settings.prices[0],100,recipe,{pageId:"native:2",fingerprint:"f2"});f.plugin.costBook.finish(attempt,{usage:{input_tokens:100,output_tokens:10}},true);await f.plugin.shared.saveResult({notebookId:id,pageId:"native:2",fingerprint:"f2",recipe},"paid second page from previous recipe");f.plugin.config.profiles[0].prompt="new instructions";await f.plugin.saveConfig();
+  const restart=new Runtime(f.app);restart.reader=()=>f.reader;await restart.onload();assert.equal(restart.store.notebooks[source].desired.length,1);await restart.update();assert.equal(f.calls.length,1);assert.equal(restart.store.notebooks[source].pages["native:2"].text,"paid second page from previous recipe");assert.equal(restart.store.notebooks[source].pages["native:2"].recipe,recipe);assert.equal(restart.store.notebooks[source].pageIssues?.["native:2"],undefined);
+});
+test("legacy paid text without a recipe is reused only after matching its rendered image hash",async()=>{
+  const f=fixture(1);f.app.data={config:{source:"/storage/emulated/0/Note/Reflections",output:"Mirror",prompt:"original"},cache:{[source]:{1:{text:"legacy paid text",hash:await sharedHash("image:1")}}}};
+  const restart=new Runtime(f.app);restart.reader=()=>f.reader;restart.aiEnabled=false;await restart.onload();await restart.update();assert.equal(f.calls.length,0);assert.equal(restart.progress.stateBlocked,undefined);assert.equal(restart.store.notebooks[source].pages["native:1"].text,"legacy paid text");assert.equal(restart.store.notebooks[source].pages["native:1"].recipe,"legacy-unverified");assert.equal(restart.store.notebooks[source].legacy,false);
+});
+
+ test("Balanced sends grouped labeled target and context images and saves valid siblings",async()=>{
+  const f=fixture(5);f.plugin.config.profiles[0].quality="balanced";f.plugin.config.continuous=false;f.plugin.config.batchPages=1;
+  globalThis.__response=async request=>{const body=JSON.parse(request.body);f.calls.push(body);return answer(JSON.stringify({pages:[{number:1,text:"first",joinPrevious:false},{number:2,text:"second",joinPrevious:true},{number:3,text:"third",joinPrevious:false}]}));};
+  await f.plugin.update();assert.equal(f.calls.length,1);const content=f.calls[0].input[0].content;
+  assert.equal(content.filter(c=>c.type==="input_image").length,5);assert.deepEqual(content.filter(c=>c.type==="input_text").slice(1).map(c=>c.text),["TARGET PAGE 1","TARGET PAGE 2","TARGET PAGE 3","TARGET PAGE 4","CONTEXT PAGE 5"]);
+  assert.equal(f.calls[0].max_output_tokens,16384);assert.equal(f.calls[0].reasoning,undefined);
+  const state=f.plugin.store.notebooks[source];assert.equal(Object.keys(state.pages).length,3);assert.equal(state.pageIssues["native:4"].status,"failed");assert.equal(state.pages["native:5"],undefined);
+  assert.equal(f.plugin.costs.total.requests,1);assert.equal(f.plugin.costs.total.pages,3);assert.equal(f.plugin.costs.recent[0].targets.length,4);
+ });
+
+test("balanced partial reply caches valid target identities and continues to the next group",async()=>{
+  const f=fixture(5);f.plugin.config.profiles[0].quality="balanced";f.plugin.config.continuous=true;f.plugin.config.batchPages=2;
+  globalThis.__response=async request=>{const body=JSON.parse(request.body);f.calls.push(body);const targets=requestedPages(body);return targets.length>1?answer(JSON.stringify({pages:[{number:targets[0],text:"one",joinPrevious:false},{number:targets[2],text:"three",joinPrevious:false}]}),body):answer("five",body);};
+  await f.plugin.update();
+  const state=f.plugin.store.notebooks[source];
+  assert.deepEqual(requestedPages(f.calls[0]),[1,2,3,4]);assert.deepEqual(requestedPages(f.calls[1]),[5]);
+  assert.deepEqual(Object.keys(state.pages).sort(),["native:1","native:3","native:5"]);
+  assert.equal(state.pageIssues["native:2"].status,"failed");assert.equal(state.pageIssues["native:4"].status,"failed");
+  assert.equal(f.plugin.costs.total.requests,2);assert.equal(f.plugin.costs.total.pages,3);
+});
+
+test("global pause saves the active group and prevents dispatch of later groups",async()=>{
+  const f=fixture(7);f.plugin.config.profiles[0].quality="balanced";f.plugin.config.continuous=true;f.plugin.config.batchPages=2;
+  globalThis.__response=async request=>{const body=JSON.parse(request.body);f.calls.push(body);f.plugin.pause();return answer("saved group",body);};
+  await f.plugin.update();
+  assert.equal(f.calls.length,1);assert.deepEqual(requestedPages(f.calls[0]),[1,2,3,4]);
+  assert.deepEqual(Object.keys(f.plugin.store.notebooks[source].pages).sort(),["native:1","native:2","native:3","native:4"]);
+  assert.equal(f.plugin.progress.paused,true);
+});
+
+test("grouped request rechecks notebook revision after rendering target and context images",async()=>{
+  const f=fixture(5);f.plugin.config.profiles[0].quality="balanced";let liveRevision="1:100";
+  f.reader.revision=async()=>liveRevision;
+  const open=f.reader.open;f.reader.open=async(...args)=>{const notebook=await open(...args),render=notebook.render;notebook.render=async number=>{const image=await render(number);if(number===5)liveRevision="2:100";return image;};return notebook;};
+  await f.plugin.update();
+  assert.equal(f.calls.length,0);
+  assert.equal(f.plugin.store.notebooks[source].status,"failed");
+  assert.match(f.plugin.store.notebooks[source].error,/Notebook changed before recognition/);
+  assert.equal(f.plugin.store.notebooks[source].pageIssues,undefined);
+  assert.equal(Object.keys(f.plugin.store.notebooks[source].pages).length,0);
+});
+
+test("ordinary context render failure omits that context image and recognizes all targets",async()=>{
+  const f=fixture(5);f.plugin.config.profiles[0].quality="balanced";
+  const open=f.reader.open;f.reader.open=async(...args)=>{const notebook=await open(...args),render=notebook.render;notebook.render=async number=>{if(number===5)throw Error("Optional context page is unreadable.");return render(number);};return notebook;};
+  globalThis.__response=async request=>{const body=JSON.parse(request.body);f.calls.push(body);return answer("target transcription",body);};
+  await f.plugin.update();
+  assert.equal(f.calls.length,1);assert.deepEqual(requestedPages(f.calls[0]),[1,2,3,4]);
+  const content=f.calls[0].input[0].content;
+  assert.deepEqual(content.filter(item=>item.type==="input_text"&&/^(TARGET|CONTEXT) PAGE/.test(item.text)).map(item=>item.text),["TARGET PAGE 1","TARGET PAGE 2","TARGET PAGE 3","TARGET PAGE 4"]);
+  assert.equal(content.filter(item=>item.type==="input_image").length,4);
+  assert.deepEqual(Object.keys(f.plugin.store.notebooks[source].pages).sort(),["native:1","native:2","native:3","native:4"]);
+});
+
+test("late shared result cancels an unsent group and replans remaining targets in the same update",async()=>{
+  const f=fixture(4);f.plugin.config.profiles[0].quality="balanced";f.plugin.config.batchPages=1;sharing(f,"late-arrival-device");
+  const cache=f.plugin.sharedCache,find=cache.findResult.bind(cache);let pageTwoLookups=0;
+  cache.findResult=async query=>{
+    if(query.pageId==="native:2"&&++pageTwoLookups===3)return {chosen:{...query,text:"arrived from another device"},alternatives:[],invalidRecords:0};
+    return find(query);
+  };
+  globalThis.__response=async request=>{const body=JSON.parse(request.body);f.calls.push(body);return answer("local grouped result",body);};
+  await f.plugin.update();
+  assert.equal(pageTwoLookups,3);
+  assert.equal(f.calls.length,2);
+  assert.deepEqual(f.calls.map(requestedPages),[[1],[3,4]]);
+  const targetImages=f.calls.map(body=>{
+    const pairs=[];let label="";
+    for(const item of body.input[0].content){if(item.type==="input_text"&&/^TARGET PAGE/.test(item.text))label=item.text;if(item.type==="input_image"&&label){pairs.push([label,item.image_url]);label="";}}
+    return pairs;
+  });
+  assert.deepEqual(targetImages.map(group=>group.map(([label])=>label)),[["TARGET PAGE 1"],["TARGET PAGE 3","TARGET PAGE 4"]]);
+  assert.ok(targetImages.flat().every(([,image])=>image.startsWith("image:")));
+  assert.equal(f.plugin.store.notebooks[source].pages["native:2"].text,"arrived from another device");
+  assert.deepEqual(Object.keys(f.plugin.store.notebooks[source].pages).sort(),["native:1","native:2","native:3","native:4"]);
+  assert.equal(f.plugin.costs.total.requests,2);assert.equal(f.plugin.costs.total.pages,3);
+});
+
+test("official grouped GPT request enforces structured schema and reserves its actual cap",async()=>{
+ const f=fixture(2);const p=f.plugin.config.profiles[0];p.quality="balanced";p.model="gpt-6-luna";p.endpoint="https://api.openai.com/v1/responses";
+ globalThis.__response=async request=>{const body=JSON.parse(request.body);f.calls.push(body);return answer(JSON.stringify({pages:[{number:1,text:"one",joinPrevious:false},{number:2,text:"two",joinPrevious:false}]}));};
+ await f.plugin.update();const body=f.calls[0];assert.deepEqual(body.reasoning,{effort:"medium"});assert.equal(body.text.format.type,"json_schema");assert.equal(body.text.format.strict,true);assert.deepEqual(body.text.format.schema.properties.pages.items.properties.number.enum,[1,2]);assert.equal(f.plugin.costs.recent[0].maxOutputTokens,body.max_output_tokens);assert.equal(f.plugin.costs.total.pages,2);
+});
+
+test("Fast cannot join a page when its predecessor image was not sent",async()=>{
+ const f=fixture(2);f.plugin.config.profiles[0].quality="fast";f.plugin.config.showPageHeadings=false;
+ globalThis.__response=async request=>{const body=JSON.parse(request.body);f.calls.push(body);const page=Number(body.input[0].content.find(c=>c.type==="input_text"&&/^TARGET PAGE/.test(c.text)).text.match(/(\d+)$/)[1]);return answer(JSON.stringify({pages:[{number:page,text:page===1?"first sentence":"<!-- supernote-continue -->\nsecond sentence",joinPrevious:page===2}]}));};
+ await f.plugin.update();assert.equal(f.calls.length,2);assert.equal(f.plugin.store.notebooks[source].pages["native:2"].text,"second sentence");const output=f.files.get(f.plugin.store.notebooks[source].output);assert.ok(output.includes("first sentence\n\n<!-- supernote-page:"));assert.ok(!output.includes("first sentence <!-- supernote-page:"));
+});
+
+async function pageNavigationFixture() {
+  const f = fixture(2);
+  await f.plugin.update();
+  f.plugin.initializing = false;
+  const state = f.plugin.store.notebooks[source];
+  assert.ok(state?.output);
+  const beforeStore = structuredClone(f.plugin.store);
+  const beforeCosts = structuredClone(f.plugin.costs);
+  const beforeCalls = f.calls.length;
+  const opened = [];
+  const open = f.reader.open.bind(f.reader);
+  f.reader.open = async (path) => { opened.push(path); return open(path); };
+  const urls = [];
+  globalThis.window.open = (url) => urls.push(url);
+  return { f, state, beforeStore, beforeCosts, beforeCalls, opened, urls };
+}
+
+test("runtime opens the current ordinal for a stable id without AI or state/cost changes", async () => {
+  const { f, state, beforeStore, beforeCosts, beforeCalls, opened, urls } = await pageNavigationFixture();
+  const nativePath = "/storage/emulated/0/Note/Reflections/space +%# test.note";
+  f.rename(nativePath);
+  state.source = nativePath;
+  f.change([
+    { id: "native:2", number: 1, fingerprint: "f2" },
+    { id: "native:1", number: 2, fingerprint: "f1" },
+  ]);
+  await f.plugin.openNotebookPage(state.output, "native:2", 2);
+  assert.deepEqual(opened, [nativePath]);
+  assert.equal(urls.length, 1);
+  const parsed = new URL(urls[0]);
+  assert.equal(parsed.protocol, "supernote-transcripts:");
+  assert.equal(parsed.searchParams.get("file"), nativePath);
+  assert.equal(parsed.searchParams.get("page"), "1");
+  assert.match(urls[0], /%20/); assert.match(urls[0], /%2B/); assert.match(urls[0], /%25/); assert.match(urls[0], /%23/);
+  assert.equal(f.calls.length, beforeCalls);
+  assert.deepEqual(f.plugin.store, { ...beforeStore, notebooks: { ...beforeStore.notebooks, [source]: { ...beforeStore.notebooks[source], source: nativePath } } });
+  assert.deepEqual(f.plugin.costs, beforeCosts);
+});
+
+test("runtime deduplicates simultaneous page opens", async () => {
+  const { f, state, opened, urls } = await pageNavigationFixture();
+  let release;
+  const gate = new Promise(resolve => { release = resolve; });
+  let entered;
+  const hasEntered = new Promise(resolve => { entered = resolve; });
+  const open = f.reader.open.bind(f.reader);
+  f.reader.open = async (path) => { entered(); await gate; return open(path); };
+  const first = f.plugin.openNotebookPage(state.output, "native:1", 1);
+  await hasEntered;
+  const active = f.plugin.pageNavigation;
+  assert.ok(active);
+  const second = f.plugin.openNotebookPage(state.output, "native:1", 1);
+  assert.equal(f.plugin.pageNavigation, active);
+  release();
+  await Promise.all([first, second]);
+  assert.equal(opened.length, 1);
+  assert.equal(urls.length, 1);
+});
+
+test("runtime does not open a removed page and reports desktop usage", async () => {
+  const removed = await pageNavigationFixture();
+  removed.f.change([{ id: "native:2", number: 1, fingerprint: "f2" }]);
+  await assert.rejects(removed.f.plugin.openNotebookPage(removed.state.output, "native:1", 1), /removed|identity changed/);
+  assert.equal(removed.urls.length, 0);
+
+  const desktop = await pageNavigationFixture();
+  globalThis.__desktop = true;
+  await assert.rejects(desktop.f.plugin.openNotebookPage(desktop.state.output, "native:1", 1), /on your Supernote/);
+  assert.equal(desktop.opened.length, 0);
+  assert.equal(desktop.urls.length, 0);
+});

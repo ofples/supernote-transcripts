@@ -1,0 +1,1 @@
+JSON.stringify({fixture:!!app.plugins.plugins["nomad-transcripts-ui-fixture"],enabled:app.plugins.enabledPlugins.has("nomad-transcripts-ui-fixture"),command:!!app.commands.commands["nomad-transcripts-ui-fixture:open"],forms:document.querySelectorAll(".modal").length,fixtureState:!!window.__transcriptUIFixture})

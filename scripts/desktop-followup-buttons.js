@@ -1,0 +1,1 @@
+(()=>{const c=window.__transcriptUIFixture,root=document.querySelector('.st-fullscreen-modal');if(!c||!root)throw Error('Require the isolated preview');return [...root.querySelectorAll('button')].map(b=>({text:b.textContent,label:b.getAttribute('aria-label')}));})();

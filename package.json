@@ -1,0 +1,23 @@
+{
+  "name": "nomad-transcripts",
+  "version": "0.10.2",
+  "private": true,
+  "license": "GPL-3.0-or-later",
+  "scripts": {
+    "build": "node build.mjs",
+    "check": "tsc --noEmit",
+    "test": "node --test tests/*.test.mjs"
+  },
+  "dependencies": {
+    "image-js": "1.7.0",
+    "supernote-typescript": "0.7.1"
+  },
+  "devDependencies": {
+    "@codemirror/state": "6.7.6",
+    "@codemirror/view": "6.43.13",
+    "@types/node": "24.1.0",
+    "esbuild": "0.25.8",
+    "obsidian": "1.8.7",
+    "typescript": "5.8.3"
+  }
+}

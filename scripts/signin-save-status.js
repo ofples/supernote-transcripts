@@ -1,0 +1,1 @@
+(async()=>{const p=app.plugins.plugins['nomad-transcripts'];return {secureConnected:p.subscriptionStatus.connected,formOpen:document.querySelector('.st-fullscreen-modal')?.querySelector('h1')?.textContent==='Settings',provider:p.provider,paused:p.progress.paused,version:p.manifest.version};})();

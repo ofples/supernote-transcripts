@@ -1,0 +1,1 @@
+(()=>({addListener:window.Capacitor.Plugins.App.addListener.toString(),loaded:!!app.plugins.plugins['nomad-transcripts'],state:app.plugins.plugins['nomad-transcripts']?.progress,coreAdd:window.Capacitor.addListener?.toString()}))()

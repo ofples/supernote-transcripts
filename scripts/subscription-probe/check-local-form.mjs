@@ -1,0 +1,11 @@
+const base='http://127.0.0.1:19455';
+const page=await fetch(base+'/');
+if(!page.headers.get('content-security-policy')?.includes("form-action 'self' http://127.0.0.1:19455 https://auth.openai.com"))throw Error('Official login redirect blocked by policy');
+const html=await page.text();
+const csrf=html.match(/name="csrf" value="([a-zA-Z0-9_-]+)"/)?.[1];
+if(!csrf)throw Error('Missing protected local form');
+const invalid=await fetch(base+'/continue',{method:'POST',headers:{'content-type':'application/x-www-form-urlencoded',Origin:'null'},body:'csrf=wrong',redirect:'manual'});
+if(invalid.status!==400)throw Error('Invalid form accepted');
+const valid=await fetch(base+'/continue',{method:'POST',headers:{'content-type':'application/x-www-form-urlencoded',Origin:'null'},body:new URLSearchParams({csrf}),redirect:'manual'});
+if(valid.status!==303 || new URL(valid.headers.get('location')).origin!=='https://auth.openai.com')throw Error('Local form authorization did not redirect');
+console.log(JSON.stringify({protectedForm:true,invalidFormRejected:true,browserNullOriginSupported:true,officialAuthorizationRedirect:true,inferenceRequests:0}));

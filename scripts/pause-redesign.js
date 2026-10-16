@@ -1,0 +1,1 @@
+(()=>{const p=app.plugins.plugins['nomad-transcripts'];p.pause();return {running:!!p.task,stage:p.progress.stage,ready:Object.values(p.store.notebooks).map(s=>s.desired.filter(d=>s.pages[d.id]?.fingerprint===d.fingerprint).length)};})();

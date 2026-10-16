@@ -1,0 +1,1 @@
+(()=>({rows:Array.from(document.querySelectorAll('.st-modal .st-notebook')).map(row=>({html:row.innerHTML,children:Array.from(row.children).map(el=>({tag:el.tagName,text:el.innerText,display:getComputedStyle(el).display,visibility:getComputedStyle(el).visibility,height:el.getBoundingClientRect().height}))})),modalText:document.querySelector('.st-modal')?.innerText}))()

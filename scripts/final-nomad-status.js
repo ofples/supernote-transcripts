@@ -1,0 +1,1 @@
+(()=>{const p=app.plugins.plugins["nomad-transcripts"];return {version:p?.manifest?.version,connected:!!p?.subscriptionStatus?.connected,idle:!p?.task,paused:!!p?.progress?.paused,initializing:!!p?.initializing,forms:document.querySelectorAll(".modal").length,fixtureEnabled:app.plugins.enabledPlugins.has("nomad-transcripts-ui-fixture"),callsThisRun:p?.callsThisRun??0}})()

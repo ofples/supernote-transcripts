@@ -1,0 +1,25 @@
+(async()=>{
+ const c=window.__transcriptUIFixture,real=app.plugins.plugins['nomad-transcripts'];
+ const root=()=>document.querySelector('.st-fullscreen-modal');
+ const click=text=>{const b=[...root().querySelectorAll('button')].find(x=>x.textContent.trim()===text);if(!b)throw Error(`Missing button: ${text}`);b.click();};
+ const assert=(test,label)=>{if(!test)throw Error(label)};
+ const realConfig=JSON.stringify(real.config), original=JSON.stringify(c.config);
+ click('Settings');
+ const password=root().querySelector('input[type=password]');assert(!!password,'Key is not masked');
+ password.value='fake-ui-key-not-a-secret';password.dispatchEvent(new Event('input',{bubbles:true}));
+ const toggle=root().querySelector('input[type=checkbox]');toggle.checked=true;toggle.dispatchEvent(new Event('change',{bubbles:true}));
+ click('Cancel');assert(c.apiKey===''&&c.aiEnabled===false,'Settings Cancel changed live settings');
+ click('Configure');
+ const prompt=root().querySelector('textarea');prompt.value='UI test only';prompt.dispatchEvent(new Event('input',{bubbles:true}));
+ click('Cancel');assert(JSON.stringify(c.config)===original,'Source Cancel changed saved config');
+ const summary=root().querySelector('.st-summary-live'),child=summary.firstElementChild;
+ c.progress.detail='Reader byte progress must stay hidden';await c.saveConfig();assert(summary.firstElementChild===child,'Unchanged display rebuilt summary');
+ click('Check now');assert(c.aiEnabled===false,'Check enabled AI');
+ click('＋ Add source');
+ await new Promise(resolve=>setTimeout(resolve,1500));
+ const entries=[...root().querySelectorAll('.st-browser-entry')].map(x=>x.textContent.trim());
+ assert(entries.length>0,'Source browser found no entries');
+ assert(JSON.stringify(real.config)===realConfig,'Mock UI changed real config');
+ assert(real.autoEnabled===false,'Real auto enabled');
+ return {settingsCancel:true,sourceCancel:true,keyMasked:true,stableSummary:true,sourceBrowserEntries:entries.slice(0,8),realAutomatic:false,realAIAllowed:localStorage.getItem(`nomad-transcripts:${app.vault.getName()}:ai`)!=='false',liveText:root().innerText.slice(0,800)};
+})();

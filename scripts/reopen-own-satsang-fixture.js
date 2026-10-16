@@ -1,0 +1,1 @@
+(()=>{document.querySelector(".st-fullscreen-modal")?.querySelector("[aria-label=\"Close mirrors\"]")?.click();app.commands.executeCommandById("nomad-transcripts-ui-fixture:open");return true})()

@@ -1,0 +1,1 @@
+(async()=>{const c=window.__transcriptUIFixture;const source='/storage/emulated/0/Note/Fixture/Working.note';c.progress.running=true;c.progress.stage='Recognizing';c.progress.activeSource=source;c.progress.activePage={source,number:2,total:3};await c.saveConfig();return {mockOnly:true,realAI:app.plugins.plugins['nomad-transcripts'].aiEnabled};})();

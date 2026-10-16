@@ -1,0 +1,25 @@
+# Robustness review
+
+This is a bounded review of the 0.7.1 implementation. It records concrete safeguards verified in code/tests and the remaining limits; it is not an exhaustive reliability guarantee.
+
+## Safeguards
+
+- Saved-state read or write failures set a persistent storage block. The Mirrors and Queue views explain that the plugin state backup must be restored before Obsidian is reloaded. Update, Resume, page Retry/Skip, forced processing, and transcript recovery writes stay unavailable while blocked. Reading a recovery comparison and inspecting source settings remain available.
+- Snapshot slots are structurally validated. Legacy snapshots without a checksum remain acceptable only when validation succeeds; newly written snapshots include a checksum that is verified on read. A damaged slot can fall back to the other valid slot, while no valid slot after state initialization blocks recognition instead of silently starting with an empty store.
+- Recognition failures are held per page and fingerprint. Other eligible pages can continue; the affected page is not retried automatically. Retry explicitly enqueues that page, while Skip omits it until its source fingerprint changes. A confirmed blank page uses the exact `<!-- supernote-empty-page -->` marker; an empty or incomplete provider response remains a failure.
+- A forced reprocess is explicit per-page intent. A failed forced request stays marked for the next explicit Retry and is not mistaken for an ordinary cached result.
+- Interrupted paid attempts are reconciled at startup and after reading a fresh source descriptor. Matching shared page results can rescue a completed response before the attempt is shown as unresolved. For a newly completed paid response, the local cache save is attempted before publication; if that state save fails, the response is offered to shared storage as a rescue copy while further recognition is blocked.
+- Transcript edit recovery previews the current Markdown and cached recognition. A recovery action checks the previewed content and source revision again; replacing the mirror saves an exact backup first. These actions use cached recognition and make no provider request.
+- Page validation reuses indexed page metadata and compares bitmap hashes during the existing bounded read pass. This catches many same-stat changes without rendering every page again.
+- UI configuration saves are serialized. If a save fails, rollback targets only the entry written by that save and preserves a concurrent edit to the same entry. A rejected save releases its pending-save guard so Close is available again.
+
+The final 0.7.1 typecheck, production build and **277 tests** pass; the saved output is [tests-0.7.1-final.txt](test-artifacts/tests-0.7.1-final.txt). Passing automated checks does not remove the limits below.
+
+Nomad 0.7.1 is active and connected, idle and paused, with the state guard clear; deployment made zero recognition requests. Read-back preserved protected configuration, cached page text/identity, published metadata, managed Markdown hashes, keys/session, accounting, and history. Startup wrote the initialization marker, recorded one legacy request hold for explicit user review, and removed its matching queue entry; it added no page holds. Slot A is checksummed generation 763, and slot B is validated legacy generation 762 without a checksum. Vedas 0.7.1 is also active and connected, idle and paused, with zero recognition requests. Its Satsang prompt update preserved GPT-6 Luna and the Sanskrit glossary; Reflection settings and both managed Markdown hashes were preserved. A Shared Data catalog save led to one transient in-memory Reflection queue entry, while reload found validated durable generation 6 with an empty queue. The final desktop UI read-back is being completed, so full transient-store equality is not claimed. Nomad read-back: [recovery-0.7.1-deployment-evidence.json](test-artifacts/recovery-0.7.1-deployment-evidence.json). Desktop read-back will be linked when finalized.
+
+## Remaining limits
+
+- Shared Obsidian Sync coordination uses a simple lease and eventual consistency. It reduces overlapping work but is not an atomic distributed lock, so two devices can occasionally issue duplicate requests or encounter a publication conflict.
+- Android may sleep or terminate Obsidian in the background. The plugin cannot guarantee that a queued run or in-flight provider request will finish; a request interrupted after transmission may still be billable. Reopen the plugin and inspect the queue before choosing an explicit retry.
+- The final page read and Markdown write cannot be made atomic with an external editor or another process. A file can change after its last content check and before the write, even though matching metadata and bitmap hashes are checked during the bounded read pass.
+- Device-local provider, pause, and budget settings do not create a shared account-wide quota or transaction across devices. Check each device's local state when coordinating work.

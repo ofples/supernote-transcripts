@@ -1,0 +1,1 @@
+(()=>{document.querySelector('.st-fullscreen-modal .st-header button:last-child')?.click();const p=app.plugins.plugins['nomad-transcripts'];return {panelClosed:!document.querySelector('.st-fullscreen-modal'),workerIdle:!p.task,aiEnabled:p.aiEnabled,automatic:p.autoEnabled,listeners:p.listeners.size,fixtureLoaded:!!app.plugins.plugins['nomad-transcripts-ui-fixture']};})();

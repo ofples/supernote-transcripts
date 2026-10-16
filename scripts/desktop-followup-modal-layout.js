@@ -1,0 +1,1 @@
+(()=>{let r=document.querySelector('.st-fullscreen-modal'),p=r.parentElement,s=getComputedStyle(p),x=getComputedStyle(r);return {parent:p.className,display:s.display,align:s.alignItems,justify:s.justifyContent,direction:s.flexDirection,modalPosition:x.position,modalTop:x.top};})();

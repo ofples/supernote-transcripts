@@ -1,0 +1,1 @@
+JSON.stringify({inline:globalThis.__fixtureRun_check_inline_mirror_browser_fixture,diag:globalThis.__inlineMirrorDiag,loaded:!!app.plugins.getPlugin("nomad-transcripts-ui-fixture"),forms:document.querySelectorAll(".modal").length})

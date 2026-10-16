@@ -1,0 +1,1 @@
+(()=>{const p=app.plugins.plugins['nomad-transcripts'];return {initializing:p.initializing,nativeActive:p.nativeActive,recipes:p.recipes?.size,progress:p.progress.stage,commands:Object.keys(app.commands.commands).filter(k=>k.startsWith('nomad-transcripts:')),native:!!window.Capacitor?.Plugins?.App};})();

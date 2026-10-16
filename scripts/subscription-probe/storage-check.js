@@ -1,0 +1,1 @@
+(async()=>({encrypted:await app.secretStorage.isEncryptionAvailable(),adapterType:app.secretStorage.adapter?.constructor.name,saveImplementation:app.secretStorage.adapter?.save?.toString(),loadImplementation:app.secretStorage.adapter?.load?.toString()}))();
