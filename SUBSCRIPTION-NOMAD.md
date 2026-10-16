@@ -1,5 +1,13 @@
 # Subscription sign-in and desktop pairing
 
+## Pairing improvements in 0.11.2
+
+New pairing codes contain 20 unambiguous characters in five groups, with 96 bits of randomness. Existing 32-character hexadecimal codes and saved pending sessions remain accepted. The ten-minute lifetime, five-failure limit and authenticated encryption are unchanged.
+
+The Nomad now has **Discover** beside Desktop address. Desktop publishes one expiring locator per installation under `Supernote Transcripts/Shared Data/Pairing`. It includes only a session ID, private IPv4 addresses and expiry; it never includes the pairing code or account data. Obsidian Sync carries this locator to the Nomad. On an explicit tap, the Nomad probes only listed, validated private addresses on port 19457, accepting a desktop only if its live `/info` session matches. Probes and timeouts are bounded. Repeated pairing replaces that desktop's previous locator; stale/closed sessions cannot be selected successfully.
+
+Start **Connect a Nomad** on desktop first, wait for vault sync, then use **Discover** on Nomad and enter the separate code. Both devices need the same synced vault and a reachable private Wi-Fi network. Manual address entry remains available. This is discovery through a synced locator plus a LAN check, not mDNS or a network scan. The browser approval and Nomad's independent credential storage are unchanged. See [the complete workflow](DESKTOP-WORKFLOW.md).
+
 ## Connection recovery in 0.11.1
 
 The account and the recognition queue have separate state. Previously a successful reconnect could leave the queue's old "Session renewal uncertain" error in place. A healthy saved session or a newly completed sign-in now clears only matching login blockers, including the older message-only records, and makes never-sent pending pages eligible again. Existing manual pause, page errors, ambiguous request holds, quotas and budgets remain in effect. Recognition follows the existing automatic/manual settings.
@@ -17,7 +25,7 @@ The desktop-assisted pairing fallback is implemented in 0.10.2 source and covere
 ### Pairing steps
 
 1. On desktop, open subscription settings and choose **Connect a Nomad**. Keep desktop Obsidian open. Use **Copy** beside one displayed address (including its port), and copy the temporary pairing code. It expires after ten minutes.
-2. Connect the Nomad to the same Wi-Fi network. In its **Sign in from desktop** section, enter the displayed address and code, then choose **Connect**. The first version requires manual entry and does not discover devices automatically.
+2. Connect the Nomad to the same Wi-Fi network. In its **Sign in from desktop** section, choose **Discover** or enter the displayed address manually, then enter the separate code and choose **Connect**. Discovery in 0.11.2 requires the same synced vault; older versions require manual entry.
 3. Complete the OpenAI sign-in and approval in the normal browser opened on desktop. The callback returns to the desktop loopback listener.
 4. The Nomad receives the encrypted one-use result, exchanges the code with its own PKCE verifier, and saves its own credentials in encrypted native storage.
 5. The relay closes after acknowledgment, cancellation, or expiry. The devices need the same private IPv4 network only while pairing; after completion the Nomad can use its own connection.

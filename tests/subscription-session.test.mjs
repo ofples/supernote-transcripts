@@ -32,7 +32,15 @@ test("subscription interruption identity and explicit decision persist without c
   assert.throws(()=>new SubscriptionUsage(storage,'recovery').recoverableAttempts(),/Restore.*usage/);
 });
 const deferred = () => { let resolve, reject; const promise = new Promise((a, b) => { resolve = a; reject = b; }); return { promise, resolve, reject }; };
-const until = async (fn) => { for (let i = 0; i < 100; i++) { if (fn()) return; await new Promise((r) => setImmediate(r)); } throw Error("Mock operation did not settle"); };
+const until = async (fn, timeoutMs = 2000) => {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (fn()) return;
+    await new Promise((resolve) => setTimeout(resolve, 2));
+  }
+  if (fn()) return;
+  throw Error("Mock operation did not settle");
+};
 async function withOnline(online, action) {
   const original = Object.getOwnPropertyDescriptor(globalThis, "navigator");
   Object.defineProperty(globalThis, "navigator", { configurable: true, value: { onLine: online } });

@@ -84,7 +84,8 @@ test("binds private LAN and loopback listeners, serves info, and rejects origins
   await pairing.start();
   assert.deepEqual(mock.servers.map(({ port, host }) => [port, host]), [[19457, "0.0.0.0"], [19456, "127.0.0.1"]]);
   assert.deepEqual(pairing.state.addresses, [hostAddress, "http://10.0.0.4:19457", "http://172.20.2.5:19457"]);
-  assert.match(pairing.state.code, /^(?:[A-F0-9]{4}-){7}[A-F0-9]{4}$/);
+  assert.match(pairing.state.code, /^(?:[2-9A-HJ-NP-Z]{4}-){4}[2-9A-HJ-NP-Z]{4}$/);
+  assert.match(pairing.state.sid, /^urn:uuid:[0-9a-f-]{36}$/i);
   const info = await lanCall(mock, "/info");
   assert.equal(info.statusCode, 200);
   assert.deepEqual(JSON.parse(info.body), { v: 1, sid: JSON.parse(info.body).sid, expiresIn: 600 });

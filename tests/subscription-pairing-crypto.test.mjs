@@ -17,12 +17,12 @@ const sid = 'urn:uuid:123e4567-e89b-42d3-a456-426614174000';
 const otherSid = 'urn:uuid:123e4567-e89b-42d3-a456-426614174001';
 const code = '0123-4567-89AB-CDEF-0123-4567-89AB-CDEF';
 
-test('pairing code has 128 bits and normalization accepts only 32 hex digits', () => {
+test('new pairing code has 96 random bits in a short unambiguous alphabet and old 128-bit codes remain accepted', () => {
   const generated = createPairingCode();
-  assert.match(generated, /^(?:[0-9A-F]{4}-){7}[0-9A-F]{4}$/);
-  assert.equal(normalizePairingCode(generated).length, 32);
+  assert.match(generated, /^(?:[2-9A-HJ-NP-Z]{4}-){4}[2-9A-HJ-NP-Z]{4}$/);
+  assert.equal(normalizePairingCode(generated).length, 20);
   assert.equal(normalizePairingCode(code.toLowerCase().replaceAll('-', ' ')), code.replaceAll('-', ''));
-  for (const bad of ['', 'abc', 'G'.repeat(32), '0'.repeat(33), '0'.repeat(16) + ' 0'.repeat(8)]) {
+  for (const bad of ['', 'abc', 'G'.repeat(32), '0'.repeat(33), '0'.repeat(16) + ' 0'.repeat(8), 'I'.repeat(20), 'A'.repeat(19) + 'B']) {
     assert.throws(() => normalizePairingCode(bad));
   }
 });
@@ -37,6 +37,13 @@ test('AES-GCM round trip binds code, session, and message purpose', async () => 
   await assert.rejects(openPairing('FFFF-'.repeat(6) + 'FFFF', sid, 'poll-reply', envelope));
   await assert.rejects(openPairing(code, otherSid, 'poll-reply', envelope));
   await assert.rejects(openPairing(code, sid, 'poll', envelope));
+});
+
+test('short codes derive the same AES-GCM key on both peers', async () => {
+  const shortCode = createPairingCode();
+  const envelope = await sealPairing(shortCode, sid, 'poll', { op: 'poll' });
+  assert.deepEqual(await openPairing(shortCode.replaceAll('-', ''), sid, 'poll', envelope), { op: 'poll' });
+  await assert.rejects(openPairing(createPairingCode(), sid, 'poll', envelope));
 });
 
 test('tampering, malformed envelopes, invalid purposes, and oversized data fail closed', async () => {

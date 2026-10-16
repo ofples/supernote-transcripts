@@ -12,7 +12,7 @@ const securityHeaders: Record<string, string> = {
   "Referrer-Policy": "no-referrer",
 };
 
-type HostState = { code: string; addresses: string[]; status: string; expiresAt: number };
+type HostState = { code: string; sid: string; addresses: string[]; status: string; expiresAt: number };
 type Authorization = { url: string; state: string; clientId: string };
 type OAuthResult = Record<string, string>;
 type HttpServer = import("node:http").Server;
@@ -127,7 +127,7 @@ export class DesktopPairingHost {
   }
 
   get state(): HostState {
-    return { code: this.code ?? "", addresses: [...this.addresses], status: this.status, expiresAt: this.expiresAt };
+    return { code: this.code ?? "", sid: this.sid ?? "", addresses: [...this.addresses], status: this.status, expiresAt: this.expiresAt };
   }
 
   start(): Promise<void> {

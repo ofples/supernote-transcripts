@@ -12,8 +12,8 @@ await mkdir(evidenceDir, { recursive: true });
 await mkdir(resolve("test-artifacts"), { recursive: true });
 
 const assert = (condition, message) => { if (!condition) throw new Error(message); };
-const secretFixtureCode = "0123456789abcdef0123456789abcdef";
-const groupedFixtureCode = "0123-4567-89ab-cdef-0123-4567-89ab-cdef";
+const secretFixtureCode = "23456789ABCDEFGHJKLM";
+const groupedFixtureCode = "2345-6789-ABCD-EFGH-JKLM";
 const reports = [];
 
 async function launch(platform, viewport) {
@@ -90,7 +90,7 @@ async function layout(page, root, label, minimumTarget = 48) {
   assert((await card.innerText()).includes("192.168.1.40:19457"), "first desktop pairing address missing");
   assert((await card.innerText()).includes("10.0.0.8:19457"), "second desktop pairing address missing");
   assert((await card.innerText()).includes("Keep desktop Obsidian open and connect from Nomad on the same Wi-Fi."), "same-Wi-Fi guidance missing");
-  assert((await card.locator(".st-pairing-code").innerText()) === groupedFixtureCode, "full pairing code was not grouped into eight four-character chunks");
+  assert((await card.locator(".st-pairing-code").innerText()) === groupedFixtureCode, "short pairing code was not grouped into five four-character chunks");
   assert((await card.locator(".st-pairing-status").innerText()).includes("Waiting for the Nomad"), "pairing host status is not readable");
   assert((await card.innerText()).includes("Code expires in about 10 minutes."), "pairing expiry is missing");
   await card.getByRole("button", { name: "Copy pairing code", exact: true }).click();
@@ -112,7 +112,7 @@ async function layout(page, root, label, minimumTarget = 48) {
   reports.push({
     platform: "desktop", viewport: desktopLayout.viewport,
     normalConnectFlowPreserved: true, pairingAvailableWhileConnected: true,
-    addressesAndStatusDisplayed: true, fullCodeDisplayedInEightGroups: true,
+    addressesAndStatusDisplayed: true, shortCodeDisplayedInFiveGroups: true,
     copyUsesFullUnformattedCode: true, cancelCallsFakeOnce: true,
     connectedAccountAndConfigPreserved: true, noHorizontalOverflow: !desktopLayout.documentOverflowX,
     pairingTargetsAtLeast36px: desktopLayout.targetsAtLeastMinimum,
@@ -126,15 +126,64 @@ async function layout(page, root, label, minimumTarget = 48) {
   const before = await snapshots(page);
   await page.evaluate(() => window.__streamlinedFixture.controller.setSubscriptionStatus({ connected: false, needsSignIn: true, pairingPending: true, status: "Sign in required." }));
   assert(await root.getByRole("heading", { name: "Sign in from desktop", exact: true }).count() === 1, "Nomad desktop-pairing sign-in section missing");
-  assert(await root.getByLabel("Desktop address").count() === 1 && await root.getByLabel("Pairing code").count() === 1, "Nomad address/code inputs missing");
+  const address = root.locator(".st-nomad-pairing input[type=url]");
+  const codeLabelCount = await root.getByLabel("Pairing code").count();
+  assert(await address.count() === 1 && codeLabelCount === 1, `Nomad address/code inputs missing (${await address.count()}/${codeLabelCount}): ${await root.locator(".st-nomad-pairing").innerText()}`);
+  assert(await address.evaluate(input => input.labels?.length === 1 && !input.labels[0].querySelector("button")), "Desktop address label must remain associated with the input and contain no interactive buttons");
   assert(await root.getByRole("button", { name: "Finish sign-in", exact: true }).count() === 1, "Nomad Finish sign-in action missing");
   assert(await root.getByRole("button", { name: "Cancel sign-in", exact: true }).count() === 1, "Nomad pending sign-in does not offer Cancel sign-in beside Finish sign-in");
   assert(await root.getByRole("button", { name: /Reconnect ChatGPT account/ }).count() === 0, "Nomad legacy browser connection is not hidden by default");
 
-  const address = root.getByLabel("Desktop address");
   const code = root.getByLabel("Pairing code");
+  await page.evaluate(() => {
+    const c = window.__streamlinedFixture.controller;
+    c.discoveryResults = [{ address: "http://192.168.1.40:19457" }];
+  });
+  await root.getByRole("button", { name: "Discover", exact: true }).click();
+  await page.waitForFunction(() => document.querySelector('[aria-live="polite"]')?.textContent?.includes("Desktop found"));
+  assert(await address.inputValue() === "http://192.168.1.40:19457", "single discovered desktop did not fill the address input");
+  assert(await code.inputValue() === "", "discovery unexpectedly filled or changed the pairing code");
+  assert((await page.evaluate(() => window.__streamlinedFixture.controller.actionCounters.pairSubscriptionDesktop)).length === 0, "discovery initiated pairing or authentication");
+
+  await page.evaluate(() => {
+    const c = window.__streamlinedFixture.controller;
+    c.discoveryResults = [{ address: "http://192.168.1.40:19457" }, { address: "http://10.0.0.8:19457" }];
+  });
+  await root.getByRole("button", { name: "Discover", exact: true }).click();
+  await page.getByText("Choose a desktop address:").waitFor();
+  await root.getByRole("button", { name: "http://10.0.0.8:19457", exact: true }).click();
+  assert(await address.inputValue() === "http://10.0.0.8:19457", "multiple discovered desktops could not be selected");
+  assert(await root.getByText("Address selected. Enter its pairing code below.").count() === 1, "desktop selection did not give the next step");
+
+  await page.evaluate(() => { window.__streamlinedFixture.controller.discoveryResults = []; });
+  await root.getByRole("button", { name: "Discover", exact: true }).click();
+  await root.getByText(/No active desktop found/).waitFor();
+  assert(await root.getByText(/enter its address manually/i).count() === 1, "empty discovery did not explain manual address entry");
+
+  await page.evaluate(() => { window.__streamlinedFixture.controller.discoveryError = "Shared vault unavailable."; });
+  await root.getByRole("button", { name: "Discover", exact: true }).click();
+  await root.getByText("Shared vault unavailable.").waitFor();
+  await page.evaluate(() => { window.__streamlinedFixture.controller.discoveryError = undefined; });
+
   await address.fill("192.168.1.40:19457");
   await code.fill(groupedFixtureCode);
+  await page.evaluate(() => {
+    const c = window.__streamlinedFixture.controller;
+    c.discoveryDeferred = true;
+  });
+  await root.getByRole("button", { name: "Discover", exact: true }).click();
+  await page.waitForFunction(() => document.querySelector(".st-pairing-discover")?.textContent === "Finding…");
+  await root.getByRole("button", { name: "Cancel sign-in", exact: true }).click();
+  await page.evaluate(() => {
+    const c = window.__streamlinedFixture.controller;
+    c.resolveDiscovery([{ address: "http://10.0.0.99:19457" }]);
+    c.discoveryDeferred = false;
+  });
+  await page.waitForTimeout(50);
+  assert(await address.inputValue() === "192.168.1.40:19457", "late discovery response after cancellation changed the address draft");
+  assert(await root.getByText("Desktop found. Enter its pairing code below.").count() === 0, "late discovery response after cancellation changed the UI");
+  assert(await code.inputValue() === groupedFixtureCode, "late discovery response after cancellation changed the code draft");
+
   await root.locator(".st-run-behavior input[type=checkbox]").first().check();
 
   await page.evaluate(() => window.__streamlinedFixture.controller.setSubscriptionStatus({ connected: false, needsSignIn: true, pairingPending: true, status: "Waiting for desktop pairing." }));
@@ -152,7 +201,7 @@ async function layout(page, root, label, minimumTarget = 48) {
   const beforeCancel = await snapshots(page);
   await root.getByRole("button", { name: "Cancel sign-in", exact: true }).click();
   const cancelCount = await page.evaluate(() => window.__streamlinedFixture.controller.actionCounters.cancelSubscriptionPairing);
-  assert(cancelCount === 1, "Nomad Cancel sign-in did not call its fake cancellation once");
+  assert(cancelCount === 2, "Nomad Cancel sign-in did not call both fake cancellation checks exactly once");
   assert(await address.inputValue() === "192.168.1.40:19457" && await code.inputValue() === groupedFixtureCode, "Cancel sign-in lost address/code drafts");
   assert((await snapshots(page)) === beforeCancel, "Cancel sign-in changed the fake account/config state");
 
@@ -198,7 +247,7 @@ async function layout(page, root, label, minimumTarget = 48) {
     simulatedKeyboardModalHeight: keyboardLayout.modal.height,
     keyboardFixtureUsesFullScreenFrame: true,
     footerVisibleAboveSimulatedKeyboard: keyboardLayout.footer.bottom <= 664,
-    fakeActions: { pairCalls: 1, cancelPairingCalls: cancelCount, finishCalls: finishCount, reconnectCalls: counts.reconnect },
+    fakeActions: { pairCalls: 1, cancelPairingCalls: cancelCount, discoverCalls: 5, finishCalls: finishCount, reconnectCalls: counts.reconnect },
     accountAndConfigPreserved: true, externalRequests: externalRequests.length, browserErrors: errors.length,
   });
   await browser.close();

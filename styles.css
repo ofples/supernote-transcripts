@@ -1648,6 +1648,26 @@
   gap: 8px;
   min-width: 0;
 }
+.st-fullscreen-modal .st-pairing-discover-row {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  min-width: 0;
+}
+.st-fullscreen-modal .st-nomad-pairing .st-field > label {
+  font-weight: 500;
+}
+.st-fullscreen-modal .st-pairing-discover-row input {
+  flex: 1;
+  min-width: 0;
+  width: 0;
+}
+.st-fullscreen-modal .st-pairing-discover-row button {
+  flex: 0 0 auto;
+}
+.st-fullscreen-modal .st-pairing-discovery-results:empty {
+  display: none;
+}
 .st-fullscreen-modal .st-pairing-address {
   display: block;
   min-width: 0;

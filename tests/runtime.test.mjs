@@ -2097,3 +2097,25 @@ test("typed pre-send auth stops are not migrated into ambiguous paid-page holds 
   assert.equal(restarted.store.notebooks[source].executionIssue.code, "subscription_auth");
   assert.equal(restarted.store.notebooks[source].pageIssues, undefined);
 });
+
+test("fresh desktop hydrates mixed Nomad recipes and cleaned presentation without recognition",async()=>{
+  const a=fixture(2);sharing(a,"nomad-mixed");a.plugin.config.continuous=true;enableCleanupApi(a);
+  const physical=await Promise.all([1,2].map(async number=>({id:`native:${number}`,number,fingerprint:await sharedHash(`physical ${number}`)})));a.change(physical);
+  await a.plugin.update();const original=a.plugin.store.notebooks[source];
+  const id=await notebookIdentity("linked-reflections","a.note");
+  original.pages["native:1"].recipe=await sharedHash("older Luna recognition recipe");
+  original.pages["native:1"].recognition={provider:"subscription",model:"gpt-6-luna",quality:"careful",recognizedAt:"2026-10-01T00:00:00.000Z",promptHash:await sharedHash("old prompt"),glossaryHash:await sharedHash("old glossary")};
+  await a.plugin.sharedCache.saveResult({notebookId:id,pageId:"native:1",fingerprint:physical[0].fingerprint,recipe:original.pages["native:1"].recipe},original.pages["native:1"].text,original.pages["native:1"].recognition);
+  cleanupResponse(a);await a.plugin.cleanupDocument(source);
+  const cleaned=a.files.get("Mirror/a.md");
+  const b=fixture(2);b.change(physical);sharing(b,"fresh-desktop");globalThis.__desktop=true;
+  const local="C:/Cloud/Reflections/a.note";b.rename(local);b.plugin.config.rules[0].source="C:/Cloud/Reflections";
+  for(const [path,text]of a.files)if(!path.startsWith(".obsidian"))b.files.set(path,text);
+  assert.deepEqual(b.plugin.store.notebooks,{});
+  await b.plugin.update();const adopted=b.plugin.store.notebooks[local];
+  assert.equal(b.calls.length,0);assert.equal(b.plugin.costs.total.requests,0);
+  assert.deepEqual(adopted.pages,original.pages);assert.deepEqual(adopted.cleanedPages,original.cleanedPages);
+  assert.deepEqual(adopted.cleanup,original.cleanup);assert.equal(adopted.profileOutdated,true);
+  assert.equal(adopted.status,"current");assert.equal(b.files.get("Mirror/a.md"),cleaned);
+  await b.plugin.update();assert.equal(b.calls.length,0);assert.equal(adopted.profileOutdated,true);
+});

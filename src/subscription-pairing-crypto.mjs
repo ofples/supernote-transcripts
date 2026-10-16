@@ -7,6 +7,7 @@ const PURPOSES = new Set([
 const REDIRECT = 'http://127.0.0.1:19456/auth/callback';
 const RESOURCE = 'https://api.openai.com/v1';
 const REQUIRED_SCOPES = 'openid profile email offline_access resource.invoke chatgpt.tokens.use.direct';
+const PAIRING_CODE_ALPHABET = '23456789ABCDEFGHJKLMNPQRSTUVWXYZ';
 
 function webCrypto() {
   if (!globalThis.crypto?.subtle || !globalThis.crypto?.getRandomValues) {
@@ -50,7 +51,20 @@ function fromBase64url(text, expectedLength, maximumLength) {
 
 function keyBytes(code) {
   const normalized = normalizePairingCode(code);
-  return Uint8Array.from({ length: 16 }, (_, index) => Number.parseInt(normalized.slice(index * 2, index * 2 + 2), 16));
+  if (/^[0-9A-F]{32}$/.test(normalized)) {
+    return Uint8Array.from({ length: 16 }, (_, index) => Number.parseInt(normalized.slice(index * 2, index * 2 + 2), 16));
+  }
+  const bytes = new Uint8Array(12);
+  let bits = 0, value = 0, offset = 0;
+  for (const character of normalized) {
+    value = (value << 5) | PAIRING_CODE_ALPHABET.indexOf(character);
+    bits += 5;
+    if (bits >= 8) {
+      bits -= 8;
+      bytes[offset++] = (value >>> bits) & 0xff;
+    }
+  }
+  return bytes;
 }
 
 async function deriveKey(code, sessionId) {
@@ -76,15 +90,27 @@ function isPlainObject(value) {
 }
 
 export function createPairingCode() {
-  const bytes = webCrypto().getRandomValues(new Uint8Array(16));
-  const hex = Array.from(bytes, byte => byte.toString(16).padStart(2, '0')).join('').toUpperCase();
-  return hex.match(/.{4}/g).join('-');
+  const bytes = webCrypto().getRandomValues(new Uint8Array(12));
+  let bits = 0, value = 0, code = '';
+  for (const byte of bytes) {
+    value = (value << 8) | byte;
+    bits += 8;
+    while (bits >= 5) {
+      bits -= 5;
+      code += PAIRING_CODE_ALPHABET[(value >>> bits) & 31];
+    }
+  }
+  if (bits) code += PAIRING_CODE_ALPHABET[(value << (5 - bits)) & 31];
+  return code.match(/.{4}/g).join('-');
 }
 
 export function normalizePairingCode(value) {
   if (typeof value !== 'string') throw new Error('Invalid pairing code');
   const normalized = value.replace(/[ -]/g, '').toUpperCase();
-  if (!/^[0-9A-F]{32}$/.test(normalized)) throw new Error('Invalid pairing code');
+  const legacyHex = /^[0-9A-F]{32}$/.test(normalized);
+  const currentBase32 = /^[23456789ABCDEFGHJKLMNPQRSTUVWXYZ]{20}$/.test(normalized)
+    && (PAIRING_CODE_ALPHABET.indexOf(normalized[19]) & 15) === 0;
+  if (!legacyHex && !currentBase32) throw new Error('Invalid pairing code');
   return normalized;
 }
 

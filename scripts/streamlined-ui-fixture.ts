@@ -71,6 +71,7 @@ export default class StreamlinedUIFixture {
       cancelSubscriptionPairing: 0,
       startSubscriptionPairing: 0, stopSubscriptionPairing: 0,
       pairSubscriptionDesktop: [] as { address: string; code: string }[],
+      discoverSubscriptionDesktops: 0,
     };
     const actionOrder = () => [...store.queue].sort((a: any, b: any) => (b.priority ?? 0) - (a.priority ?? 0));
     const controller: any = {
@@ -86,6 +87,10 @@ export default class StreamlinedUIFixture {
       apiKey: "fixture-only-key", aiEnabled: false, autoEnabled: false,
       subscriptionStatus: { connected: true, status: "Synthetic fixture account" },
       subscriptionPairing: undefined as undefined | { code: string; addresses: string[]; status: string; expiresAt: number },
+      discoveryResults: [] as { address: string }[],
+      discoveryError: undefined as string | undefined,
+      discoveryDeferred: false,
+      discoveryResolve: undefined as undefined | ((value: { address: string }[]) => void),
       subscriptionUsage: {
         requests: 12, pages: 18, inputTokens: 3200, outputTokens: 1100, unconfirmed: 1,
         todayRequests: 3, dailyLimit: 30, day: "2026-10-15",
@@ -109,7 +114,7 @@ export default class StreamlinedUIFixture {
       startSubscriptionPairing: async () => {
         counters.startSubscriptionPairing++;
         controller.subscriptionPairing = {
-          code: "0123456789abcdef0123456789abcdef",
+          code: "23456789ABCDEFGHJKLM",
           addresses: ["192.168.1.40:19457", "10.0.0.8:19457"],
           status: "Waiting for the Nomad to connect…",
           expiresAt: Date.now() + 600000,
@@ -125,6 +130,13 @@ export default class StreamlinedUIFixture {
         counters.pairSubscriptionDesktop.push({ address, code });
         emit();
       },
+      discoverSubscriptionDesktops: async () => {
+        counters.discoverSubscriptionDesktops++;
+        if (controller.discoveryDeferred) return await new Promise<{ address: string }[]>((resolve) => { controller.discoveryResolve = resolve; });
+        if (controller.discoveryError) throw new Error(controller.discoveryError);
+        return copy(controller.discoveryResults);
+      },
+      resolveDiscovery(value: { address: string }[]) { controller.discoveryResolve?.(copy(value)); controller.discoveryResolve = undefined; },
       setSubscriptionStatus(status: any) { controller.subscriptionStatus = status; emit(); },
       get queueView() {
         const waiting = actionOrder().filter((task: any) => task.source !== paths.working && !controller.isPaused(task.source)).map((task: any) => task.source);

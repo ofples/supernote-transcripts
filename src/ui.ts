@@ -2698,6 +2698,7 @@ class MirrorsModal extends Modal {
       startSubscriptionPairing?: () => Promise<void>;
       stopSubscriptionPairing?: () => Promise<void>;
       pairSubscriptionDesktop?: (address: string, code: string) => Promise<void>;
+      discoverSubscriptionDesktops?: () => Promise<{address: string}[]>;
       subscriptionUsage?: { requests: number; pages: number; inputTokens: number; outputTokens: number; unconfirmed: number };
     };
     const runSubscriptionAction = (action?: () => Promise<void>) =>
@@ -2825,7 +2826,7 @@ class MirrorsModal extends Modal {
       if (controller.platform === "nomad" && (!status?.connected || status.needsSignIn)) {
         const pairingSection = el(connection, "section", undefined, "st-nomad-pairing");
         el(pairingSection, "h3", "Sign in from desktop", "st-pairing-heading");
-        el(pairingSection, "p", "Enter the address and code shown by desktop Obsidian on the same Wi-Fi.", "st-caption st-pairing-guidance");
+        el(pairingSection, "p", "Start “Connect a Nomad” on desktop, then discover its address and enter its pairing code. Keep both devices on the same Wi-Fi.", "st-caption st-pairing-guidance");
         const addressInput = this.input(
           pairingSection,
           "Desktop address",
@@ -2836,13 +2837,47 @@ class MirrorsModal extends Modal {
         );
         addressInput.autocomplete = "off";
         addressInput.inputMode = "url";
+        if(controller.discoverSubscriptionDesktops){
+          const originalField=addressInput.parentElement!;
+          const field=el(pairingSection,"div",undefined,"st-field");
+          originalField.replaceWith(field);
+          while(originalField.firstChild)field.appendChild(originalField.firstChild);
+          addressInput.id=`st-pairing-address-${crypto.randomUUID()}`;
+          const caption=field.querySelector("span")!;
+          const label=el(field,"label",caption.textContent??"Desktop address");
+          label.htmlFor=addressInput.id;caption.replaceWith(label);
+          const row=el(field,"div",undefined,"st-pairing-discover-row");
+          row.appendChild(addressInput);
+          const results=el(pairingSection,"div",undefined,"st-pairing-discovery-results");
+          results.setAttribute("aria-live","polite");
+          const find=btn(row,"Discover",()=>{
+            find.disabled=true;find.textContent="Finding…";results.empty();
+            void controller.discoverSubscriptionDesktops!.call(this.c).then(found=>{
+              if(this.settingsDraft!==d||!addressInput.isConnected)return;
+              const addresses=[...new Set(found.map(c=>c.address))];
+              if(addresses.length===1){
+                addressInput.value=d.pairingAddress=addresses[0];
+                el(results,"p","Desktop found. Enter its pairing code below.","st-caption");
+              }else if(addresses.length){
+                el(results,"p","Choose a desktop address:","st-caption");
+                for(const address of addresses)btn(results,address,()=>{
+                  addressInput.value=d.pairingAddress=address;results.empty();
+                  el(results,"p","Address selected. Enter its pairing code below.","st-caption");
+                },"st-button st-text-button");
+              }else el(results,"p","No active desktop found. Start pairing on desktop and wait for Obsidian Sync, then try again—or enter its address manually.","st-caption");
+            }).catch(error=>{
+              if(this.settingsDraft===d&&addressInput.isConnected)el(results,"p",err(error),"st-caption");
+            }).finally(()=>{find.disabled=false;find.textContent="Discover";});
+          },"st-button st-text-button st-pairing-discover");
+          find.setAttribute("aria-label","Discover");
+        }
         const codeInput = this.input(
           pairingSection,
           "Pairing code",
           d.pairingCode,
           "text",
           (value) => (d.pairingCode = value),
-          "Enter the full 32-character code; spaces and hyphens are allowed.",
+          "Enter the code shown on desktop; spaces and hyphens are allowed.",
         );
         codeInput.autocomplete = "one-time-code";
         codeInput.autocapitalize = "characters";

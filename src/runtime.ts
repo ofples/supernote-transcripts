@@ -16,6 +16,7 @@ import { DesktopReadOnlySource } from "./desktop-reader";
 import { SharedNotebookCache, notebookIdentity, isSharedPath, type SharedIO, type LeaseHandle } from "./shared";
 import { MirrorCatalog } from "./catalog";
 import { ChatGPTSession } from "./subscription";
+import { advertise as advertisePairing, discover as discoverPairing } from "./subscription-pairing-discovery";
 import { SubscriptionUsage } from "./subscription-usage";
 import { encodeStateSnapshot, loadStateSlots, STATE_STORAGE_BLOCK } from "./state";
 import { interruptedAttempts } from "./attempt-recovery.mjs";
@@ -26,6 +27,7 @@ import { cleanupInput, cleanupPages } from "./cleanup.mjs";
 import { pageTextLayer } from "./provenance.mjs";
 import { runWorkers } from "./workers.mjs";
 import { PublicationReceipts, canAdvancePublication, canAdoptPublication, type Receipt } from "./publication";
+import { hydratePublicationCache } from "./publication-cache";
 import { installUI } from "./ui";
 import { installPageLinks } from "./page-links-ui";
 import { resolveNotePage, notePageUrl, isManagedTranscript } from "./page-navigation";
@@ -174,7 +176,20 @@ export default class SupernoteTranscripts extends Plugin implements Controller {
   get subscriptionUsage(){return {...this.subscriptionBook.snapshot(),dailyLimit:this.costs.settings.dailyRequests};}
   async connectSubscription(){if(this.task)throw Error("Finish active recognition before connecting an account.");await this.session.signIn();}
   get subscriptionPairing(){return this.session.pairing;}
-  async startSubscriptionPairing(){if(this.task)throw Error("Pause and wait for recognition before pairing a Nomad.");await this.session.startDesktopPairing();}
+  async startSubscriptionPairing(){
+    if(this.task)throw Error("Pause and wait for recognition before pairing a Nomad.");
+    await this.session.startDesktopPairing();
+    const state=this.session.pairing,io=this.sharedIO();
+    const deviceId=this.shared?.deviceId;
+    if(state&&io&&deviceId)try {await advertisePairing(io,state,deviceId);}catch{
+      new Notice("Pairing is ready. Desktop discovery could not be shared; enter its address manually.");
+    }
+  }
+  async discoverSubscriptionDesktops(){
+    const io=this.sharedIO();
+    if(!io)throw Error("Desktop discovery needs the same synced vault on both devices. You can enter its address manually.");
+    return discoverPairing(io,url=>requestUrl({url,throw:false}));
+  }
   async stopSubscriptionPairing(){this.session.stopDesktopPairing();}
   async cancelSubscriptionPairing(){await this.session.cancelPairing();}
   async pairSubscriptionDesktop(address:string,code:string){if(this.task)throw Error("Pause and wait for recognition before signing in.");await this.session.pairWithDesktop(address,code);}
@@ -1307,11 +1322,23 @@ export default class SupernoteTranscripts extends Plugin implements Controller {
         if(Array.isArray(selection)||selectedIds)delete state.pageIssues?.[page.id];
       }
       if(shared&&!force&&!state.forcePending?.length){
+        const io=this.sharedIO();
+        if(io&&await io.exists(state.output)){
+          const text=await io.read(state.output);
+          if(isManagedTranscript(text)){
+            const receipt=await new PublicationReceipts(io).find(sharedId,text);
+            const imported=await hydratePublicationCache({receipt,notebookId:sharedId,
+              current:state.desired,before:before.desired,local:state.pages,cache:shared});
+            Object.assign(state.pages,imported);
+            for(const id of Object.keys(imported))delete state.pageIssues?.[id];
+          }
+        }
         for(const page of descriptor.pages){
           if(state.pages[page.id]?.fingerprint===page.fingerprint)continue;
           const result=(await shared.findResult({notebookId:sharedId,pageId:page.id,fingerprint:page.fingerprint,recipe:resolved.recipe})).chosen;
           if(result){state.pages[page.id]={fingerprint:page.fingerprint,text:result.text,recipe:resolved.recipe,number:page.number,...(result.recognition?{recognition:result.recognition}:{}),...(isEmptyPage(result.text)?{blank:true}:{})};delete state.pageIssues?.[page.id];}
         }
+        state.profileOutdated=profileNeedsRefresh(state,resolved.recipe);
       }
       if(shared){
         for(const page of descriptor.pages){
