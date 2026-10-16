@@ -64,6 +64,10 @@ Neighbor pages are context only; the request targets only the pending pages. Gro
 
 Device OCR text may be shown provisionally while AI recognition is still pending. It is separate from saved AI recognition and is supplied only as a secondary hint; the page image remains authoritative. OCR text is not a completed or verified transcript. Review the recognized Markdown against the original handwriting.
 
+### Careful mode progress
+
+In Careful mode, Queue shows the page currently being prepared and labels a neighboring image as **Context page**. The active request’s target pages are shown separately from context pages. Nearby images rendered for one group may be reused by later groups while they remain in the temporary in-memory cache. Image preparation runs one group at a time, while AI requests can still run in parallel. If you pause during a render, the current image finishes and no new images start. An AI request already in flight may finish.
+
 ## Review costs and run safely
 
 Recognition may consume paid API usage or subscription capacity. Before enabling a provider, confirm its billing terms and configure any available local request and dollar limits. Estimates use prior comparable pages when available; with little history, estimates are provisional and rely on token assumptions. Estimates are not bills or guaranteed caps. API reservations and subscription attempt counters are local plugin accounting; they do not show the provider account’s remaining quota or replace provider-side limits.
@@ -80,7 +84,13 @@ A cautious first run:
 
 *Example estimate from a synthetic fixture. It is guidance, not a bill.*
 
+![Synthetic Queue showing a spending pause and the Review Costs action](screenshots/queue-spending-paused-desktop.png)
+
+*Example recovery state from a synthetic fixture. Review the budget before resuming work.*
+
 Automatic catch-up can process new and changed pages when Obsidian starts/resumes or at the configured interval while Obsidian is active. It is optional and does not provide continuous Android background execution. Queues, progress, provider connection, budgets, worker concurrency and pause state are local to each device. A paused device does not pause another device’s queue.
+
+Before AI work begins, Update checks the page counts and order in changed notebooks. It checks up to two notebooks at once on Nomad and four on desktop, without rendering page images or making recognition requests. Unchanged notebooks reuse their previous inventory. Sources and Queue refresh as these checks finish, so a later notebook does not have to wait for an earlier one to finish recognition before its page count updates. Each device keeps its own queue.
 
 Failed pages remain visible for review and are not retried automatically. Use **Retry** when you want another attempt; **Skip** leaves a page out until you choose to retry it. Uncertain interrupted attempts can count against configured ceilings because a provider may have received the request even if no result returned.
 
@@ -91,6 +101,16 @@ Open a notebook’s actions to see its page progress and saved transcript. **Cle
 **Re-recognize pages** explicitly sends selected page images again. This may use provider credit and can replace transcript content for those pages. Save or copy important edits before re-recognizing. Re-recognition is not automatic after changing a prompt or model.
 
 When source pages change, use **Update** to detect and process the changes. Keep original notebooks and transcript backups until the new output is checked. Concurrent edits or delayed Sync can create conflicts; resolve conflicts after both devices finish syncing and preserve the copy you want.
+
+### Force update for a notebook in conflict
+
+**Force update** appears in notebook details or Sources for failed/conflicted notebooks and certain waits for shared results, synchronization, or another device’s claim. It is an explicit recovery choice. It bypasses shared claims and the Sync wait for that notebook for that invocation only, using this device’s current local notebook and saved recognition settings. Before it runs, the plugin backs up the current Markdown and cached recognition under `Supernote Transcripts/History/`.
+
+By default, matching cached recognition is reused; existing explicit re-recognition work remains queued. The **Re-recognize every page** option sends every current page for recognition, including pages held or skipped earlier. That can create duplicate requests and cost, and publishing this device’s result can replace newer shared transcript text. Check the estimate and compare the local source and saved settings before proceeding. Force update is never automatic. Authentication, AI enablement when re-recognizing all pages, budget, attempt-storage, and saved-state checks still apply. If the transcript is manually edited, use the edit comparison workflow instead of forcing it away.
+
+![Synthetic Force update warning showing local-result behavior, backup, estimate, and re-recognition option](screenshots/force-update-warning-desktop.png)
+
+*Example warning from a synthetic fixture. Check the source and estimate before choosing Force update.*
 
 ## View original pages
 

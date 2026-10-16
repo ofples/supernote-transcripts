@@ -1,6 +1,6 @@
 # Interface examples
 
-These are captures of the plugin UI rendered from synthetic fixtures for the 0.12.1 working tree. The fixture run reported 375 assertions across desktop, narrow desktop, and Nomad-sized layouts, with no production Obsidian use, external requests, recognition calls, browser errors, or fixture mutations. The notebook labels and paths are fixture display values; no notebook contents, account data, tokens, settings profiles, or reading positions are included. These screenshots show layout and controls; they do not establish a live Nomad installation or release status.
+These are captures of the plugin UI rendered from synthetic fixtures for the 0.12.2 working tree. The final fixture run reported 469 assertions across desktop, narrow desktop, and Nomad-sized layouts, with no production Obsidian use, external requests, recognition calls, browser errors, or fixture mutations. The notebook labels and paths are fixture display values; no notebook contents, account data, tokens, settings profiles, or reading positions are included. These screenshots show layout and controls; they do not establish release status or live Nomad validation.
 
 ## Sources overview
 
@@ -14,6 +14,10 @@ The source editor shows a single-notebook source and the aligned Markdown output
 
 ![Synthetic single-notebook source editor with output folder controls](source-editor-desktop.png)
 
+The narrow layout stacks the output path and folder button while keeping both aligned to the form's right edge.
+
+![Synthetic narrow desktop source editor showing the aligned output-folder control](source-editor-narrow.png)
+
 ## Queue estimate
 
 The estimate shows four eligible remaining pages, excludes an attention source, and explains the comparable-page basis and conservative reservation.
@@ -26,7 +30,13 @@ The estimate shows four eligible remaining pages, excludes an attention source, 
 
 The Queue shows that spending limits paused recognition and provides a **Review Costs** action.
 
-![Synthetic spending-paused Queue with the Review Costs action](queue-paused-desktop.png)
+![Synthetic spending-paused Queue with the Review Costs action](queue-spending-paused-desktop.png)
+
+## Force update recovery
+
+The warning explains that Force update uses this device’s saved results, creates a backup, and may duplicate requests or replace newer transcript text.
+
+![Synthetic Force update warning with backup, risk, estimate, and re-recognition option](force-update-warning-desktop.png)
 
 ## Shared settings recovery
 

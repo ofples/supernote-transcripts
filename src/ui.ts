@@ -6,7 +6,7 @@ import {
   PluginSettingTab,
   setIcon,
 } from "obsidian";
-import type { Controller, FolderRule, Profile, QueueEstimate } from "./types";
+import type { Controller, FolderRule, Profile, QueueEstimate, Store } from "./types";
 import {
   browserBreadcrumbs,
   browserEntryType,
@@ -189,6 +189,7 @@ class SettingsTab extends PluginSettingTab {
 type Screen =
   | "home"
   | "queue"
+  | "force-update"
   | "notebook-selection"
   | "settings"
   | "editor"
@@ -219,6 +220,11 @@ class MirrorsModal extends Modal {
   private pageIssuesLive?: HTMLElement;
   private notebookRetryQueued = new Set<string>();
   private updateButton?: HTMLButtonElement;
+  private forceUpdateSource = "";
+  private forceUpdateReturnScreen: Screen = "home";
+  private forceUpdateRecognizeAll = false;
+  private forceUpdateBusy = false;
+  private forceUpdateEstimateElement?: HTMLElement;
   private costLive?: HTMLElement;
   private costDraft?: CostSettings;
   private costReturnScreen: "home" | "queue" | "settings" = "home";
@@ -288,6 +294,9 @@ class MirrorsModal extends Modal {
   private outdatedOnly = false;
   private cleanupBusySource = "";
   private cleanupSaveCopy = false;
+  private get displayStore(): Store {
+    return this.c.displayStore ?? this.c.store;
+  }
   constructor(
     app: App,
     private c: Controller,
@@ -492,6 +501,8 @@ class MirrorsModal extends Modal {
           ? "Settings"
           : this.screen === "queue"
             ? "Queue"
+            : this.screen === "force-update"
+              ? "Force update"
             : this.screen === "notebook-selection"
               ? "Select notebooks"
               : this.screen === "editor"
@@ -519,6 +530,7 @@ class MirrorsModal extends Modal {
     this.updateButton = undefined;
     if (this.screen === "home") this.renderHome();
     else if (this.screen === "queue") this.renderQueue();
+    else if (this.screen === "force-update") this.renderForceUpdate();
     else if (this.screen === "notebook-selection")
       void this.renderNotebookSelection();
     else if (this.screen === "settings") this.renderSettings();
@@ -535,7 +547,7 @@ class MirrorsModal extends Modal {
     else if (this.screen === "queue") this.refreshQueue();
     else if (this.screen === "detail") {
       this.refreshDetail();
-      const state = this.c.store.notebooks[this.selectedSource];
+      const state = this.displayStore.notebooks[this.selectedSource];
       if (state) this.refreshPageIssues(state);
     }
     else if (this.screen === "recovery") {
@@ -642,10 +654,17 @@ class MirrorsModal extends Modal {
   private refreshHome() {
     if (!this.summary || !this.rows) return;
     const scroll = this.body.scrollTop;
-    const model = overviewPresentation(this.c);
+    const model = overviewPresentation({
+      config: this.c.config,
+      store: this.displayStore,
+      progress: this.c.progress,
+      autoEnabled: this.c.autoEnabled,
+      provider: this.c.provider,
+      aiEnabled: this.c.aiEnabled,
+    });
     const multipleSources =
       this.c.config.rules.filter((r) => r.enabled).length > 1;
-    const states = Object.values(this.c.store.notebooks);
+    const states = Object.values(this.displayStore.notebooks);
     const summaryKey = JSON.stringify([
       model,
       multipleSources,
@@ -655,6 +674,11 @@ class MirrorsModal extends Modal {
       this.c.progress.stateBlocked,
       (this.c.progress as typeof this.c.progress & { executionBlocked?: string }).executionBlocked,
       this.c.queueView.working?.source,
+      this.c.progress.detail,
+      this.c.progress.renderingContext,
+      this.c.progress.checked,
+      this.c.progress.total,
+      this.c.progress.stage,
     ]);
     if (this.summary.dataset.key !== summaryKey) {
       this.summary.dataset.key = summaryKey;
@@ -804,7 +828,7 @@ class MirrorsModal extends Modal {
     return copy;
   }
   private queueProgress(copy: HTMLElement, source: string) {
-    const state = this.c.store.notebooks[source];
+    const state = this.displayStore.notebooks[source];
     if (!state) return;
     const view = notebookPresentation(state);
     el(
@@ -815,9 +839,16 @@ class MirrorsModal extends Modal {
         : "Awaiting page check",
       "st-caption",
     );
-    if (view.reason)
-      el(copy, "p", view.reason, "st-caption st-attention-reason");
+    const reason = this.forceUpdateReason(state, view.reason);
+    if (reason)
+      el(copy, "p", reason, "st-caption st-attention-reason");
     progressBar(copy, view, `${base(source)} pages ready`);
+  }
+  private renderForceUpdateAction(parent: HTMLElement, state: Controller["store"]["notebooks"][string]) {
+    if (!this.canForceUpdate(state)) return;
+    const force = btn(parent, "Force update", () => this.openForceUpdate(state.source), "st-button st-text-button st-force-update-action");
+    force.disabled = !this.c.forceUpdate || !!this.c.progress.running || !!this.c.progress.stateBlocked || !!this.c.progress.budgetBlocked || !!this.c.progress.executionBlocked;
+    force.setAttribute("aria-label", `Force update ${base(state.source)}`);
   }
   private renderQueueBlockerAction(parent: HTMLElement) {
     const existing = parent.querySelector<HTMLButtonElement>(".st-blocker-action");
@@ -864,7 +895,7 @@ class MirrorsModal extends Modal {
     if (!this.summary) return;
     const q = this.c.queueView;
     if (!q) return;
-    const pageAttention = Object.values(this.c.store.notebooks)
+    const pageAttention = Object.values(this.displayStore.notebooks)
       .filter((state) => {
         const rule = this.c.config.rules.find((candidate) => candidate.id === state.ruleId);
         return !!rule?.enabled && selectedForRule(rule, state) &&
@@ -873,7 +904,7 @@ class MirrorsModal extends Modal {
       .map((state) => state.source);
     const attentionSources = [...new Set([...q.attention, ...pageAttention])]
       .filter((source) => {
-        const state = this.c.store.notebooks[source];
+        const state = this.displayStore.notebooks[source];
         return !state || notebookPresentation(state).attention;
       });
     const key = JSON.stringify([
@@ -887,7 +918,8 @@ class MirrorsModal extends Modal {
       this.c.progress.budgetBlocked,
       this.c.progress.stateBlocked,
       (this.c.progress as typeof this.c.progress & { executionBlocked?: string }).executionBlocked,
-      Object.values(this.c.store.notebooks).map((s) => [
+      this.c.progress.detail,
+      Object.values(this.displayStore.notebooks).map((s) => [
         s.source,
         notebookPresentation(s),
         s.paused,
@@ -908,7 +940,9 @@ class MirrorsModal extends Modal {
       if (this.c.progress.stateBlocked)
         this.renderStateBlockedNotice(this.summary);
       const overview = el(this.summary, "section", undefined, "st-queue-overview");
-      const globalStatus = this.c.progress.budgetBlocked
+      const globalStatus = this.c.progress.stage === "Checking notebook pages"
+        ? `Checking notebooks · ${this.c.progress.checked} of ${this.c.progress.total}`
+        : this.c.progress.budgetBlocked
         ? ((this.c as Controller & { provider?: string }).provider === "subscription" ? "Usage limit reached" : "Spending paused")
         : (this.c.progress as typeof this.c.progress & { executionBlocked?: string }).executionBlocked
           ? "Recognition paused"
@@ -959,6 +993,11 @@ class MirrorsModal extends Modal {
           `${q.working.stage}${q.working.number ? ` · page ${q.working.number}${q.working.total ? ` of ${q.working.total}` : ""}` : ""}`,
           "st-caption",
         );
+        const contextPage = this.c.progress.renderingContext && this.c.progress.activePage?.source === q.working.source
+          ? String(this.c.progress.activePage.number)
+          : this.c.progress.detail.match(/(?:^|[—–-]\s*)context page\s+(\d+)\b/i)?.[1];
+        if (contextPage)
+          el(copy, "p", `Context page ${contextPage}`, "st-caption st-context-page");
         const activePages = this.c.progress.activePages ?? [];
         const activeSource = this.c.progress.activePage?.source;
         if (
@@ -984,7 +1023,7 @@ class MirrorsModal extends Modal {
         } else {
           this.renderQueueEstimate(copy, q.working.source);
         }
-        const state = this.c.store.notebooks[q.working.source];
+        const state = this.displayStore.notebooks[q.working.source];
         if (state) {
           const pausing =
             !!state.paused ||
@@ -1077,7 +1116,7 @@ class MirrorsModal extends Modal {
     el(details, "summary", `${title} (${sources.length})`);
     for (const source of sources) {
       const row = el(details, "div", undefined, "st-queue-row");
-      const state = this.c.store.notebooks[source];
+      const state = this.displayStore.notebooks[source];
       const copy = this.queueCopy(row, source);
       this.queueProgress(copy, source);
       this.renderQueueEstimate(copy, source);
@@ -1138,6 +1177,7 @@ class MirrorsModal extends Modal {
             : "st-button st-text-button",
         );
         open.dataset.queueKey = `review:${source}`;
+        this.renderForceUpdateAction(row, state);
       }
     }
   }
@@ -1213,6 +1253,117 @@ class MirrorsModal extends Modal {
   }
   private stateBlockedMessage() {
     return "Saved plugin state is blocked. Restore the plugin state backup, then reload Obsidian. Update cannot repair saved-state storage.";
+  }
+  private isRecognitionVersionConflict(state: Controller["store"]["notebooks"][string]) {
+    return /shared transcript recognition versions differ/i.test(state.error ?? "");
+  }
+  private canForceUpdate(state: Controller["store"]["notebooks"][string]) {
+    return state.status === "failed" || state.status === "conflict" ||
+      /wait for (?:shared )?(?:results|synchronization)|another device.*(?:updat|claim)|shared notebook claim/i.test(state.error ?? "");
+  }
+  private forceUpdateReason(state: Controller["store"]["notebooks"][string] | undefined, fallback?: string) {
+    if (!state) return fallback;
+    if (this.isRecognitionVersionConflict(state))
+      return "Recognition versions differ. Use Force update to choose this device’s saved results, or keep the current transcript.";
+    if (/shared transcript results have not arrived or conflict with local results|shared transcript results.*(?:not arrived|conflict)/i.test(state.error ?? ""))
+      return "Shared recognition needs review. Check Sync or use Force update to choose this device’s saved results.";
+    return fallback;
+  }
+  private openForceUpdate(source: string) {
+    if (!this.c.forceUpdate) return new Notice("Force update is not available in this runtime yet.");
+    this.forceUpdateSource = source;
+    this.forceUpdateReturnScreen = this.screen;
+    this.forceUpdateRecognizeAll = false;
+    this.forceUpdateBusy = false;
+    this.screen = "force-update";
+    this.render();
+  }
+  private renderForceUpdate() {
+    const state = this.displayStore.notebooks[this.forceUpdateSource];
+    const root = el(this.body, "section", undefined, "st-force-update");
+    el(root, "h2", "Use this device’s saved results", "st-section-heading");
+    if (!state) {
+      el(root, "p", "This notebook is no longer available in saved state.", "st-caption st-attention-reason");
+    } else {
+      const rule = this.c.config.rules.find((item) => item.id === state.ruleId);
+      const profile = this.c.config.profiles.find((item) => item.id === rule?.profileId);
+      const settings = [profile?.model ? friendlyModel(profile.model) : "Model unavailable", profile?.quality ? qualityLabel(profile.quality) : "Fast"].join(" · ");
+      el(root, "p", settings, "st-caption st-force-update-settings");
+      el(root, "p", "This run bypasses shared claims and the Sync wait for this notebook only. It uses the original notebook and recognition settings saved on this device. It can duplicate requests or replace newer transcript text. Before running, the plugin backs up the current Markdown transcript and cached recognition. Provider budgets, authentication, and storage checks still apply.", "st-caption st-force-update-warning");
+      el(root, "p", "Matching cached pages are reused by default. Already queued re-recognition requests remain queued.", "st-caption");
+      this.forceUpdateEstimateElement = el(root, "p", "", "st-caption st-queue-estimate st-force-update-estimate");
+      this.updateForceUpdateEstimate(state);
+      this.toggle(root, "Re-recognize every page", this.forceUpdateRecognizeAll, (value) => {
+        this.forceUpdateRecognizeAll = value;
+        this.updateForceUpdateEstimate(state);
+        if (this.forceUpdateRunButton) this.forceUpdateRunButton.disabled = this.forceUpdateDisabled();
+      }, "Off reuses matching cached pages and their saved recognition.");
+    }
+    const reason = this.forceUpdateDisabledReason();
+    if (reason) el(root, "p", reason, "st-caption st-attention-reason");
+    const actions = el(this.footer, "div", undefined, "st-actions");
+    btn(actions, "Cancel", () => {
+      this.forceUpdateSource = "";
+      this.screen = this.forceUpdateReturnScreen;
+      this.render();
+    }, "st-button st-text-button");
+    this.forceUpdateRunButton = btn(actions, this.forceUpdateBusy ? "Forcing update…" : "Force update", () => void this.runForceUpdate(), "st-button st-primary");
+    this.forceUpdateRunButton.disabled = this.forceUpdateDisabled();
+  }
+  private forceUpdateRunButton?: HTMLButtonElement;
+  private updateForceUpdateEstimate(state: Controller["store"]["notebooks"][string]) {
+    if (!this.forceUpdateEstimateElement) return;
+    this.forceUpdateEstimateElement.hidden = false;
+    try {
+      const estimate = this.c.forceUpdateEstimate?.(state.source, this.forceUpdateRecognizeAll) ??
+        (this.forceUpdateRecognizeAll
+          ? this.c.reprocessEstimate?.(state.source, `1-${state.desired.length}`, false) ??
+            (this.c as Controller & { queueEstimate(source?: string, pages?: number[]): QueueEstimate }).queueEstimate(state.source, state.desired.map((page) => page.number))
+          : this.c.queueEstimate(state.source));
+      const parts = [`${estimate.pages} page${estimate.pages === 1 ? "" : "s"}`, `${estimate.requests} request${estimate.requests === 1 ? "" : "s"}`];
+      if (this.c.provider === "subscription" && estimate.seconds !== undefined) parts.push(`about ${this.duration(estimate.seconds)}`);
+      if (this.c.provider === "api" && estimate.usd !== undefined) parts.push(`about $${estimate.usd.toFixed(4)}`);
+      if (estimate.provisional) parts.push("provisional estimate");
+      setText(this.forceUpdateEstimateElement, `Estimated remaining work: ${parts.join(" · ")}`);
+    } catch {
+      this.forceUpdateEstimateElement.hidden = true;
+    }
+  }
+  private forceUpdateDisabledReason() {
+    const p = this.c.progress;
+    if (!this.displayStore.notebooks[this.forceUpdateSource]) return "Notebook state is unavailable.";
+    if (!this.c.forceUpdate) return "Force update is not available in this runtime yet.";
+    if (p.stateBlocked) return this.stateBlockedMessage();
+    if (p.running) return "Wait for active requests to finish before forcing an update.";
+    if (p.budgetBlocked) return p.budgetBlocked;
+    if (p.executionBlocked) return p.executionBlocked;
+    if (this.forceUpdateRecognizeAll && !aiOn(this.c)) return "Turn on AI recognition before re-recognizing every page.";
+    if (this.forceUpdateBusy) return "Force update is running.";
+    return "";
+  }
+  private forceUpdateDisabled() { return !!this.forceUpdateDisabledReason(); }
+  private async runForceUpdate() {
+    const source = this.forceUpdateSource;
+    const controller = this.c;
+    if (!source || !controller.forceUpdate || this.forceUpdateDisabled()) return;
+    const action = this.actionGate.run(`force-update:${source}`, async () => {
+      this.forceUpdateBusy = true;
+      if (this.forceUpdateRunButton) this.forceUpdateRunButton.disabled = true;
+      try {
+        const result = await controller.forceUpdate!(source, { reRecognizeAll: this.forceUpdateRecognizeAll });
+        new Notice(result.backup ? `Force update completed. Previous transcript backed up to ${result.backup}` : "Force update completed.");
+        this.forceUpdateSource = "";
+        this.forceUpdateBusy = false;
+        this.screen = "home";
+        this.render();
+        this.refreshHome();
+      } catch (error) {
+        this.forceUpdateBusy = false;
+        new Notice(`Could not force update this notebook: ${err(error)}`);
+        this.render();
+      }
+    });
+    if (action) await action;
   }
   private renderStateBlockedNotice(parent: HTMLElement) {
     const notice = el(parent, "aside", undefined, "st-error st-state-blocked");
@@ -1315,12 +1466,13 @@ class MirrorsModal extends Modal {
     const meta = el(row, "div", undefined, "st-row-meta");
     el(meta, "p", view.caption, "st-caption");
     this.renderSharedSettingsConflict(row, rule.id);
-    if (view.reason && view.reason !== view.caption)
-      el(meta, "p", view.reason, "st-caption st-attention-reason");
+    const reason = this.forceUpdateReason(stateSources.length ? this.displayStore.notebooks[stateSources[0]] : undefined, view.reason);
+    if (reason && reason !== view.caption)
+      el(meta, "p", reason, "st-caption st-attention-reason");
     progressBar(row, view, `${shortPath(rule.source)} pages ready`);
     const controls = el(row, "div", undefined, "st-row-controls");
     const recoverySources = stateSources.filter((source) =>
-      canRecoverTranscriptEdits(this.c.store.notebooks[source]),
+      canRecoverTranscriptEdits(this.displayStore.notebooks[source]),
     );
     if (recoverySources.length)
       btn(
@@ -1332,14 +1484,14 @@ class MirrorsModal extends Modal {
         "st-button st-text-button st-recovery-action",
       );
     const issueSource = stateSources.find((source) =>
-      currentPageIssues(this.c.store.notebooks[source]).some((issue) => issue.status !== "skipped"),
+      currentPageIssues(this.displayStore.notebooks[source]).some((issue) => issue.status !== "skipped"),
     );
     if (issueSource)
       btn(
         controls,
         "Review pages",
         () => {
-          this.selectedRule = this.c.store.notebooks[issueSource].ruleId;
+          this.selectedRule = this.displayStore.notebooks[issueSource].ruleId;
           this.selectedSource = issueSource;
           this.detailReturnScreen = "home";
           this.screen = "detail";
@@ -1348,7 +1500,8 @@ class MirrorsModal extends Modal {
         "st-button st-text-button st-review-pages",
       );
     if (isNotebook && stateSources.length) {
-      const state = this.c.store.notebooks[stateSources[0]];
+      const state = this.displayStore.notebooks[stateSources[0]];
+      this.renderForceUpdateAction(controls, state);
       const paused = !!(rule.paused || state?.paused);
       const pause = iconButton(
         controls,
@@ -1416,7 +1569,7 @@ class MirrorsModal extends Modal {
           children.dataset.ruleId = rule.id;
           el(children, "p", "Choose a notebook or use its actions below.", "st-caption st-folder-instruction");
           for (const source of stateSources) {
-            const state = this.c.store.notebooks[source];
+            const state = this.displayStore.notebooks[source];
             if (state) this.renderNotebookRow(children, rule, state);
           }
         }
@@ -1443,7 +1596,7 @@ class MirrorsModal extends Modal {
     if (this.c.queueView.working?.source === state.source)
       el(heading, "span", "Working", "st-working-badge");
     if (
-      Object.values(this.c.store.notebooks).some(
+      Object.values(this.displayStore.notebooks).some(
         (s) =>
           s.source !== state.source &&
           s.ruleId === rule.id &&
@@ -1462,10 +1615,12 @@ class MirrorsModal extends Modal {
     );
     const meta = el(row, "div", undefined, "st-row-meta");
     el(meta, "p", view.caption, "st-caption");
-    if (view.reason && view.reason !== view.caption)
-      el(meta, "p", view.reason, "st-caption st-attention-reason");
+    const reason = this.forceUpdateReason(state, view.reason);
+    if (reason && reason !== view.caption)
+      el(meta, "p", reason, "st-caption st-attention-reason");
     progressBar(row, view, `${shortPath(state.source)} pages ready`);
     const controls = el(row, "div", undefined, "st-row-controls");
+    this.renderForceUpdateAction(controls, state);
     const pause = iconButton(
       controls,
       state.paused ? "play" : "pause",
@@ -1533,7 +1688,7 @@ class MirrorsModal extends Modal {
     });
   }
   private openRecovery(source: string) {
-    const state = this.c.store.notebooks[source];
+    const state = this.displayStore.notebooks[source];
     if (!state || !canRecoverTranscriptEdits(state)) return;
     this.selectedRule = state.ruleId;
     this.selectedSource = source;
@@ -1713,9 +1868,12 @@ class MirrorsModal extends Modal {
       (v) => (r.output = v),
       "Choose a vault folder or enter a new path.",
     );
-    outputFolderInput.closest<HTMLElement>(".st-field")?.classList.add("st-output-folder-field");
+    const outputField = outputFolderInput.closest<HTMLElement>(".st-field");
+    outputField?.classList.add("st-output-folder-field");
+    const outputControls = el(outputField ?? outputChoice, "div", undefined, "st-output-folder-controls");
+    outputControls.append(outputFolderInput);
     btn(
-      outputFolderInput.closest<HTMLElement>(".st-field") ?? outputChoice,
+      outputControls,
       "Choose folder",
       () => {
         this.outputPickerPath = "";
@@ -1801,7 +1959,7 @@ class MirrorsModal extends Modal {
       (Array.from(instructions.querySelectorAll("input, select, textarea, button")) as Array<HTMLInputElement | HTMLSelectElement | HTMLTextAreaElement | HTMLButtonElement>).forEach((control) => { control.disabled = true; });
     }
 
-    const sourceState = this.c.store.notebooks[r.source];
+    const sourceState = this.displayStore.notebooks[r.source];
     if (r.source.toLowerCase().endsWith(".note") && sourceState) {
       const notebookActions = el(root, "section", undefined, "st-form-section st-notebook-actions");
       el(notebookActions, "h2", "Notebook actions", "st-section-heading");
@@ -3664,7 +3822,7 @@ class MirrorsModal extends Modal {
     return `$${value.toFixed(value >= 1 ? 2 : 4)}`;
   }
   private renderDetail() {
-    const states = Object.values(this.c.store.notebooks).filter(
+    const states = Object.values(this.displayStore.notebooks).filter(
       (s) => s.ruleId === this.selectedRule,
     );
     if (!states.length) {
@@ -3687,10 +3845,10 @@ class MirrorsModal extends Modal {
     });
     this.detailLive = el(this.body, "section", undefined, "st-detail-live");
     this.pageIssuesLive = el(this.body, "section", undefined, "st-page-issues");
-    this.refreshPageIssues(this.c.store.notebooks[this.selectedSource]);
+    this.refreshPageIssues(this.displayStore.notebooks[this.selectedSource]);
     this.refreshDetail();
     const controls = el(this.body, "section", undefined, "st-detail-controls");
-    const state = this.c.store.notebooks[this.selectedSource];
+    const state = this.displayStore.notebooks[this.selectedSource];
     btn(
       this.footer,
       "Open transcript",
@@ -3773,6 +3931,12 @@ class MirrorsModal extends Modal {
       cleanupEstimate?: (source: string) => QueueEstimate;
       reprocessPages?: (source: string, range: string, outdatedOnly?: boolean) => Promise<void>;
     };
+    if (this.canForceUpdate(state)) {
+      const forceSection = el(controls, "section", undefined, "st-detail-task st-force-update-task");
+      el(forceSection, compact ? "h3" : "h2", "Force update", "st-section-heading");
+      el(forceSection, "p", this.forceUpdateReason(state, "This notebook needs attention before its next update."), "st-caption st-attention-reason");
+      btn(forceSection, "Force update", () => this.openForceUpdate(state.source), "st-button st-text-button st-force-update-action");
+    }
     const cleanupSection = el(controls, "section", undefined, "st-detail-task st-cleanup-task");
     const cleanupTitle = el(cleanupSection, "div", undefined, "st-document-action-title");
     el(cleanupTitle, compact ? "h3" : "h2", "Clean up document", "st-section-heading");
@@ -3949,7 +4113,7 @@ class MirrorsModal extends Modal {
         if (this.c.progress.stateBlocked) return new Notice(this.stateBlockedMessage());
         safe(this.c.retryNotebook(state.source).then(() => {
         this.notebookRetryQueued.add(state.source);
-        this.refreshPageIssues(this.c.store.notebooks[state.source]);
+        this.refreshPageIssues(this.displayStore.notebooks[state.source]);
       }));
       }, "st-button st-text-button");
       retryNotebook.disabled = this.c.progress.running || !!this.c.progress.stateBlocked;
@@ -4012,7 +4176,7 @@ class MirrorsModal extends Modal {
   }
   private refreshPageIssuesAfterAction(source: string) {
     if (this.screen !== "detail" || this.selectedSource !== source) return;
-    const state = this.c.store.notebooks[source];
+    const state = this.displayStore.notebooks[source];
     if (!state || !this.pageIssuesLive) return;
     // The prior render may have created a disabled button before the action
     // rejected. Force a fresh DOM render, but only in the same detail view.
@@ -4020,7 +4184,7 @@ class MirrorsModal extends Modal {
     this.refreshPageIssues(state);
   }
   private renderRecovery() {
-    const state = this.c.store.notebooks[this.selectedSource];
+    const state = this.displayStore.notebooks[this.selectedSource];
     const root = el(this.body, "section", undefined, "st-recovery");
     el(root, "h2", "Resolve edited transcript", "st-section-heading");
     if (this.c.progress.stateBlocked)
@@ -4109,7 +4273,7 @@ class MirrorsModal extends Modal {
     replace.disabled = !enabled;
   }
   private refreshDetail() {
-    const state = this.c.store.notebooks[this.selectedSource],
+    const state = this.displayStore.notebooks[this.selectedSource],
       root = this.detailLive;
     if (!state || !root) return;
     const view = notebookPresentation(state);
@@ -4131,7 +4295,7 @@ class MirrorsModal extends Modal {
       label,
       caption,
       view.ratio,
-      view.reason,
+      this.forceUpdateReason(state, view.reason),
       currentPageIssues(state),
       state.error,
       (this.c.progress as typeof this.c.progress & { executionBlocked?: string }).executionBlocked,
@@ -4142,8 +4306,9 @@ class MirrorsModal extends Modal {
     root.empty();
     el(root, "p", label, "st-summary-title");
     el(root, "p", caption, "st-caption");
-    if (view.reason)
-      el(root, "p", view.reason, "st-caption st-attention-reason");
+    const reason = this.forceUpdateReason(state, view.reason);
+    if (reason)
+      el(root, "p", reason, "st-caption st-attention-reason");
     if (state.error) {
       const diagnostics = el(root, "details", undefined, "st-notebook-diagnostics");
       el(diagnostics, "summary", "Notebook diagnostics");

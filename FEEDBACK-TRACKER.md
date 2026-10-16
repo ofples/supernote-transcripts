@@ -3,6 +3,17 @@
 This checklist is cumulative. Later feedback does not replace earlier requests.
 Source implementation, fixture checks, installed builds and live verification are separate states.
 
+## Follow-up fixes — 0.12.2
+
+- [x] Diagnose Careful re-recognition appearing stuck on page 29 using saved screenshot and local attempt records.
+- [x] Fix queued groups overwriting the actual rendering page; honor Pause before starting another image and reuse bounded context-image cache.
+- [x] Refresh changed notebook inventories in bounded parallel batches before recognition, so all queue counts are current.
+- [x] Distinguish missing shared results from existing divergent recognition versions; do not tell users to wait for Sync when it cannot resolve the conflict.
+- [x] Add explicit Force update with a clear warning and backup; allow overriding device claims and shared-result waits without bypassing budgets or local storage safety.
+- [x] Align fields, selectors, toggles, help buttons and actions consistently across source/global settings; verify actual geometry and update guide screenshots.
+- [x] Activate the final combined build on desktop and Nomad with protected data preserved and recognition paused.
+- [x] Update validation, illustrated guides and remote repository for the combined follow-up.
+
 ## Production readiness pass — 0.12.1
 
 - [x] Commit local settings before publishing; retry failed acknowledgements and remote-import saves before recognition.
@@ -17,7 +28,7 @@ Source implementation, fixture checks, installed builds and live verification ar
 - [x] Install desktop 0.12.1 with notes, state, settings, credentials and accounting preserved.
 - [x] Luna visually verify live Sources, Queue, Settings, single-note/folder settings and child controls; cancel drafts and leave recognition paused.
 - [x] Stage and readback-verify 0.12.1 on Nomad; preserve the open form and active 0.11.2 code.
-- [ ] Activate and visually verify final Nomad 0.12.1 after its source-settings form is saved or cancelled.
+- [x] Superseded by guarded activation and Source settings verification of Nomad 0.12.2 after the draft was closed.
 - [ ] Verify live source-setting propagation between updated devices and restore the selected test value.
 
 See [the readiness findings](PRODUCTION-READINESS.md) for severity, fixes and remaining release gates.
@@ -44,8 +55,8 @@ See [the readiness findings](PRODUCTION-READINESS.md) for severity, fixes and re
 - [x] Install desktop 0.12.0 with configuration, state, transcripts, sign-in and accounting preserved.
 - [x] Verify actual desktop Sources, Queue, Settings, Reflection source form and notebook-action presence. Folder-child flows and wide/Nomad layouts additionally pass the mocked browser checks.
 - [x] Stage and hash-verify the same 0.12.0 artifacts on Nomad without replacing active code or discarding its open form.
-- [ ] Activate the newer Nomad 0.12.1 candidate after its Reflection source-settings form is saved or cancelled. Active version remains 0.11.2, idle and paused.
-- [ ] Verify Nomad when available; do not claim desktop checks establish Nomad behavior.
+- [x] Superseded by guarded active Nomad 0.12.2 after the user closed the draft; saved settings were preserved.
+- [x] Verify the actual Nomad 0.12.2 Source settings and Queue; retain separate desktop and synthetic evidence.
 - [ ] Verify a real source-settings change propagates between the two installed devices, then restore the selected value. Source tests establish logic; live Sync remains a separate gate.
 
 ## Existing workflow checks still open

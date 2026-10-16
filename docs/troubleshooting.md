@@ -18,6 +18,8 @@ Check that provider settings are connected, AI recognition is enabled, the globa
 
 Failures are shown in Queue and are not retried automatically. Review the reason, then choose **Retry** or **Skip**. An interrupted request may have reached the provider even when no result was returned; local accounting can hold its estimated usage. Avoid repeated retries until you understand the error.
 
+In Careful mode, Queue may show a **Context page** while neighboring images are prepared. That page provides context and is not an extra recognition target. If you pause during image rendering, the current render completes and the plugin stops starting new images. An AI request already in flight may finish.
+
 ## Estimates look uncertain or a limit stops work
 
 Estimates are provisional when there is little comparable history. They are guidance, not invoices or provider-enforced ceilings. Check the plugin’s local daily, monthly and per-run budgets, as well as provider-side limits. Subscription-mode local attempt counts do not reveal the account’s remaining subscription quota. Accounting storage errors block new paid work so limits are not bypassed.
@@ -30,11 +32,13 @@ Queues, source file paths, provider credentials, execution switches, budgets and
 
 If the plugin says settings could not be saved on this device, check that the vault and plugin configuration folders are writable and that the device has free storage. Recognition is paused until settings are saved. After correcting storage access, open Sources and choose **Retry Sync**; this retries local persistence and settings publication, without starting recognition. If settings saved locally but could not sync, **Retry Sync** retries publication and does not send recognition. For a **Settings conflict**, choose **Keep this device** or **Use synced settings** only after reviewing which values you want. If a shared record is damaged or a Sync conflict copy remains, preserve the files and resolve the conflict copies before editing that source again.
 
-## Transcript differs from the latest notebook
+## A shared page inventory is newer or conflicting
 
-Confirm the native notebook has finished uploading/syncing and that the desktop source points to the updated local original. Then run **Update**. Do not use a potentially stale desktop copy to overwrite newer transcript work. Verify the page count and review changed pages before relying on the output.
+This message means the shared publication history and the local page inventory cannot be safely reconciled. It does not by itself prove that Obsidian Sync is missing or delayed. Different saved recognition versions can need resolution even after all shared page results have arrived. First compare the actual notebook originals on the devices. If this device has an older original, finish its native Supernote Cloud/Cloud Sync update, then choose **Update** or **Resume** to refresh its local page inventory. Matching page counts alone do not prove the originals are the same.
 
-If the plugin reports a newer or conflicting shared page inventory, sync the original notebook to this device first. Return to **Sources** and choose **Update** or **Resume**; this checks the source again and can process other eligible queued pages. **Retry page** and forced transcript replacement cannot repair an outdated original.
+If the local original is already current, inspect the current Markdown and any Obsidian conflict copies. There may be newer or conflicting local transcript text. Preserve edits before choosing a recovery. For an ordinary transcript edit conflict, open notebook details and compare **Your edited version** with **Saved recognition**; choose whether to keep edits in a new mirror or back up edits and restore the generated mirror. For a shared page-inventory conflict, **Force update** is available as a deliberate choice after comparing source versions and settings; it backs up the current transcript and recognition cache but can replace newer shared text or create duplicate requests. See [Force update](user-guide.md#force-update-for-a-notebook-in-conflict).
+
+The update inventory step refreshes changed notebook metadata before AI work: up to two open notebooks on Nomad or four on desktop, with no page-image rendering during that pass. Unchanged reported filesystem revisions reuse their prior inventory. The temporary Sources/Queue page-order and provenance overlay is an in-memory view, not a shared queue.
 
 ## A page link has no enhanced view
 

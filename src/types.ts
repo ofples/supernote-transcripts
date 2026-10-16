@@ -197,6 +197,7 @@ export interface Progress {
   /** Saved state is unreadable or could not be written; Update cannot clear this guard. */
   stateBlocked?: string;
   activePages?: number[];
+  renderingContext?: boolean;
 }
 export interface QueueEstimate {
   pages: number;
@@ -236,6 +237,7 @@ export interface Controller {
   aiEnabled: boolean;
   config: ConfigV1;
   store: Store;
+  readonly displayStore?: Store;
   progress: Progress;
   apiKey: string;
   autoEnabled: boolean;
@@ -248,6 +250,8 @@ export interface Controller {
   retryPage(source: string, pageId: string): Promise<void>;
   skipPage(source: string, pageId: string): Promise<void>;
   retryNotebook(source: string): Promise<void>;
+  forceUpdate?(source: string, options?: {reRecognizeAll?:boolean}): Promise<{backup?:string}>;
+  forceUpdateEstimate?(source:string,reRecognizeAll?:boolean):QueueEstimate;
   setSourcePaused(ruleId: string, paused: boolean): Promise<void>;
   setNotebookPaused(source: string, paused: boolean): Promise<void>;
   preview(path: string, page: number): Promise<string>;

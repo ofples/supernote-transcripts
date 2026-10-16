@@ -334,6 +334,47 @@ async function inspectViewport(platform, viewport, label) {
     c.aiEnabled = true;
     c.notify();
   });
+  await page.evaluate(() => {
+    const c = window.__streamlinedFixture.controller;
+    const state = c.store.notebooks[Object.keys(c.store.notebooks).find((source) => source.endsWith("/Failed.note"))];
+    state.status = "conflict";
+    state.error = "Shared transcript recognition versions differ on pages 1 and 2. Force update can use this device's results after backing up the current transcript.";
+    c.forceUpdateCalls = 0;
+    c.forceUpdate = async () => { c.forceUpdateCalls++; return {}; };
+    c.forceUpdateEstimate = (_source, reRecognizeAll = false) => reRecognizeAll
+      ? { pages: state.desired.length, requests: 2, usd: 0.002, samples: 2, provisional: false }
+      : { pages: 0, requests: 0, usd: 0, samples: 2, provisional: false };
+    c.notify();
+  });
+  await root.getByRole("button", { name: "Sources", exact: true }).click();
+  await root.getByRole("button", { name: "Queue", exact: true }).click();
+  await root.locator('details[data-queue-section="Needs attention"] summary').click();
+  const forceRow = root.locator(".st-queue-collapsed[open] .st-queue-row").filter({ hasText: "Failed" });
+  const forceAction = forceRow.getByRole("button", { name: /Force update Failed/ });
+  check(await forceAction.isVisible() && !(await forceAction.isDisabled()), `${label}: eligible sync conflict has no enabled Force update action in Queue; state=${await page.evaluate(() => { const c = window.__streamlinedFixture.controller; const s = c.store.notebooks[Object.keys(c.store.notebooks).find((source) => source.endsWith("/Failed.note"))]; return JSON.stringify({status:s?.status,error:s?.error,hasMethod:!!c.forceUpdate}); })}; rows=${await root.locator(".st-queue-collapsed[open] .st-queue-row").allInnerTexts().then((items) => JSON.stringify(items))}; buttons=${await root.locator(".st-queue-collapsed[open] .st-queue-row button").evaluateAll((items) => JSON.stringify(items.map((item) => [item.textContent, item.getAttribute("aria-label")])))}`);
+  await forceAction.click();
+  await root.locator(".st-force-update").waitFor();
+  check(await root.locator(".st-force-update").innerText().then((text) =>
+    /bypasses shared claims and the Sync wait for this notebook only/i.test(text) &&
+    /uses the original notebook and recognition settings saved on this device/i.test(text) &&
+    /duplicate requests or replace newer transcript text/i.test(text) &&
+    /backs up the current Markdown transcript and cached recognition/i.test(text) &&
+    /Provider budgets, authentication, and storage checks still apply/i.test(text) &&
+    /Matching cached pages are reused by default/i.test(text)), `${label}: Force update warning omits a key behavior or safeguard`);
+  check(await root.getByRole("button", { name: "Cancel", exact: true }).isVisible(), `${label}: Force update warning has no Cancel action`);
+  check(await root.getByRole("button", { name: "Force update", exact: true }).isVisible(), `${label}: Force update warning has no confirm action`);
+  const forceReRecognize = root.getByRole("checkbox", { name: "Re-recognize every page", exact: true });
+  check(await forceReRecognize.isVisible() && !(await forceReRecognize.isChecked()), `${label}: Force update re-recognition option is not off by default`);
+  check(await root.locator(".st-force-update-estimate").innerText().then((text) => /0 pages · 0 requests/.test(text)), `${label}: cached-result Force update estimate does not show zero new work`);
+  await forceReRecognize.check();
+  check(await root.locator(".st-force-update-estimate").innerText().then((text) => /3 pages · 2 requests/.test(text)), `${label}: re-recognize-all option does not update the estimate`);
+  await forceReRecognize.uncheck();
+  await assertLayout("Force update warning");
+  await screenshot("force-update-warning");
+  await root.getByRole("button", { name: "Cancel", exact: true }).click();
+  await root.locator(".st-queue-live").waitFor();
+  check(await page.evaluate(() => window.__streamlinedFixture.controller.forceUpdateCalls) === 0, `${label}: cancelling Force update invoked the mutating controller action`);
+  check(await root.locator(".st-queue-status").isVisible(), `${label}: cancelling Force update did not return to the Queue`);
 
   // Settings: compact rows and keyboard-operable contextual help.
   await root.getByRole("button", { name: "Settings", exact: true }).click();
@@ -350,22 +391,33 @@ async function inspectViewport(platform, viewport, label) {
     check(count === 1 && text === "Settings", `${label}: header Settings label is not exactly one after ${step}; found ${count}, text=${text}`);
   };
   await assertOneSettingsLabel("opening settings");
-  if (platform === "desktop" && viewport.width >= 701) {
+  if (platform === "desktop" || platform === "nomad") {
     for (const fieldName of ["API key", "Simultaneous requests", "Check interval (minutes)"]) {
       const label = root.locator(".st-settings-section label").filter({ hasText: new RegExp(`^${fieldName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}$`) });
       const geometry = await label.evaluate((element) => {
         const field = element.closest(".st-field");
         const rect = (node) => {
           const r = node?.getBoundingClientRect();
-          return r && { x: r.x, y: r.y, width: r.width, height: r.height };
+          return r && { x: r.x, y: r.y, width: r.width, height: r.height, right: r.right };
         };
-        return { label: rect(element), input: rect(field?.querySelector("input, select")), help: rect(field?.querySelector("button.st-help-button")) };
+        const input = field?.querySelector("input, select");
+        return { label: rect(element), field: rect(field), grid: field ? getComputedStyle(field).gridTemplateColumns : "", input: rect(input), inputGrid: input ? `${getComputedStyle(input).gridColumnStart}/${getComputedStyle(input).gridColumnEnd}` : "", help: rect(field?.querySelector("button.st-help-button")) };
       });
       const { label: labelBounds, input: inputBounds, help: helpBounds } = geometry;
       check(labelBounds && inputBounds && helpBounds, `${label}: ${fieldName} settings row is missing label/input/help geometry`);
-      const centers = [labelBounds.y + labelBounds.height / 2, inputBounds.y + inputBounds.height / 2, helpBounds.y + helpBounds.height / 2];
-      check(Math.max(...centers) - Math.min(...centers) <= 2, `${label}: ${fieldName} label, input, and help button are not on one aligned row: ${JSON.stringify({ labelBounds, inputBounds, helpBounds })}`);
+      check(Math.abs(inputBounds.right - helpBounds.right) <= 2, `${label}: ${fieldName} control and help button do not share the right rail: ${JSON.stringify(geometry)}`);
+      const labelHelpTopDelta = Math.abs(helpBounds.y - labelBounds.y);
+      check(inputBounds.y > labelBounds.y + labelBounds.height - 2 && labelHelpTopDelta <= 8, `${label}: ${fieldName} label, control, and help do not use the aligned label-above-control layout: ${JSON.stringify({ labelBounds, inputBounds, helpBounds })}`);
     }
+    const settingsToggles = await root.locator(".st-settings-section .st-check-row").evaluateAll((rows) => rows.map((row) => {
+      const checkbox = row.querySelector('input[type="checkbox"]')?.getBoundingClientRect();
+      const help = row.querySelector(".st-help-button")?.getBoundingClientRect();
+      return { checkboxX: checkbox ? checkbox.x + checkbox.width / 2 : null, helpRight: help?.right ?? null };
+    }).filter((item) => item.checkboxX !== null));
+    check(settingsToggles.length >= 2, `${label}: settings toggle geometry was not found`);
+    check(Math.max(...settingsToggles.map((item) => item.checkboxX)) - Math.min(...settingsToggles.map((item) => item.checkboxX)) <= 2, `${label}: settings checkbox centers do not align: ${JSON.stringify(settingsToggles)}`);
+    const settingsHelpRights = settingsToggles.map((item) => item.helpRight).filter((right) => right !== null);
+    check(settingsHelpRights.length > 0 && Math.max(...settingsHelpRights) - Math.min(...settingsHelpRights) <= 2, `${label}: settings toggle help buttons do not share a right rail: ${JSON.stringify(settingsToggles)}`);
   }
   const helpButton = root.locator("button.st-help-button").first();
   check(await helpButton.count() === 1, `${label}: settings help button missing`);
@@ -402,7 +454,7 @@ async function inspectViewport(platform, viewport, label) {
   }
   await assertLayout("Subscription settings");
   await screenshot("subscription-settings");
-  if (platform === "desktop" && viewport.width >= 701) {
+  if (platform === "desktop" || platform === "nomad") {
     const quality = root.locator(".st-quality-control");
     const trackBounds = await quality.locator('input[type="range"]').boundingBox();
     const labelsBounds = await quality.locator(".st-quality-labels").boundingBox();
@@ -428,6 +480,52 @@ async function inspectViewport(platform, viewport, label) {
     check(editorHeadings.includes(heading), `${label}: source editor is missing the ${heading} section heading: ${JSON.stringify(editorHeadings)}`);
   }
   check(await root.locator(".st-form .st-source-advanced").count() === 0, `${label}: single-note editor still has a Source Advanced disclosure`);
+  const outputRail = await root.locator(".st-form .st-output-folder-field").evaluate((field) => {
+    const bounds = (node) => {
+      const r = node?.getBoundingClientRect();
+      return r && { x: r.x, y: r.y, width: r.width, height: r.height, right: r.right };
+    };
+    return {
+      field: bounds(field),
+      controls: bounds(field.querySelector(".st-output-folder-controls")),
+      help: bounds(field.querySelector(".st-help-button")),
+    };
+  });
+  check(outputRail.field && outputRail.controls && outputRail.help, `${label}: output folder and help geometry is missing: ${JSON.stringify(outputRail)}`);
+  check(Math.abs(outputRail.controls.right - outputRail.help.right) <= 2, `${label}: output folder controls and help button do not share a right rail: ${JSON.stringify(outputRail)}`);
+  if (platform === "desktop" && viewport.width >= 701) {
+    const fieldGeometry = await root.evaluate(() => {
+      const rect = (node) => {
+        const r = node?.getBoundingClientRect();
+        return r && { x: r.x, y: r.y, width: r.width, height: r.height, right: r.right };
+      };
+      const fields = [".st-shared-mirror-field .st-field", ".st-model-picker", ".st-output-folder-field"].map((selector) => {
+        const field = document.querySelector(selector);
+        const control = selector.includes("output-folder") ? field?.querySelector(".st-output-folder-controls") : field?.querySelector("select");
+        return { selector, field: rect(field), control: rect(control) };
+      });
+      const helpButtons = [...document.querySelectorAll(".st-form .st-help-button")].map((button) => ({
+        button: rect(button), field: rect(button.closest(".st-field")),
+      }));
+      const toggles = [...document.querySelectorAll(".st-form .st-check-row")].map((row) => ({
+        checkbox: rect(row.querySelector('input[type="checkbox"]')),
+        help: rect(row.querySelector(".st-help-button")),
+      })).filter((item) => item.checkbox);
+      return { fields, helpButtons, toggles };
+    });
+    check(fieldGeometry.fields.every((item) => item.field && item.control), `${label}: shared mirror, model, or output control geometry is missing: ${JSON.stringify(fieldGeometry.fields)}`);
+    const fieldRights = fieldGeometry.fields.map((item) => item.field.right);
+    check(Math.max(...fieldRights) - Math.min(...fieldRights) <= 2, `${label}: shared mirror, model, and output fields do not share a right edge: ${JSON.stringify(fieldGeometry.fields)}`);
+    check(fieldGeometry.fields.every((item) => Math.abs(item.control.right - item.field.right) <= 2), `${label}: shared mirror, model, or output control does not reach the shared field edge: ${JSON.stringify(fieldGeometry.fields)}`);
+    check(fieldGeometry.helpButtons.length > 0 && fieldGeometry.helpButtons.every((item) => item.button && (!item.field || Math.abs(item.button.right - item.field.right) <= 2)), `${label}: one or more source form help buttons are not at the field's right rail: ${JSON.stringify(fieldGeometry.helpButtons)}`);
+    const helpRights = fieldGeometry.helpButtons.map((item) => item.button.right);
+    check(Math.max(...helpRights) - Math.min(...helpRights) <= 2, `${label}: source form help buttons do not share a right rail: ${JSON.stringify(helpRights)}`);
+    check(fieldGeometry.toggles.length >= 2, `${label}: source form toggle geometry was not found`);
+    const checkboxCenters = fieldGeometry.toggles.map((item) => item.checkbox.x + item.checkbox.width / 2);
+    check(Math.max(...checkboxCenters) - Math.min(...checkboxCenters) <= 2, `${label}: source form checkbox centers do not align: ${JSON.stringify(fieldGeometry.toggles)}`);
+    const toggleHelpRights = fieldGeometry.toggles.filter((item) => item.help).map((item) => item.help.x + item.help.width);
+    check(toggleHelpRights.length > 0 && Math.max(...toggleHelpRights) - Math.min(...toggleHelpRights) <= 2, `${label}: source form toggle help buttons do not share a right rail: ${JSON.stringify(fieldGeometry.toggles)}`);
+  }
   const mirrorHelp = root.locator(".st-form .st-help-button[aria-label='Help: Shared mirror']");
   await mirrorHelp.focus();
   await page.keyboard.press("Enter");

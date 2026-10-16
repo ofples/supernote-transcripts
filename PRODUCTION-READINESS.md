@@ -1,6 +1,21 @@
-# Production readiness review — 0.12.1
+# Production readiness review — 0.12.2
 
 Reviewed 16 October 2026. This is a release candidate assessment, not a claim that every device, provider or handwriting format has been validated.
+
+## 0.12.2 findings
+
+| Priority | Finding | Fix and evidence |
+| --- | --- | --- |
+| High | A shared page inventory can conflict even when Obsidian Sync is working: a device may have a different local original or newer local transcript text. Treating every conflict as a missing Sync transfer risks overwriting useful work. | Refresh metadata for changed notebooks before AI work; explain that the user must compare the actual originals and transcript conflict copies. Offer Force update only as a deliberate recovery path, with an explicit warning and backups. Keep ordinary transcript-edit comparison separate. Source review and synthetic UI evidence cover these paths; no provider or Force update request is claimed. |
+| Medium | In Careful mode, users needed to see which page was being prepared and whether a neighboring image was only context. Pausing also needed a clear boundary during image rendering. | Show the current render and **Context page** separately from request targets. Prepare images one group at a time while AI workers can remain parallel. Pause completes the current render and prevents new image preparation; an AI request already in flight may finish. |
+| Medium | A changed notebook could have stale page inventory when recognition began, and fetching metadata for many notebooks at once would be unsuitable for Nomad. | Add a metadata inventory phase before AI. Open at most two notebooks concurrently on Nomad or four on desktop, read the page descriptor and close each notebook without rendering page images or reading OCR. Reuse the prior inventory when the reported filesystem revision is unchanged. The Sources/Queue provenance overlay is temporary in-memory display state, not a synchronized queue. |
+| Medium | Failed notebooks, synchronization conflicts and waits for shared work needed a recoverable action that made the local-device consequences clear. | Expose **Force update** only for the eligible failed/conflict/device-wait states. It backs up current Markdown and cached recognition to History, uses this device's current original and settings, and bypasses coordination for that invocation only. Matching cached results are reused by default; optional re-recognition includes held or skipped pages. The warning names duplicate-request, cost and newer-text overwrite risks. Authentication, budgets, storage and state checks remain active; Force update is never automatic. Synthetic UI fixtures show the warning; no actual Force update or provider request is claimed. |
+
+The final synthetic browser report records 469 assertions across desktop, narrow desktop and Nomad-sized layouts, with zero external requests, recognition calls, browser errors or fixture mutations. The fixtures and UI sources are frozen. See [VALIDATION.md](VALIDATION.md) for the candidate gate and live installation evidence when recorded.
+
+## Previous pass: 0.12.1
+
+The following findings and release gates are retained from the 0.12.1 assessment.
 
 ## Issues found and fixed
 
@@ -24,7 +39,7 @@ The pass makes no recognition requests. Fault injection uses mocked providers an
 
 ## Remaining release gates
 
-- Activate and check the final Nomad candidate after the existing source-settings draft is saved or cancelled. Do not discard a user's draft to install an update.
+- Complete a real provider-quality run with the new preparation pipeline. Current regression coverage uses mocked recognition; installation and UI checks make no recognition calls.
 - Verify a real portable source-setting change through Obsidian Sync between the updated desktop and Nomad, then restore it. Mocked reconciliation is not proof of a network transfer.
 - Align the desktop Cloud Sync original with the native 2610 Satsang notebook before completing the handwriting-edit → cloud → incremental recognition → transcript Sync workflow. Equal page counts do not prove equal handwriting.
 - Finish foreground desktop original-page viewer acceptance and independently verify the requested native page ordinal.

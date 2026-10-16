@@ -388,6 +388,18 @@ test("middle page failure continues sibling notebooks and remains held through U
   const restarted=new Runtime(f.app);await restarted.onload();restarted.reader=()=>f.reader;restarted.apiKey="fake";await restarted.update();assert.equal(f.calls.length,5);assert.equal(restarted.store.notebooks[source].pageIssues["native:2"].attempts,1);
   await restarted.retryPage(source,"native:2");assert.equal(f.calls.length,5);await restarted.update();assert.equal(f.calls.length,6);assert.equal(restarted.store.notebooks[source].status,"current");
 });
+test("inventory refresh exposes every changed notebook before recognition without persisting projected pages",async()=>{
+  const f=folderFixture();await f.plugin.saveConfig();await f.plugin.update();
+  const oldCounts=[f.plugin.store.notebooks[source].desired.length,f.plugin.store.notebooks[f.nested].desired.length];
+  const revision="2:100",open=f.reader.open;
+  f.reader.list=async()=>[source,f.nested,f.skip].map(path=>({path,size:100,mtime:2}));f.reader.revision=async()=>revision;
+  f.reader.open=async path=>{const notebook=await open(path);notebook.descriptor={...notebook.descriptor,revision,pages:Array.from({length:path===source?4:path===f.nested?3:2},(_,i)=>({id:`native:${i+1}`,number:i+1,fingerprint:`fresh:${path}:${i+1}`}))};return notebook;};
+  let inventorySnapshot,firstRequestSnapshot;
+  const unsubscribe=f.plugin.subscribe(()=>{if(f.plugin.progress.stage==="Checking notebook pages"&&/^2 of 2 notebooks checked/.test(f.plugin.progress.detail))inventorySnapshot={display:[f.plugin.displayStore.notebooks[source].desired.length,f.plugin.displayStore.notebooks[f.nested].desired.length],persisted:[f.plugin.store.notebooks[source].desired.length,f.plugin.store.notebooks[f.nested].desired.length]};});
+  globalThis.__response=async request=>{if(!firstRequestSnapshot)firstRequestSnapshot=[f.plugin.displayStore.notebooks[source].desired.length,f.plugin.displayStore.notebooks[f.nested].desired.length];const body=JSON.parse(request.body);f.calls.push(body);return answer("refreshed",body);};
+  try{await f.plugin.update();}finally{unsubscribe();}
+  assert.deepEqual(inventorySnapshot,{display:[4,3],persisted:oldCounts});assert.deepEqual(firstRequestSnapshot,[4,3]);
+});
 test("selective retries merge distinct pages, retain other holds, and changed fingerprints become eligible",async()=>{
   const f=fixture(3);f.plugin.config.continuous=true;globalThis.__response=async request=>{f.calls.push(JSON.parse(request.body));throw Error("Interrupted");};
   await f.plugin.update();assert.equal(f.calls.length,3);await f.plugin.retryPage(source,"native:1");await f.plugin.retryPage(source,"native:3");assert.deepEqual(f.plugin.store.queue[0].pageIds,["native:1","native:3"]);
@@ -1533,6 +1545,101 @@ test("hash lookup retains receipt validation and damaged recovery evidence fails
   assert.equal(f.files.get("Mirror/a.md"),f.edited);assert.equal(f.calls.length,1);
 });
 
+test("Force update backs up conflicting local text and cache, publishes cached local pages while globally paused",async()=>{
+  const f=await editedTranscriptFixture(2,true),state=f.plugin.store.notebooks[source],id=await notebookIdentity("linked-reflections","a.note");
+  const conflicting=state.desired.map(page=>({...page,fingerprint:`remote-${page.fingerprint}`}));
+  await new PublicationReceipts(f.plugin.sharedIO()).save(id,f.edited,conflicting,{});
+  state.status="queued";delete state.error;f.plugin.enqueue(source);const requests=f.calls.length;
+  await f.plugin.update();assert.equal(state.status,"conflict");assert.match(state.error,/newer or conflicting page inventory/);assert.equal(f.calls.length,requests);assert.equal(f.files.get(state.output),f.edited);
+  const cache=structuredClone(state),settings=structuredClone(f.plugin.costs.settings);f.plugin.pause();
+  const result=await f.plugin.forceUpdate(source);
+  assert.equal(f.files.get(result.backup),f.edited);assert.equal(f.plugin.store.history.includes(result.backup),true);
+  const cacheBackup=[...f.files.entries()].find(([path])=>path.endsWith("-recognition.md"));assert.ok(cacheBackup);
+  assert.deepEqual(JSON.parse(cacheBackup[1].split("```json\n")[1].split("\n```")[0]),cache);
+  assert.notEqual(f.files.get(state.output),f.edited);assert.equal(f.calls.length,requests);
+  assert.deepEqual(f.plugin.costs.settings,settings);assert.equal(f.plugin.progress.paused,true);assert.equal(state.status,"current");
+});
+
+test("Force re-recognition bypasses an active shared claim without acquiring or releasing it",async()=>{
+  const f=fixture(2);sharing(f,"force-claim-device");f.plugin.config.continuous=true;await f.plugin.saveConfig();await f.plugin.update();
+  const state=f.plugin.store.notebooks[source],settings=structuredClone(f.plugin.costs.settings);
+  let acquired=0,released=0;f.plugin.sharedCache.acquire=async()=>{acquired++;return null;};f.plugin.sharedCache.release=async()=>{released++;};
+  state.status="queued";f.plugin.enqueue(source,true);
+  const before=f.calls.length;await f.plugin.update();assert.equal(f.calls.length,before);assert.equal(acquired,1);assert.equal(state.status,"queued");
+  f.plugin.concurrency=2;const forcedCalls=before+2;await f.plugin.forceUpdate(source,{reRecognizeAll:true});
+  assert.equal(f.calls.length,forcedCalls);assert.equal(acquired,1);assert.equal(released,0);
+  assert.deepEqual(f.plugin.costs.settings,settings);assert.equal(f.plugin.costs.total.requests,forcedCalls);
+  assert.equal(state.status,"current");assert.equal(state.forcePending.length,0);
+});
+
+test("Force update backup creation failure leaves output and recognition untouched",async()=>{
+  const f=await editedTranscriptFixture(),state=f.plugin.store.notebooks[source],calls=f.calls.length,create=f.app.vault.create;
+  f.app.vault.create=async(path,text)=>{if(path.startsWith("Supernote Transcripts/History/"))throw Error("Backup disk unavailable");return create(path,text);};
+  await assert.rejects(f.plugin.forceUpdate(source,{reRecognizeAll:true}),/Backup disk unavailable/);
+  assert.equal(f.files.get(state.output),f.edited);assert.equal(f.calls.length,calls);assert.equal(f.plugin.store.history.length,0);
+});
+
+test("Force update preserves a transcript edit that races the backed-up output",async()=>{
+  const f=await editedTranscriptFixture(),state=f.plugin.store.notebooks[source],initial=f.edited,raced=f.edited+"\nRacing user correction.\n";
+  globalThis.__response=async request=>{const body=JSON.parse(request.body);f.calls.push(body);f.files.set(state.output,raced);return answer("forced transcription",body);};
+  await assert.rejects(f.plugin.forceUpdate(source,{reRecognizeAll:true}),/Transcript changed during Force update/);
+  const backup=[...f.files.entries()].find(([path])=>path.endsWith("-transcript.md"));
+  assert.ok(backup);assert.equal(backup[1],initial);assert.equal(f.files.get(state.output),raced);assert.equal(f.calls.length,2);
+});
+
+test("paused Force update restores pause and does not bypass the next normal shared claim",async()=>{
+  const f=fixture(1);sharing(f,"force-paused-device");await f.plugin.saveConfig();await f.plugin.update();
+  const state=f.plugin.store.notebooks[source];let acquired=0;
+  f.plugin.sharedCache.acquire=async()=>{acquired++;return null;};f.plugin.sharedCache.release=async()=>{};
+  f.plugin.pause();await f.plugin.forceUpdate(source,{reRecognizeAll:true});
+  assert.equal(f.plugin.progress.paused,true);assert.equal(acquired,0);
+  state.status="queued";f.plugin.enqueue(source,true);
+  const calls=f.calls.length;await f.plugin.update();
+  assert.equal(acquired,1);assert.equal(f.calls.length,calls);assert.equal(state.status,"queued");
+});
+
+test("Force re-recognition includes cached pages and clears every existing page hold",async()=>{
+  const f=fixture(4);f.plugin.config.profiles[0].quality="balanced";f.plugin.config.continuous=true;await f.plugin.saveConfig();await f.plugin.update();
+  const state=f.plugin.store.notebooks[source],before=f.calls.length;
+  state.forcePending=["native:2"];
+  state.pageIssues={
+    "native:3":{fingerprint:"f3",number:3,status:"failed",kind:"provider",reason:"Previous failure",attempts:1,updatedAt:new Date(1).toISOString()},
+    "native:4":{fingerprint:"f4",number:4,status:"skipped",kind:"provider",reason:"Previously skipped",attempts:0,updatedAt:new Date(1).toISOString()},
+  };
+  state.status="partial";
+  await f.plugin.forceUpdate(source,{reRecognizeAll:true});
+  assert.deepEqual(requestedPages(f.calls.at(-1)),[1,2,3,4]);assert.equal(f.calls.length,before+1);
+  assert.deepEqual(state.pageIssues,{});assert.deepEqual(state.forcePending,[]);assert.equal(state.status,"current");
+});
+
+test("zero run budget stops Force before provider dispatch and preserves manual edits and ownership",async()=>{
+  const f=await editedTranscriptFixture(),state=f.plugin.store.notebooks[source],publishedHash=state.publishedHash,calls=f.calls.length;
+  f.plugin.saveCostSettings({...f.plugin.costs.settings,runUsd:0});
+  await assert.rejects(f.plugin.forceUpdate(source,{reRecognizeAll:true}),/limit|spending|budget/i);
+  assert.equal(f.calls.length,calls);assert.equal(f.files.get(state.output),f.edited);assert.equal(state.publishedHash,publishedHash);
+  state.status="queued";f.plugin.enqueue(source);
+  await f.plugin.update();
+  assert.equal(state.status,"conflict");assert.match(state.error,/manually edited/);assert.equal(f.files.get(state.output),f.edited);assert.equal(state.publishedHash,publishedHash);
+});
+
+test("missing API key before Force dispatch preserves edited Markdown and published ownership",async()=>{
+  const f=await editedTranscriptFixture(),state=f.plugin.store.notebooks[source],publishedHash=state.publishedHash,calls=f.calls.length;
+  f.plugin.apiKey="";
+  await assert.rejects(f.plugin.forceUpdate(source,{reRecognizeAll:true}),/API key/);
+  assert.equal(f.calls.length,calls);assert.equal(f.files.get(state.output),f.edited);assert.equal(state.publishedHash,publishedHash);
+  f.plugin.apiKey="fake-not-a-secret";state.status="queued";f.plugin.enqueue(source);
+  await f.plugin.update();
+  assert.equal(state.status,"conflict");assert.match(state.error,/manually edited/);assert.equal(f.files.get(state.output),f.edited);assert.equal(state.publishedHash,publishedHash);
+});
+
+test("Force setup failure clears its temporary authority before another action can run",async()=>{
+  const f=await editedTranscriptFixture(),state=f.plugin.store.notebooks[source],publishedHash=state.publishedHash,calls=f.calls.length;
+  f.plugin.costBook.beginRun=()=>{throw Error("Usage storage unavailable");};
+  await assert.rejects(f.plugin.forceUpdate(source,{reRecognizeAll:true}),/Usage storage unavailable/);
+  assert.equal(f.plugin.forcedPublication,undefined);assert.equal(f.plugin.task,null);
+  assert.equal(f.calls.length,calls);assert.equal(f.files.get(state.output),f.edited);assert.equal(state.publishedHash,publishedHash);
+});
+
 test("legacy manual-edit conflict with appended pages recovers from its owned prefix receipt without recognizing new pages",async()=>{
   const pages=Array.from({length:8},(_,i)=>({id:`native:${i+1}`,number:i+1,fingerprint:`f${i+1}`}));
   const f=await editedTranscriptFixture(2,true,pages),state=f.plugin.store.notebooks[source];
@@ -1759,6 +1866,64 @@ test("global pause saves the active group and prevents dispatch of later groups"
   assert.equal(f.calls.length,1);assert.deepEqual(requestedPages(f.calls[0]),[1,2,3,4]);
   assert.deepEqual(Object.keys(f.plugin.store.notebooks[source].pages).sort(),["native:1","native:2","native:3","native:4"]);
   assert.equal(f.plugin.progress.paused,true);
+});
+
+test("queued careful group does not replace rendering progress before its render starts",async()=>{
+  const f=fixture(8);f.plugin.config.profiles[0].quality="careful";f.plugin.config.continuous=true;f.plugin.concurrency=2;
+  let releaseFirst,firstStarted;
+  const firstGate=new Promise(resolve=>{releaseFirst=resolve;}),first=new Promise(resolve=>{firstStarted=resolve;});
+  const open=f.reader.open;f.reader.open=async(...args)=>{const notebook=await open(...args);notebook.render=async number=>{if(number===1){firstStarted();await firstGate;}return `image:${number}`;};return notebook;};
+  const work=f.plugin.update();await first;
+  try{
+    await new Promise(resolve=>setImmediate(resolve));
+    assert.equal(f.plugin.progress.stage,"Rendering");
+    assert.match(f.plugin.progress.detail,/page 1/);
+    assert.equal(f.plugin.progress.activePage?.number,1);
+  }finally{releaseFirst();await work;}
+});
+
+test("pause during careful render prevents queued target and context renders",async()=>{
+  const f=fixture(8);f.plugin.config.profiles[0].quality="careful";f.plugin.config.continuous=true;f.plugin.concurrency=2;
+  let releaseFirst,firstStarted;
+  const firstGate=new Promise(resolve=>{releaseFirst=resolve;}),first=new Promise(resolve=>{firstStarted=resolve;});
+  const rendered=[];const open=f.reader.open;f.reader.open=async(...args)=>{const notebook=await open(...args);notebook.render=async number=>{rendered.push(number);if(number===1){firstStarted();await firstGate;}return `image:${number}`;};return notebook;};
+  const work=f.plugin.update();await first;
+  try{
+    await new Promise(resolve=>setImmediate(resolve));
+    f.plugin.pause();releaseFirst();await work;
+    assert.deepEqual(rendered,[1]);
+    assert.equal(f.calls.length,0);
+    assert.deepEqual(f.plugin.store.notebooks[source].pageIssues,undefined);
+    assert.equal(f.plugin.progress.paused,true);
+  }finally{releaseFirst();await work;}
+});
+
+test("adjacent careful groups reuse rendered target and context pages",async()=>{
+  const f=fixture(8);f.plugin.config.profiles[0].quality="careful";f.plugin.config.continuous=true;f.plugin.concurrency=2;
+  const rendered=new Map(),open=f.reader.open;f.reader.open=async(...args)=>{const notebook=await open(...args);notebook.render=async number=>{rendered.set(number,(rendered.get(number)??0)+1);return `image:${number}`;};return notebook;};
+  await f.plugin.update();
+  assert.deepEqual(f.calls.map(requestedPages),[[1,2,3,4],[5,6,7,8]]);
+  assert.deepEqual([...rendered.entries()].sort((a,b)=>a[0]-b[0]),Array.from({length:8},(_,i)=>[i+1,1]));
+});
+
+test("careful request starts before later group preparation finishes and requests overlap",async()=>{
+  const f=fixture(12);f.plugin.config.profiles[0].quality="careful";f.plugin.config.continuous=true;f.plugin.concurrency=2;
+  let releaseLater,releaseFirst,releaseSecond,laterStarted,firstStarted,secondStarted;
+  const laterGate=new Promise(resolve=>{releaseLater=resolve;}),firstGate=new Promise(resolve=>{releaseFirst=resolve;}),secondGate=new Promise(resolve=>{releaseSecond=resolve;});
+  const later=new Promise(resolve=>{laterStarted=resolve;}),first=new Promise(resolve=>{firstStarted=resolve;}),second=new Promise(resolve=>{secondStarted=resolve;});
+  const open=f.reader.open;f.reader.open=async(...args)=>{const notebook=await open(...args);notebook.render=async number=>{if(number===7){laterStarted();await laterGate;}return `image:${number}`;};return notebook;};
+  let active=0,maxActive=0;
+  globalThis.__response=async request=>{const body=JSON.parse(request.body);f.calls.push(body);active++;maxActive=Math.max(maxActive,active);const index=f.calls.length;if(index===1)firstStarted();if(index===2)secondStarted();try{if(index===1)await firstGate;else if(index===2)await secondGate;return answer(`text ${index}`,body);}finally{active--;}};
+  const work=f.plugin.update();
+  try{
+    await Promise.all([first,later]);
+    assert.equal(f.calls.length,1);
+    releaseLater();await second;
+    assert.equal(f.calls.length,2);
+    assert.equal(active,2);
+    releaseFirst();releaseSecond();await work;
+    assert.equal(maxActive,2);
+  }finally{releaseLater();releaseFirst();releaseSecond();await work;}
 });
 
 test("grouped request rechecks notebook revision after rendering target and context images",async()=>{

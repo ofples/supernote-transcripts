@@ -2260,46 +2260,6 @@
   align-self: center;
   margin: auto;
 }
-/* Keep field labels, controls, and optional help aligned on the same desktop row. */
-@media (min-width: 701px) {
-  .st-fullscreen-modal.st-desktop .st-settings-section > .st-field:has(> .st-help-button) {
-    grid-template-columns: minmax(150px, 1fr) minmax(180px, 280px) 32px;
-    grid-template-rows: auto auto;
-    align-items: center;
-    gap: 4px 16px;
-  }
-  .st-fullscreen-modal.st-desktop .st-settings-section > .st-field > span,
-  .st-fullscreen-modal.st-desktop .st-settings-section > .st-field > label {
-    grid-column: 1;
-    grid-row: 1;
-  }
-  .st-fullscreen-modal.st-desktop .st-settings-section > .st-field > input,
-  .st-fullscreen-modal.st-desktop .st-settings-section > .st-field > select {
-    grid-column: 2;
-    grid-row: 1;
-    justify-self: stretch;
-    max-width: 280px;
-  }
-  .st-fullscreen-modal.st-desktop .st-settings-section > .st-field > .st-help-button {
-    grid-column: 3;
-    grid-row: 1;
-    justify-self: end;
-  }
-  .st-fullscreen-modal.st-desktop .st-settings-section > .st-field > .st-help-text {
-    grid-column: 1 / -1;
-    grid-row: 2;
-  }
-  .st-fullscreen-modal.st-desktop .st-settings-section > .st-model-picker {
-    grid-template-rows: auto auto auto;
-  }
-  .st-fullscreen-modal.st-desktop .st-settings-section > .st-model-picker > input {
-    grid-column: 2;
-    grid-row: 2;
-  }
-  .st-fullscreen-modal.st-desktop .st-settings-section > .st-model-picker > .st-help-text {
-    grid-row: 3;
-  }
-}
 .st-fullscreen-modal .st-output-choice {
   display: block;
 }
@@ -2335,6 +2295,20 @@
   align-self: center;
   margin: 0 !important;
 }
+.st-fullscreen-modal .st-output-folder-controls {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+.st-fullscreen-modal .st-output-folder-field > .st-output-folder-controls {
+  grid-column: 1 / -1;
+  grid-row: 2;
+}
+.st-fullscreen-modal .st-output-folder-controls > input {
+  min-width: 0;
+}
 .st-fullscreen-modal .st-document-action-title {
   display: grid;
   grid-template-columns: minmax(0, 1fr) 32px;
@@ -2356,45 +2330,265 @@
   grid-column: 1 / -1;
   grid-row: 2;
 }
+.st-fullscreen-modal .st-form .st-field,
+.st-fullscreen-modal .st-settings-section > .st-field {
+  width: 100%;
+  max-width: none;
+}
+.st-fullscreen-modal .st-form .st-field > input,
+.st-fullscreen-modal .st-form .st-field > textarea,
+.st-fullscreen-modal .st-form .st-field > select,
+.st-fullscreen-modal .st-settings-section > .st-field > input,
+.st-fullscreen-modal .st-settings-section > .st-field > textarea,
+.st-fullscreen-modal .st-settings-section > .st-field > select {
+  width: 100%;
+  max-width: none;
+}
+.st-fullscreen-modal .st-check-row {
+  width: 100%;
+  grid-template-columns: minmax(0, 1fr) 32px 32px;
+}
+.st-fullscreen-modal .st-form .st-check-row,
+.st-fullscreen-modal .st-settings-section .st-check-row {
+  width: 100%;
+  max-width: none;
+}
+.st-fullscreen-modal .st-check-row > label,
+.st-fullscreen-modal .st-check-row > span {
+  grid-column: 1;
+  grid-row: 1;
+}
+.st-fullscreen-modal .st-check-row > input[type="checkbox"] {
+  grid-column: 2;
+  grid-row: 1;
+  justify-self: center;
+}
+.st-fullscreen-modal .st-check-row > .st-help-button {
+  grid-column: 3;
+  grid-row: 1;
+  justify-self: end;
+}
+.st-fullscreen-modal .st-check-row > .st-help-text {
+  grid-column: 1 / -1;
+}
+/* Align editable fields to one shared right edge on wide screens. */
+@media (min-width: 701px) {
+  .st-fullscreen-modal.st-desktop .st-settings-section > .st-field {
+    width: 100%;
+    max-width: none;
+    grid-template-columns: minmax(0, 1fr) 32px;
+    grid-template-rows: auto auto auto;
+    align-items: center;
+  }
+  .st-fullscreen-modal.st-desktop .st-settings-section > .st-field > label,
+  .st-fullscreen-modal.st-desktop .st-settings-section > .st-field > span {
+    grid-column: 1;
+    grid-row: 1;
+  }
+  .st-fullscreen-modal.st-desktop .st-settings-section > .st-field > input,
+  .st-fullscreen-modal.st-desktop .st-settings-section > .st-field > textarea,
+  .st-fullscreen-modal.st-desktop .st-settings-section > .st-field > select {
+    grid-column: 1 / -1;
+    grid-row: 2;
+    width: 100%;
+    min-width: 0 !important;
+    max-width: none !important;
+    justify-self: stretch;
+  }
+  .st-fullscreen-modal.st-desktop .st-settings-section > .st-field > input[type="number"] {
+    max-width: none;
+  }
+  .st-fullscreen-modal.st-desktop .st-settings-section > .st-field > .st-help-button {
+    grid-column: 2;
+    grid-row: 1;
+    justify-self: end;
+  }
+  .st-fullscreen-modal.st-desktop .st-settings-section > .st-field > .st-help-text {
+    grid-column: 1 / -1;
+    grid-row: 3;
+  }
+  .st-fullscreen-modal.st-desktop .st-settings-section > .st-model-picker {
+    grid-template-rows: auto auto auto auto;
+  }
+  .st-fullscreen-modal.st-desktop .st-settings-section > .st-model-picker > select {
+    grid-column: 1 / -1;
+    grid-row: 2;
+  }
+  .st-fullscreen-modal.st-desktop .st-settings-section > .st-model-picker > input {
+    grid-column: 1 / -1;
+    grid-row: 3;
+    max-width: none;
+  }
+  .st-fullscreen-modal.st-desktop .st-settings-section > .st-model-picker > .st-help-text {
+    grid-row: 4;
+  }
+  .st-fullscreen-modal .st-form,
+  .st-fullscreen-modal .st-settings-section {
+    width: 100%;
+    max-width: 760px;
+  }
+  .st-fullscreen-modal .st-form .st-field,
+  .st-fullscreen-modal .st-settings-section > .st-field {
+    width: 100%;
+    max-width: none;
+    grid-template-columns: minmax(0, 1fr) 32px;
+    grid-template-rows: auto auto auto;
+    align-items: center;
+    gap: 4px 16px;
+  }
+  .st-fullscreen-modal .st-form .st-field > label,
+  .st-fullscreen-modal .st-form .st-field > span,
+  .st-fullscreen-modal .st-settings-section > .st-field > label,
+  .st-fullscreen-modal .st-settings-section > .st-field > span {
+    grid-column: 1;
+    grid-row: 1;
+  }
+  .st-fullscreen-modal .st-form .st-field > input,
+  .st-fullscreen-modal .st-form .st-field > textarea,
+  .st-fullscreen-modal .st-form .st-field > select,
+  .st-fullscreen-modal .st-settings-section > .st-field > input,
+  .st-fullscreen-modal .st-settings-section > .st-field > textarea,
+  .st-fullscreen-modal .st-settings-section > .st-field > select {
+    grid-column: 1 / -1;
+    grid-row: 2;
+    width: 100%;
+    max-width: none;
+  }
+  .st-fullscreen-modal .st-form .st-field > .st-help-button,
+  .st-fullscreen-modal .st-settings-section > .st-field > .st-help-button {
+    grid-column: 2;
+    grid-row: 1;
+    justify-self: end;
+  }
+  .st-fullscreen-modal .st-form .st-field > .st-help-text,
+  .st-fullscreen-modal .st-settings-section > .st-field > .st-help-text {
+    grid-column: 1 / -1;
+    grid-row: 3;
+  }
+  .st-fullscreen-modal .st-form .st-model-picker,
+  .st-fullscreen-modal .st-settings-section > .st-model-picker {
+    grid-template-rows: auto auto auto auto;
+  }
+  .st-fullscreen-modal .st-form .st-model-picker > select,
+  .st-fullscreen-modal .st-settings-section > .st-model-picker > select {
+    grid-row: 2;
+  }
+  .st-fullscreen-modal .st-form .st-model-picker > input,
+  .st-fullscreen-modal .st-settings-section > .st-model-picker > input {
+    grid-column: 1 / -1;
+    grid-row: 3;
+  }
+  .st-fullscreen-modal .st-form .st-model-picker > .st-help-text,
+  .st-fullscreen-modal .st-settings-section > .st-model-picker > .st-help-text {
+    grid-row: 4;
+  }
+  .st-fullscreen-modal .st-form .st-quality-control,
+  .st-fullscreen-modal .st-settings-section > .st-quality-control {
+    grid-template-columns: minmax(0, 1fr);
+    max-width: none;
+  }
+  .st-fullscreen-modal .st-form .st-quality-control > input,
+  .st-fullscreen-modal .st-form .st-quality-control > .st-quality-labels,
+  .st-fullscreen-modal .st-form .st-quality-control > .st-quality-summary,
+  .st-fullscreen-modal .st-settings-section > .st-quality-control > input,
+  .st-fullscreen-modal .st-settings-section > .st-quality-control > .st-quality-labels,
+  .st-fullscreen-modal .st-settings-section > .st-quality-control > .st-quality-summary {
+    grid-column: 1;
+    grid-row: auto;
+    width: 100%;
+    max-width: none;
+  }
+  .st-fullscreen-modal .st-check-row {
+    width: 100%;
+    max-width: none;
+    grid-template-columns: minmax(0, 1fr) 32px 32px;
+    align-items: center;
+  }
+  .st-fullscreen-modal .st-form .st-check-row,
+  .st-fullscreen-modal .st-settings-section .st-check-row {
+    width: 100%;
+    max-width: none;
+  }
+  .st-fullscreen-modal .st-check-row > label,
+  .st-fullscreen-modal .st-check-row > span {
+    grid-column: 1;
+    grid-row: 1;
+  }
+  .st-fullscreen-modal .st-check-row > input[type="checkbox"] {
+    grid-column: 2;
+    grid-row: 1;
+    justify-self: center;
+  }
+  .st-fullscreen-modal .st-check-row > .st-help-button {
+    grid-column: 3;
+    grid-row: 1;
+    justify-self: end;
+  }
+  .st-fullscreen-modal .st-check-row > .st-help-text {
+    grid-column: 1 / -1;
+  }
+  .st-fullscreen-modal .st-output-folder-field > .st-output-folder-controls {
+    grid-column: 1 / -1;
+    grid-row: 2;
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    align-items: center;
+    gap: 12px;
+    min-width: 0;
+  }
+  .st-fullscreen-modal .st-output-folder-controls > input {
+    width: 100%;
+    min-width: 0;
+  }
+  .st-fullscreen-modal .st-output-folder-controls > button {
+    margin: 0 !important;
+  }
+}
 @media (max-width: 600px) {
-  .st-fullscreen-modal.st-desktop .st-header {
+  .st-fullscreen-modal .st-output-folder-controls {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .st-fullscreen-modal .st-output-folder-controls > button {
+    justify-self: start;
+  }
+  .st-fullscreen-modal .st-header {
     grid-template-columns: 36px repeat(3, minmax(0, 1fr));
     grid-template-rows: auto auto;
     gap: 6px 8px;
   }
-  .st-fullscreen-modal.st-desktop .st-header h1 {
+  .st-fullscreen-modal .st-header h1 {
     grid-column: 2 / -1;
     grid-row: 1;
   }
-  .st-fullscreen-modal.st-desktop .st-back {
+  .st-fullscreen-modal .st-back {
     grid-column: 1;
     grid-row: 1;
   }
-  .st-fullscreen-modal.st-desktop .st-cost-head,
-  .st-fullscreen-modal.st-desktop .st-head-action,
-  .st-fullscreen-modal.st-desktop .st-close {
+  .st-fullscreen-modal .st-cost-head,
+  .st-fullscreen-modal .st-head-action,
+  .st-fullscreen-modal .st-close {
     grid-row: 2;
     justify-self: center;
   }
-  .st-fullscreen-modal.st-desktop .st-cost-head { grid-column: 2; }
-  .st-fullscreen-modal.st-desktop .st-head-action { grid-column: 3; }
-  .st-fullscreen-modal.st-desktop .st-close { grid-column: 4; }
-  .st-fullscreen-modal.st-desktop .st-rule-row,
-  .st-fullscreen-modal.st-desktop .st-notebook-child {
+  .st-fullscreen-modal .st-cost-head { grid-column: 2; }
+  .st-fullscreen-modal .st-head-action { grid-column: 3; }
+  .st-fullscreen-modal .st-close { grid-column: 4; }
+  .st-fullscreen-modal .st-rule-row,
+  .st-fullscreen-modal .st-notebook-child {
     grid-template-columns: minmax(0, 1fr);
     gap: 8px;
   }
-  .st-fullscreen-modal.st-desktop .st-row-controls {
+  .st-fullscreen-modal .st-row-controls {
     grid-column: 1;
     grid-row: auto;
     justify-content: flex-start;
     flex-wrap: wrap;
   }
-  .st-fullscreen-modal.st-desktop .st-source-heading {
+  .st-fullscreen-modal .st-source-heading {
     min-width: 0;
     flex-wrap: wrap;
   }
-  .st-fullscreen-modal.st-desktop .st-rule-source {
+  .st-fullscreen-modal .st-rule-source {
     min-width: 0;
     overflow-wrap: normal;
     word-break: normal;
@@ -2414,17 +2608,60 @@
   border-top: 0;
 }
 @media (min-width: 701px) {
-  .st-fullscreen-modal.st-desktop .st-settings-section > .st-quality-control {
+  .st-fullscreen-modal .st-settings-section > .st-quality-control {
     width: 100%;
     max-width: 680px;
     grid-template-columns: minmax(0, 1fr);
   }
-  .st-fullscreen-modal.st-desktop .st-settings-section > .st-quality-control > input[type="range"],
-  .st-fullscreen-modal.st-desktop .st-settings-section > .st-quality-control > .st-quality-labels {
+  .st-fullscreen-modal .st-settings-section > .st-quality-control > input[type="range"],
+  .st-fullscreen-modal .st-settings-section > .st-quality-control > .st-quality-labels {
     grid-column: 1;
     width: 100% !important;
     min-width: 100%;
     max-width: none;
     justify-self: stretch;
+  }
+}
+@media (max-width: 700px) {
+  .st-fullscreen-modal.st-desktop .st-settings-section > .st-field:has(> .st-help-button) {
+    grid-template-columns: minmax(0, 1fr) !important;
+    grid-template-rows: auto auto auto;
+  }
+  .st-fullscreen-modal.st-desktop .st-settings-section > .st-field:has(> .st-help-button) > label,
+  .st-fullscreen-modal.st-desktop .st-settings-section > .st-field:has(> .st-help-button) > span {
+    grid-column: 1;
+    grid-row: 1;
+  }
+  .st-fullscreen-modal.st-desktop .st-settings-section > .st-field:has(> .st-help-button) > .st-help-button {
+    grid-column: 1;
+    grid-row: 1;
+    justify-self: end;
+  }
+  .st-fullscreen-modal.st-desktop .st-settings-section > .st-field:has(> .st-help-button) > input,
+  .st-fullscreen-modal.st-desktop .st-settings-section > .st-field:has(> .st-help-button) > textarea,
+  .st-fullscreen-modal.st-desktop .st-settings-section > .st-field:has(> .st-help-button) > select {
+    grid-column: 1;
+    grid-row: 2;
+  }
+  .st-fullscreen-modal.st-desktop .st-settings-section > .st-field:has(> .st-help-button) > input,
+  .st-fullscreen-modal.st-desktop .st-settings-section > .st-field:has(> .st-help-button) > textarea,
+  .st-fullscreen-modal.st-desktop .st-settings-section > .st-field:has(> .st-help-button) > select {
+    grid-column: 1 / -1;
+    grid-row: 2;
+    width: 100%;
+    max-width: none;
+  }
+  .st-fullscreen-modal.st-desktop .st-settings-section > .st-field > input,
+  .st-fullscreen-modal.st-desktop .st-settings-section > .st-field > textarea,
+  .st-fullscreen-modal.st-desktop .st-settings-section > .st-field > select {
+    grid-column: 1 / -1;
+    grid-row: 2;
+    width: 100% !important;
+    min-width: 0 !important;
+    max-width: none !important;
+    justify-self: stretch;
+  }
+  .st-fullscreen-modal.st-desktop .st-settings-section > .st-field > input[type="number"] {
+    max-width: none;
   }
 }
