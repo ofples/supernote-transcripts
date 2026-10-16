@@ -2,6 +2,8 @@
 
 ## Version 0.11.1 — simpler settings and connection recovery
 
+Active on desktop Vedas and Nomad; source tests and live settings checks passed. Both workers remain paused, with no recognition requests during validation.
+
 Settings and source forms now use ordinary labelled sections with one **Advanced** disclosure each. Desktop controls use compact labelled rows, consistent typography and outlined secondary buttons. Pairing has **Copy** beside every complete desktop address.
 
 A successful ChatGPT sign-in clears stale login-related queue blockers. Known offline attempts do not send a renewal request or invalidate the saved login. Page failure holds, budgets, cached text and pause settings are retained. See [SUBSCRIPTION-NOMAD.md](SUBSCRIPTION-NOMAD.md) and [VALIDATION.md](VALIDATION.md) for behavior and verification status.
