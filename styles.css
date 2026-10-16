@@ -1249,6 +1249,38 @@
   min-width: 0;
   padding-left: 4px;
 }
+.st-fullscreen-modal .st-document-action-buttons {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 12px;
+  align-items: center;
+}
+.st-fullscreen-modal .st-action-workflow {
+  width: 100%;
+  max-width: 680px;
+  padding-bottom: 16px;
+}
+.st-fullscreen-modal .st-action-workflow > .st-field {
+  width: 100%;
+  max-width: none;
+}
+.st-fullscreen-modal .st-action-workflow .st-cleanup-destination {
+  display: grid;
+  gap: 2px;
+  margin: 8px 0 14px;
+}
+.st-fullscreen-modal .st-action-workflow .st-cleanup-destination-path {
+  overflow-wrap: anywhere;
+}
+.st-fullscreen-modal .st-action-workflow .st-cleanup-replace-note {
+  margin-top: -8px;
+}
+.st-fullscreen-modal .st-action-workflow .st-action-disabled-reason {
+  margin-top: 14px;
+}
+.st-fullscreen-modal .st-action-workflow details {
+  margin: 12px 0;
+}
 .st-fullscreen-modal .st-document-actions-compact .st-detail-task {
   margin-top: 8px;
   padding-top: 8px;

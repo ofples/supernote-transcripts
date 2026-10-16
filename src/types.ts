@@ -258,8 +258,8 @@ export interface Controller {
   manual(path: string, range: string, force?: boolean): Promise<void>;
   reprocessPages(source: string, range: string, outdatedOnly?: boolean): Promise<void>;
   reprocessEstimate?(source: string, range: string, outdatedOnly?: boolean): QueueEstimate;
-  cleanupEstimate(source: string): QueueEstimate;
-  cleanupDocument(source: string, options?: { saveCopy?: boolean }): Promise<void>;
+  cleanupEstimate(source: string, options?: { model?: string }): QueueEstimate;
+  cleanupDocument(source: string, options?: { saveCopy?: boolean; copyPath?: string; model?: string }): Promise<void>;
   openOutput(path: string): Promise<void>;
   previewTranscriptRecovery(source: string): Promise<{ current: string; generated: string; output: string; revision: string }>;
   resolveTranscriptConflict(source: string, action: "replace" | "keep", expectedCurrent: string, expectedRevision?: string): Promise<{ backup?: string; output: string }>;

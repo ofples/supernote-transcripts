@@ -196,6 +196,8 @@ type Screen =
   | "browser"
   | "detail"
   | "recovery"
+  | "cleanup"
+  | "reprocess"
   | "glossaries"
   | "costs"
   | "output-folders";
@@ -206,6 +208,8 @@ class MirrorsModal extends Modal {
   private formControlState?: Array<[HTMLButtonElement | HTMLInputElement | HTMLTextAreaElement | HTMLSelectElement, boolean]>;
   private off?: () => void;
   private screen: Screen = "home";
+  private actionReturnScreen: "editor" | "detail" = "detail";
+  private actionSource = "";
   private detailReturnScreen: "home" | "queue" = "home";
   private settingsReturnScreen: Screen = "home";
   private body!: HTMLElement;
@@ -291,9 +295,13 @@ class MirrorsModal extends Modal {
   private viewWindow?: Window;
   private keyboardHiddenHeight = 0;
   private range = "";
+  private reprocessRange = "";
   private outdatedOnly = false;
   private cleanupBusySource = "";
+  private reprocessBusy = false;
   private cleanupSaveCopy = false;
+  private cleanupCopyPath = "";
+  private cleanupModel = "";
   private get displayStore(): Store {
     return this.c.displayStore ?? this.c.store;
   }
@@ -434,6 +442,7 @@ class MirrorsModal extends Modal {
     } else if (this.screen === "browser" && this.browserFrom === "edit")
       this.screen = "editor";
     else if (this.screen === "recovery") this.screen = "detail";
+    else if (this.screen === "cleanup" || this.screen === "reprocess") this.screen = this.actionReturnScreen;
     else if (this.screen === "detail") this.screen = this.detailReturnScreen;
     else if (this.screen === "settings") {
       this.settingsDraft = undefined;
@@ -503,6 +512,10 @@ class MirrorsModal extends Modal {
             ? "Queue"
             : this.screen === "force-update"
               ? "Force update"
+            : this.screen === "cleanup"
+              ? "Clean up document"
+              : this.screen === "reprocess"
+                ? "Re-recognize pages"
             : this.screen === "notebook-selection"
               ? "Select notebooks"
               : this.screen === "editor"
@@ -531,6 +544,8 @@ class MirrorsModal extends Modal {
     if (this.screen === "home") this.renderHome();
     else if (this.screen === "queue") this.renderQueue();
     else if (this.screen === "force-update") this.renderForceUpdate();
+    else if (this.screen === "cleanup") this.renderCleanupWorkflow();
+    else if (this.screen === "reprocess") this.renderReprocessWorkflow();
     else if (this.screen === "notebook-selection")
       void this.renderNotebookSelection();
     else if (this.screen === "settings") this.renderSettings();
@@ -1567,7 +1582,6 @@ class MirrorsModal extends Modal {
             "st-folder-contents",
           );
           children.dataset.ruleId = rule.id;
-          el(children, "p", "Choose a notebook or use its actions below.", "st-caption st-folder-instruction");
           for (const source of stateSources) {
             const state = this.displayStore.notebooks[source];
             if (state) this.renderNotebookRow(children, rule, state);
@@ -1620,7 +1634,6 @@ class MirrorsModal extends Modal {
       el(meta, "p", reason, "st-caption st-attention-reason");
     progressBar(row, view, `${shortPath(state.source)} pages ready`);
     const controls = el(row, "div", undefined, "st-row-controls");
-    this.renderForceUpdateAction(controls, state);
     const pause = iconButton(
       controls,
       state.paused ? "play" : "pause",
@@ -1640,28 +1653,15 @@ class MirrorsModal extends Modal {
       );
     }
     if (this.c.progress.stateBlocked && state.paused) pause.disabled = true;
-    if (canRecoverTranscriptEdits(state))
-      btn(
-        controls,
-        "Resolve edits",
-        () => this.openRecovery(state.source),
-        "st-button st-text-button st-recovery-action",
-      );
-    if (currentPageIssues(state).some((issue) => issue.status !== "skipped"))
-      btn(
-        controls,
-        "Review pages",
-        () => {
-          this.selectedRule = state.ruleId;
-          this.selectedSource = state.source;
-          this.detailReturnScreen = "home";
-          this.screen = "detail";
-          this.render();
-        },
-        "st-button st-text-button st-review-pages",
-      );
-    this.renderDocumentActions(row, state, true);
+    btn(controls, "Details", () => this.openNotebookDetail(rule.id, state.source), "st-button st-text-button st-notebook-details-action");
     this.makeNotebookOpenable(row, rule.id, state.source);
+  }
+  private openNotebookDetail(ruleId: string, source: string) {
+    this.selectedRule = ruleId;
+    this.selectedSource = source;
+    this.detailReturnScreen = "home";
+    this.screen = "detail";
+    this.render();
   }
   private makeNotebookOpenable(
     row: HTMLElement,
@@ -1965,7 +1965,7 @@ class MirrorsModal extends Modal {
       el(notebookActions, "h2", "Notebook actions", "st-section-heading");
       if (this.sourceEditorDraftDirty())
         el(notebookActions, "p", "Save source settings before running notebook actions.", "st-caption st-actions-draft-note");
-      else this.renderDocumentActions(notebookActions, sourceState, true);
+      else this.renderDocumentActions(notebookActions, sourceState);
     }
 
     const management = el(root, "div", undefined, "st-source-management-action");
@@ -3924,140 +3924,246 @@ class MirrorsModal extends Modal {
       el(technical, "p", `Device OCR is available for ${deviceOcrPages} page${deviceOcrPages === 1 ? "" : "s"}; it is separate from saved AI recognition.`, "st-caption");
     }
   }
-  private renderDocumentActions(parent: HTMLElement, state: Controller["store"]["notebooks"][string], compact = false) {
-    const controls = el(parent, "section", undefined, `st-document-actions${compact ? " st-document-actions-compact" : ""}`);
-    const operationController = this.c as Controller & {
-      cleanupDocument?: (source: string, options?: { saveCopy?: boolean }) => Promise<void>;
-      cleanupEstimate?: (source: string) => QueueEstimate;
-      reprocessPages?: (source: string, range: string, outdatedOnly?: boolean) => Promise<void>;
-    };
+  private renderDocumentActions(parent: HTMLElement, state: Controller["store"]["notebooks"][string]) {
+    const controls = el(parent, "section", undefined, "st-document-actions");
+    const actions = el(controls, "div", undefined, "st-document-action-buttons");
     if (this.canForceUpdate(state)) {
-      const forceSection = el(controls, "section", undefined, "st-detail-task st-force-update-task");
-      el(forceSection, compact ? "h3" : "h2", "Force update", "st-section-heading");
-      el(forceSection, "p", this.forceUpdateReason(state, "This notebook needs attention before its next update."), "st-caption st-attention-reason");
-      btn(forceSection, "Force update", () => this.openForceUpdate(state.source), "st-button st-text-button st-force-update-action");
+      const reason = this.forceUpdateReason(state, "This notebook needs attention before its next update.");
+      el(controls, "p", reason, "st-caption st-attention-reason");
+      btn(actions, "Force update", () => this.openForceUpdate(state.source), "st-button st-text-button st-force-update-action");
     }
-    const cleanupSection = el(controls, "section", undefined, "st-detail-task st-cleanup-task");
-    const cleanupTitle = el(cleanupSection, "div", undefined, "st-document-action-title");
-    el(cleanupTitle, compact ? "h3" : "h2", "Clean up document", "st-section-heading");
-    this.help(cleanupTitle, "Clean formatting and transcription errors across the complete document, preserving your wording. One text-only request, with high reasoning where supported.", "Clean up document");
-    const cleanupMetadata = (state as typeof state & { cleanup?: { updatedAt?: string; model?: string; quality?: string; stale?: boolean } }).cleanup;
-    if (cleanupMetadata) {
-      const when = cleanupMetadata.updatedAt ? new Date(cleanupMetadata.updatedAt).toLocaleString() : "date unavailable";
-      const details = [cleanupMetadata.model, cleanupMetadata.quality, when].filter(Boolean).join(" · ");
-      el(cleanupSection, "p", `Previous cleanup${cleanupMetadata.stale ? " · source text changed" : ""}: ${details}`, "st-caption");
+    btn(actions, "Clean up document", () => this.openDocumentWorkflow("cleanup", state.source), "st-button st-text-button st-cleanup-open");
+    btn(actions, "Re-recognize pages", () => this.openDocumentWorkflow("reprocess", state.source), "st-button st-text-button st-reprocess-open");
+  }
+  private savedModelFor(source: string) {
+    const state = this.displayStore.notebooks[source];
+    const rule = this.c.config.rules.find((item) => item.id === state?.ruleId);
+    const profile = this.c.config.profiles.find((item) => item.id === rule?.profileId) ?? this.c.config.profiles.find((item) => item.id === "general");
+    return profile?.model ?? this.c.config.profiles[0]?.model ?? MODEL_OPTIONS[0];
+  }
+  private defaultCopyPath(state: Controller["store"]["notebooks"][string]) {
+    const output = state.output || "transcript.md";
+    const slash = output.lastIndexOf("/");
+    const folder = slash >= 0 ? output.slice(0, slash + 1) : "";
+    const filename = slash >= 0 ? output.slice(slash + 1) : output;
+    const stem = filename.replace(/\.md$/i, "") || "transcript";
+    return `${folder}${stem} (cleaned).md`;
+  }
+  private openDocumentWorkflow(screen: "cleanup" | "reprocess", source: string) {
+    if (this.screen === "editor" && this.sourceEditorDraftDirty()) {
+      new Notice("Save source settings before opening notebook actions.");
+      return;
     }
-    const cleanupEstimate = operationController.cleanupEstimate?.(state.source);
-    if (cleanupEstimate && cleanupEstimate.pages > 0) {
-      const parts = [`${cleanupEstimate.pages} page${cleanupEstimate.pages === 1 ? "" : "s"}`, `${cleanupEstimate.requests} request${cleanupEstimate.requests === 1 ? "" : "s"}`];
-      if ((this.c as Controller & { provider?: string }).provider === "subscription") {
-        if (cleanupEstimate.seconds !== undefined) parts.push(`about ${this.duration(cleanupEstimate.seconds)}`);
-        const usage = this.c.subscriptionUsage;
-        const left = Math.max(0, usage.dailyLimit - usage.todayRequests);
-        parts.push(`${left} of ${usage.dailyLimit} plugin requests left today`);
-      } else {
-        if (cleanupEstimate.usd !== undefined) parts.push(`about $${cleanupEstimate.usd.toFixed(4)}`);
-        if (cleanupEstimate.reservationUsd !== undefined && cleanupEstimate.reservationUsd > 0)
-          parts.push(`up to $${cleanupEstimate.reservationUsd.toFixed(4)} reserved`);
-      }
-      el(cleanupSection, "p", `Estimated cleanup: ${parts.join(" · ")}${cleanupEstimate.provisional ? " · provisional" : ""}`, "st-caption st-queue-estimate");
-    }
-    if ((this.c as Controller & { provider?: string }).provider === "subscription") {
+    if (!this.displayStore.notebooks[source]) return;
+    this.actionReturnScreen = this.screen === "editor" ? "editor" : "detail";
+    this.actionSource = source;
+    if (screen === "cleanup") {
+      this.cleanupModel = this.savedModelFor(source);
+      this.cleanupSaveCopy = false;
+      this.cleanupCopyPath = this.defaultCopyPath(this.displayStore.notebooks[source]);
     } else {
-      const limits = this.c.costs.settings;
-      const spent = this.c.costs.day.spentUsd + this.c.costs.day.heldUsd;
-      const monthTotal = this.c.costs.month.spentUsd + this.c.costs.month.heldUsd;
-      el(cleanupSection, "p", `API budget: $${spent.toFixed(4)} of $${limits.dailyUsd.toFixed(2)} today · ${this.c.costs.day.requests}/${limits.dailyRequests} requests today · $${monthTotal.toFixed(4)} of $${limits.monthlyUsd.toFixed(2)} this month · $${limits.runUsd.toFixed(2)} run cap.`, "st-caption");
+      this.reprocessRange = "";
+      this.outdatedOnly = false;
     }
-    this.toggle(
-      cleanupSection,
-      "Save cleaned text as a separate copy",
-      this.cleanupSaveCopy,
-      (value) => { this.cleanupSaveCopy = value; },
-      "Off replaces the current transcript after preserving its previous version in history.",
-    );
-    const cleanupButton = btn(cleanupSection, this.cleanupBusySource === state.source ? "Cleaning up…" : "Clean up document", () => { void this.runDocumentCleanup(state.source); }, "st-button st-primary");
-    const cleanupReady=state.desired.length>0&&state.desired.every(p=>state.pages[p.id]?.fingerprint===p.fingerprint);
-    cleanupButton.disabled = !operationController.cleanupDocument || !!this.c.progress.stateBlocked || !aiOn(this.c) || this.c.progress.running || !cleanupReady || this.cleanupBusySource === state.source;
-    if(!cleanupReady)el(cleanupSection,"p","Recognize all pages before cleanup.","st-caption");
-    if (!operationController.cleanupDocument)
-      el(cleanupSection, "p", "Document cleanup is not available in this runtime yet.", "st-caption st-inactive");
-    else if (!aiOn(this.c))
-      el(cleanupSection, "p", "Turn on AI recognition in Settings before requesting cleanup.", "st-caption st-inactive");
-    else if (this.c.progress.stateBlocked)
-      el(cleanupSection, "p", this.stateBlockedMessage(), "st-caption st-attention-reason");
-
-    const reprocessSection = el(controls, "section", undefined, "st-detail-task st-reprocess-task");
-    const reprocessTitle = el(reprocessSection, "div", undefined, "st-document-action-title");
-    el(reprocessTitle, compact ? "h3" : "h2", "Re-recognize pages", "st-section-heading");
-    this.help(reprocessTitle, "Choose page numbers or ranges. This explicit action sends the selected page images for recognition and may use provider credit.", "Re-recognize pages");
-    let updateSelectionEstimate=()=>{};
-    const range = this.input(
-      reprocessSection,
-      "Pages",
-      this.range,
-      "text",
-      (v) => {this.range = v;updateSelectionEstimate();},
-      "1, 3-5, 12",
-    );
-    range.placeholder = "For example: 1, 3-5, 12";
-    this.toggle(
-      reprocessSection,
-      "Only pages with outdated recognition",
-      this.outdatedOnly,
-      (value) => { this.outdatedOnly = value;updateSelectionEstimate(); },
-      "When off, every selected page is recognized again.",
-    );
-    const selectionEstimate=el(reprocessSection,"p",undefined,"st-caption st-selection-estimate");
-    updateSelectionEstimate=()=>{
-      try {
-        const estimate=this.c.reprocessEstimate?.(state.source,this.range,this.outdatedOnly);
-        setText(selectionEstimate,estimate?`${estimate.pages} selected pages · ${estimate.requests} requests${this.c.provider==="api"&&estimate.usd!==undefined?` · about $${estimate.usd.toFixed(4)}`:""}${estimate.provisional?" · provisional estimate":""}`:"Enter pages to estimate this operation.");
-      }catch(error){setText(selectionEstimate,err(error));}
-    };
-    updateSelectionEstimate();
-    const reprocessButton = btn(reprocessSection, aiOn(this.c) ? "Re-recognize selected pages" : "AI recognition is off", () => {
-      if (this.screen === "editor" && this.sourceEditorDraftDirty())
-        return new Notice("Save source settings before running notebook actions.");
-      if (this.c.progress.stateBlocked) return new Notice(this.stateBlockedMessage());
-      if (!this.range.trim()&&!this.outdatedOnly) return new Notice("Enter one or more page numbers or ranges.");
-      if (!operationController.reprocessPages) return new Notice("Page re-recognition is not available in this runtime yet.");
-      safe(operationController.reprocessPages(state.source, this.range, this.outdatedOnly));
-    }, "st-button st-primary");
-    reprocessButton.disabled = !operationController.reprocessPages || !!this.c.progress.stateBlocked || !aiOn(this.c) || this.c.progress.running;
-
+    this.screen = screen;
+    this.render();
+  }
+  private documentActionReason(state: Controller["store"]["notebooks"][string], kind: "cleanup" | "reprocess") {
+    if (this.c.progress.stateBlocked) return "Saved plugin state is unavailable.";
+    if (!aiOn(this.c)) return "Turn on AI recognition in Settings to run this action.";
+    if (this.c.progress.running) return "Wait for the current request to finish.";
+    const rule = this.c.config.rules.find((item) => item.id === state.ruleId);
+    if (state.paused || rule?.paused) return "Resume this notebook before running it.";
+    if (rule && !rule.enabled) return "Turn this source on before running it.";
+    if (kind === "cleanup") {
+      if (!this.c.cleanupDocument || !this.c.cleanupEstimate) return "Document cleanup is unavailable in this runtime.";
+      if (!this.cleanupModel.trim()) return "Choose a valid cleanup model.";
+      const complete = state.desired.length > 0 && state.desired.every((page) => state.pages[page.id]?.fingerprint === page.fingerprint);
+      if (!complete) return "Recognize all pages before cleanup.";
+      if (this.cleanupSaveCopy && !this.cleanupCopyPath.trim()) return "Enter a path for the cleaned copy.";
+    } else {
+      if (!this.c.reprocessPages || !this.c.reprocessEstimate) return "Page re-recognition is unavailable in this runtime.";
+      if (!this.reprocessRange.trim() && !this.outdatedOnly) return "Enter pages or choose outdated pages.";
+    }
+    return "";
+  }
+  private cleanupEstimateText(state: Controller["store"]["notebooks"][string]) {
+    try {
+      const estimate = this.c.cleanupEstimate(state.source, { model: this.cleanupModel });
+      const parts = [`${estimate.pages} page${estimate.pages === 1 ? "" : "s"}`, `${estimate.requests} request${estimate.requests === 1 ? "" : "s"}`];
+      if (this.c.provider === "subscription") {
+        if (estimate.seconds !== undefined) parts.push(`about ${this.duration(estimate.seconds)}`);
+      } else if (estimate.usd !== undefined) parts.push(`about $${estimate.usd.toFixed(4)}`);
+      return `Estimated cleanup: ${parts.join(" · ")}${estimate.provisional ? " · provisional" : ""}`;
+    } catch (error) {
+      return `Estimate unavailable: ${err(error)}`;
+    }
+  }
+  private renderCleanupWorkflow() {
+    const state = this.displayStore.notebooks[this.actionSource];
+    const root = el(this.body, "section", undefined, "st-form st-action-workflow st-cleanup-workflow");
+    if (!state) {
+      el(root, "p", "This notebook is no longer available.", "st-caption st-attention-reason");
+    } else {
+      el(root, "p", "Clean formatting and transcription errors across the document while preserving your wording.", "st-caption");
+      this.modelPicker(root, "Cleanup model", this.cleanupModel, (model) => {
+        this.cleanupModel = model;
+        const estimate = root.querySelector(".st-cleanup-estimate") as HTMLElement | null;
+        if (estimate) setText(estimate, this.cleanupEstimateText(state));
+        updateRunState();
+      });
+      el(root, "p", this.cleanupEstimateText(state), "st-caption st-queue-estimate st-cleanup-estimate");
+      const copyToggle = this.toggle(root, "Save cleaned text as a separate copy", this.cleanupSaveCopy, (value) => {
+        this.cleanupSaveCopy = value;
+        copyFieldWrapper.hidden = !value;
+        destinationBlock.hidden = value;
+        setText(copyConsequence, value ? "Leaves the original transcript unchanged." : "Replaces this transcript and backs up the previous version.");
+        setText(destination, value ? this.cleanupCopyPath.trim() || "Enter a copy path." : state.output);
+        updateRunState();
+      }, "The original transcript stays unchanged when you save a copy.");
+      copyToggle.dataset.testid = "cleanup-save-copy";
+      const copyConsequence = el(root, "p", this.cleanupSaveCopy ? "Leaves the original transcript unchanged." : "Replaces this transcript and backs up the previous version.", "st-caption st-cleanup-replace-note");
+      const copyField = this.input(root, "Copy path", this.cleanupCopyPath, "text", (value) => {
+        this.cleanupCopyPath = value;
+        setText(destination, value.trim() || "Enter a copy path.");
+        updateRunState();
+      }, "Choose a new Markdown path in the vault.");
+      const copyFieldWrapper = copyField.closest<HTMLElement>(".st-field")!;
+      copyFieldWrapper.classList.add("st-cleanup-copy-field");
+      copyFieldWrapper.hidden = !this.cleanupSaveCopy;
+      const destinationBlock = el(root, "div", undefined, "st-cleanup-destination");
+      destinationBlock.hidden = this.cleanupSaveCopy;
+      el(destinationBlock, "span", "Destination", "st-caption");
+      const destination = el(destinationBlock, "strong", this.cleanupSaveCopy ? this.cleanupCopyPath : state.output, "st-cleanup-destination-path");
+      const previous = (state as typeof state & { cleanup?: { updatedAt?: string; model?: string; quality?: string; stale?: boolean } }).cleanup;
+      if (previous) {
+        const details = el(root, "details", undefined, "st-cleanup-previous");
+        el(details, "summary", "Previous cleanup details");
+        const when = previous.updatedAt ? new Date(previous.updatedAt).toLocaleString() : "Date unavailable";
+        el(details, "p", [previous.model, previous.quality, when, previous.stale ? "Source text changed since cleanup" : ""].filter(Boolean).join(" · "), "st-caption");
+      }
+      const reason = el(root, "p", "", "st-caption st-attention-reason st-action-disabled-reason");
+      const actions = el(this.footer, "div", undefined, "st-actions");
+      btn(actions, "Cancel", () => this.goBack(), "st-button st-text-button");
+      const run = btn(actions, this.cleanupBusySource === state.source ? "Cleaning up…" : "Clean up document", () => void this.runDocumentCleanup(state.source), "st-button st-primary st-cleanup-run");
+      const updateRunState = () => {
+        const message = this.documentActionReason(state, "cleanup");
+        reason.hidden = !message;
+        setText(reason, message);
+        run.disabled = !!message || this.cleanupBusySource === state.source;
+      };
+      updateRunState();
+      (Array.from(root.querySelectorAll("input, select")) as Array<HTMLInputElement | HTMLSelectElement>).forEach((control) => { control.disabled = this.cleanupBusySource === state.source; });
+    }
+    if (!state) {
+      const actions = el(this.footer, "div", undefined, "st-actions");
+      btn(actions, "Cancel", () => this.goBack(), "st-button st-text-button");
+    }
+  }
+  private renderReprocessWorkflow() {
+    const state = this.displayStore.notebooks[this.actionSource];
+    const root = el(this.body, "section", undefined, "st-form st-action-workflow st-reprocess-workflow");
+    if (!state) {
+      el(root, "p", "This notebook is no longer available.", "st-caption st-attention-reason");
+    } else {
+      el(root, "p", "Choose pages to send for recognition. This action may use provider credit.", "st-caption");
+      const pages = this.input(root, "Pages", this.reprocessRange, "text", (value) => {
+        this.reprocessRange = value;
+        refreshEstimate();
+        updateRunState();
+      }, "For example: 1, 3-5, 12");
+      pages.placeholder = "For example: 1, 3-5, 12";
+      this.toggle(root, "Only pages with outdated recognition", this.outdatedOnly, (value) => {
+        this.outdatedOnly = value;
+        refreshEstimate();
+        updateRunState();
+      }, "When off, every selected page is recognized again.");
+      const estimate = el(root, "p", "Enter pages to estimate this operation.", "st-caption st-selection-estimate");
+      const refreshEstimate = () => {
+        try {
+          const value = this.c.reprocessEstimate?.(state.source, this.reprocessRange, this.outdatedOnly);
+          setText(estimate, value ? `${value.pages} selected pages · ${value.requests} requests${this.c.provider === "api" && value.usd !== undefined ? ` · about $${value.usd.toFixed(4)}` : ""}${value.provisional ? " · provisional estimate" : ""}` : "Enter pages to estimate this operation.");
+        } catch (error) { setText(estimate, `Estimate unavailable: ${err(error)}`); }
+      };
+      refreshEstimate();
+      const reason = el(root, "p", "", "st-caption st-attention-reason st-action-disabled-reason");
+      const actions = el(this.footer, "div", undefined, "st-actions");
+      btn(actions, "Cancel", () => this.goBack(), "st-button st-text-button");
+      const run = btn(actions, this.reprocessBusy ? "Re-recognizing…" : "Re-recognize selected pages", () => void this.runDocumentReprocess(state.source), "st-button st-primary st-reprocess-run");
+      const updateRunState = () => {
+        const message = this.documentActionReason(state, "reprocess");
+        reason.hidden = !message;
+        setText(reason, message);
+        run.disabled = !!message || this.reprocessBusy;
+      };
+      updateRunState();
+      (Array.from(root.querySelectorAll("input, select")) as Array<HTMLInputElement | HTMLSelectElement>).forEach((control) => { control.disabled = this.reprocessBusy; });
+    }
+    if (!state) {
+      const actions = el(this.footer, "div", undefined, "st-actions");
+      btn(actions, "Cancel", () => this.goBack(), "st-button st-text-button");
+    }
   }
   private async runDocumentCleanup(source: string) {
-    if (this.screen === "editor" && this.editorRule?.source === source && this.sourceEditorDraftDirty()) {
+    if (this.cleanupBusySource) return;
+    const state = this.displayStore.notebooks[source];
+    if (!state || source !== this.actionSource) return;
+    if (this.actionReturnScreen === "editor" && this.editorRule?.source === source && this.sourceEditorDraftDirty()) {
       new Notice("Save source settings before running notebook actions.");
       return;
     }
-    const controller = this.c as Controller & {
-      cleanupDocument?: (source: string, options?: { saveCopy?: boolean }) => Promise<void>;
-    };
-    if (!controller.cleanupDocument) {
-      new Notice("Document cleanup is not available in this runtime yet.");
-      return;
-    }
-    if (this.c.progress.stateBlocked) {
-      new Notice(this.stateBlockedMessage());
-      return;
-    }
-    if (!aiOn(this.c)) {
-      new Notice("Turn on AI recognition in Settings before requesting cleanup.");
-      return;
-    }
-    if (this.cleanupBusySource) return;
+    const reason = this.documentActionReason(state, "cleanup");
+    if (reason) { new Notice(reason); return; }
+    const workflowScreen = this.screen;
+    const returnScreen = this.actionReturnScreen;
+    let completed = false;
     this.cleanupBusySource = source;
-    if (this.screen === "detail" && this.selectedSource === source) this.render();
+    this.render();
     try {
-      await controller.cleanupDocument(source, { saveCopy: this.cleanupSaveCopy });
+      await this.c.cleanupDocument(source, {
+        model: this.cleanupModel,
+        saveCopy: this.cleanupSaveCopy,
+        ...(this.cleanupSaveCopy ? { copyPath: this.cleanupCopyPath.trim() } : {}),
+      });
       new Notice(this.cleanupSaveCopy ? "Cleaned transcript saved as a separate copy." : "Transcript cleanup completed; the previous version is in history.");
+      completed = true;
     } catch (error) {
-      new Notice(`Could not clean up this transcript: ${err(error)}. Review the source and budget, then retry.`);
+      new Notice(`Could not clean up this transcript: ${err(error)}`);
     } finally {
-      if (this.cleanupBusySource === source) this.cleanupBusySource = "";
-      if (this.screen === "detail" && this.selectedSource === source) this.render();
+      this.cleanupBusySource = "";
+      if (this.screen === workflowScreen && this.actionSource === source) {
+        if (completed) this.screen = returnScreen;
+        this.render();
+      }
+    }
+  }
+  private async runDocumentReprocess(source: string) {
+    if (this.reprocessBusy) return;
+    const state = this.displayStore.notebooks[source];
+    if (!state || source !== this.actionSource) return;
+    if (this.actionReturnScreen === "editor" && this.editorRule?.source === source && this.sourceEditorDraftDirty()) {
+      new Notice("Save source settings before running notebook actions.");
+      return;
+    }
+    const reason = this.documentActionReason(state, "reprocess");
+    if (reason) { new Notice(reason); return; }
+    const workflowScreen = this.screen;
+    const returnScreen = this.actionReturnScreen;
+    let completed = false;
+    this.reprocessBusy = true;
+    this.render();
+    try {
+      await this.c.reprocessPages(source, this.reprocessRange.trim(), this.outdatedOnly);
+      new Notice("Page re-recognition queued.");
+      completed = true;
+    } catch (error) {
+      new Notice(`Could not re-recognize these pages: ${err(error)}.`);
+    } finally {
+      this.reprocessBusy = false;
+      if (this.screen === workflowScreen && this.actionSource === source) {
+        if (completed) this.screen = returnScreen;
+        this.render();
+      }
     }
   }
   private refreshPageIssues(state: Controller["store"]["notebooks"][string]) {

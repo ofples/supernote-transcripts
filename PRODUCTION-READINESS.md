@@ -1,6 +1,16 @@
-# Production readiness review — 0.12.2
+# Production readiness review — 0.12.3
 
 Reviewed 16 October 2026. This is a release candidate assessment, not a claim that every device, provider or handwriting format has been validated.
+
+## 0.12.3 findings
+
+| Priority | Finding | Fix and evidence |
+| --- | --- | --- |
+| Medium | Expanded Satsang children exposed the full cleanup and page-range forms inline, making the notebook list hard to scan. | Keep child rows to title, progress, pause and details. Open dedicated **Clean up document** and **Re-recognize pages** workflows from the details/configuration view. The final rendered-browser fixture covers these screens. |
+| Medium | Cleanup model choice and separate-copy destination needed to be clear, reviewable per run, and safe for the shared transcript. | Let users choose a cleanup model for this request; update its estimate without changing the saved recognition profile. Show a copy-path field only when **Save cleaned text as a separate copy** is enabled. Require a new Markdown file in the vault, outside Shared Data and the current transcript. Saving a copy leaves the canonical transcript's cleanup record unchanged. |
+| Medium | If the source or transcript changed while cleanup was in flight, users needed a way to recover the paid result without requesting cleanup again. | Retain the cleanup result in History when the current transcript cannot safely be replaced. Keep prior cleanup metadata under **Previous cleanup details**. The 0.12.3 suite passes 464/464 tests, type checking and the production build. No provider cleanup or re-recognition request is claimed. |
+
+The final synthetic browser checker passes 652 assertions across desktop, narrow desktop and Nomad-sized layouts, with zero browser errors or external requests. Per viewport, controlled success stubs exercised three cleanup completions and one re-recognition completion; no real recognition calls or production Obsidian/config access occurred. Screenshots use synthetic fixtures only. The 0.12.2 findings and release gates remain below as the previous candidate record.
 
 ## 0.12.2 findings
 

@@ -100,16 +100,29 @@ async function seedReviewCases(page, root, platform) {
         fingerprint: page.fingerprint, text: `Synthetic reflection page ${page.number}.`,
         recipe: "fixture", number: page.number,
       }])), status: "current", paused: false,
+      cleanup: { updatedAt: "2026-10-10T12:00:00.000Z", inputHash: "synthetic-cleanup-input", outputHash: "synthetic-cleanup-output", model: "gpt-5.6-sol", quality: "careful", provider: "api", basePages: desired.map((page) => ({ ...page })), stale: true },
     };
     c.aiEnabled = true;
     c.progress.running = false;
     c.progress.paused = false;
     c.actionCounters.cleanupDocument = 0;
     c.actionCounters.reprocessPages = 0;
-    c.cleanupEstimate = () => ({ pages: 2, requests: 1, usd: 0.001 });
-    c.reprocessEstimate = () => ({ pages: 2, requests: 1, usd: 0.001 });
-    c.cleanupDocument = async () => { c.actionCounters.cleanupDocument++; };
-    c.reprocessPages = async () => { c.actionCounters.reprocessPages++; };
+    c.workflowCapture = { cleanupEstimateModels: [], cleanupCalls: [], reprocessEstimates: [], reprocessCalls: [], deferCleanup: false, cleanupResolved: false };
+    c.cleanupEstimate = (source, options = {}) => {
+      c.workflowCapture.cleanupEstimateModels.push(options.model ?? "");
+      return { pages: 2, requests: 1, usd: options.model === "custom-fixture-model" ? 0.0032 : 0.001 };
+    };
+    c.reprocessEstimate = (source, range, outdatedOnly) => {
+      c.workflowCapture.reprocessEstimates.push({ source, range, outdatedOnly });
+      return { pages: range.trim() || outdatedOnly ? (range.trim() ? 2 : 1) : 0, requests: 1, usd: 0.001 };
+    };
+    c.cleanupDocument = async (source, options) => {
+      c.workflowCapture.cleanupCalls.push({ source, ...options });
+      if (c.workflowCapture.deferCleanup) await new Promise((resolve) => {
+        c.workflowCapture.resolveCleanup = () => { c.workflowCapture.cleanupResolved = true; resolve(); };
+      });
+    };
+    c.reprocessPages = async (source, range, outdatedOnly) => { c.workflowCapture.reprocessCalls.push({ source, range, outdatedOnly }); };
     const pendingPageCount = (state) => state.desired.filter((page) =>
       (state.forcePending?.includes(page.id) || state.pages[page.id]?.fingerprint !== page.fingerprint) &&
       state.pageIssues?.[page.id]?.fingerprint !== page.fingerprint,
@@ -270,10 +283,14 @@ async function inspectViewport(platform, viewport, label) {
   const child = root.locator(".st-folder-contents .st-notebook-child").filter({ hasText: "Reflection" }).first();
   await child.waitFor();
   check(await child.locator('button[aria-label^="Pause"], button[aria-label^="Resume"]').count() === 1, `${label}: Satsang child pause action missing`);
-  const childCleanup = child.getByRole("button", { name: "Clean up document", exact: true });
-  check(await childCleanup.isVisible() && !(await childCleanup.isDisabled()), `${label}: Satsang child cleanup action missing or disabled`);
-  check(await child.getByRole("button", { name: "Re-recognize selected pages", exact: true }).isVisible(), `${label}: Satsang child reprocess action missing`);
+  check(await child.getByRole("button", { name: "Details", exact: true }).isVisible(), `${label}: Satsang child Details action missing`);
+  check(await child.locator(".st-document-actions, .st-cleanup-task, .st-reprocess-task, .st-cleanup-previous").count() === 0, `${label}: expanded home child renders full actions or cleanup metadata`);
   await screenshot("satsang-expanded-child-actions");
+  await child.getByRole("button", { name: "Details", exact: true }).click();
+  await root.locator(".st-detail-controls").waitFor();
+  check(await root.locator(".st-detail-controls").getByRole("button", { name: "Clean up document", exact: true }).isVisible(), `${label}: child Details does not expose the cleanup workflow launch`);
+  await root.getByRole("button", { name: "Back", exact: true }).click();
+  await root.locator(".st-folder-contents .st-notebook-child").filter({ hasText: "Reflection" }).first().waitFor();
 
   // Queue navigation and status view.
   await root.getByRole("button", { name: "Queue", exact: true }).click();
@@ -550,6 +567,24 @@ async function inspectViewport(platform, viewport, label) {
   check(chooserBounds.x >= fieldBounds.x - 2 && buttonRight <= bodyRight - 2, `${label}: output folder button misaligned relative to field/body: ${JSON.stringify({ chooserBounds, fieldBounds, bodyBounds })}`);
   check(!(chooserBounds.x < inputBounds.x + inputBounds.width && buttonRight > inputBounds.x && chooserBounds.y < inputBounds.y + inputBounds.height && buttonBottom > inputBounds.y), `${label}: output folder button overlaps the text input`);
   if (platform === "desktop" && viewport.width >= 701) check(Math.abs((chooserBounds.y + chooserBounds.height / 2) - (inputBounds.y + inputBounds.height / 2)) <= 2, `${label}: output folder Browse button is not center-aligned with the input: ${JSON.stringify({ chooserBounds, inputBounds })}`);
+  const editorActions = root.locator(".st-notebook-actions");
+  check(await editorActions.getByRole("button", { name: "Clean up document", exact: true }).isVisible(), `${label}: single-note source settings lack cleanup launch action`);
+  check(await editorActions.getByRole("button", { name: "Re-recognize pages", exact: true }).isVisible(), `${label}: single-note source settings lack reprocess launch action`);
+  check(await editorActions.locator(".st-cleanup-task, .st-reprocess-task, .st-cleanup-previous").count() === 0, `${label}: source settings render full action forms or cleanup metadata inline`);
+  await editorActions.getByRole("button", { name: "Clean up document", exact: true }).click();
+  await root.locator(".st-cleanup-workflow").waitFor();
+  await root.getByRole("button", { name: "Cancel", exact: true }).click();
+  check(await root.locator(".st-form .st-source-title").innerText() === "Reflection", `${label}: cleanup Cancel did not return to source settings`);
+  await root.locator(".st-notebook-actions").getByRole("button", { name: "Re-recognize pages", exact: true }).click();
+  await root.locator(".st-reprocess-workflow").waitFor();
+  await root.getByRole("button", { name: "Cancel", exact: true }).click();
+  check(await root.locator(".st-form .st-source-title").innerText() === "Reflection", `${label}: reprocess Cancel did not return to source settings`);
+  const outputPathInput = root.locator(".st-output-folder-field input");
+  const savedOutputPath = await outputPathInput.inputValue();
+  await outputPathInput.fill(`${savedOutputPath}-draft`);
+  await root.locator(".st-notebook-actions").getByRole("button", { name: "Clean up document", exact: true }).click();
+  check(await root.locator(".st-cleanup-workflow").count() === 0 && await root.locator(".st-form .st-source-title").innerText() === "Reflection", `${label}: unsaved source settings did not guard workflow launch`);
+  await outputPathInput.fill(savedOutputPath);
   await screenshot("reflection-editor");
   await chooseFolder.click();
   await root.locator(".st-output-browser").waitFor();
@@ -560,21 +595,133 @@ async function inspectViewport(platform, viewport, label) {
   await root.getByRole("button", { name: "Cancel", exact: true }).waitFor();
   await root.getByRole("button", { name: "Cancel", exact: true }).click();
 
-  // Open standalone notebook detail and assert actions are outside any collapsed Advanced section.
+  // Open standalone notebook detail, then inspect cleanup and reprocess in dedicated workflows.
   await root.locator('article.st-rule-row[role="button"]').filter({ hasText: "Reflection" }).last().click();
   await root.locator(".st-detail-controls").waitFor();
   const detail = root.locator(".st-detail-controls");
   check(await detail.locator(".st-notebook-advanced").count() === 0, `${label}: single-note detail still has a separate Advanced disclosure`);
   const cleanup = detail.getByRole("button", { name: "Clean up document", exact: true });
-  const reprocess = detail.getByRole("button", { name: "Re-recognize selected pages", exact: true });
-  check(await cleanup.isVisible() && !(await cleanup.evaluate((button) => !!button.closest("details"))), `${label}: cleanup action is not directly visible`);
-  check(await reprocess.isVisible() && !(await reprocess.evaluate((button) => !!button.closest("details"))), `${label}: reprocess action is not directly visible`);
-  check(!(await cleanup.isDisabled()) && !(await reprocess.isDisabled()), `${label}: complete standalone note cleanup/reprocess action is disabled`);
-  const helpLabel = detail.getByRole("button", { name: "Help: Clean up document", exact: true });
-  await helpLabel.focus();
-  await page.keyboard.press("Enter");
-  check(await helpLabel.getAttribute("aria-expanded") === "true", `${label}: document action help is not keyboard-operable`);
-  check(await detail.locator(".st-help-text:visible").count() === 1, `${label}: opening one help action expands too much inline text`);
+  const reprocess = detail.getByRole("button", { name: "Re-recognize pages", exact: true });
+  check(await cleanup.isVisible() && await reprocess.isVisible(), `${label}: detail action launch buttons are missing`);
+  check(await detail.locator(".st-cleanup-task, .st-reprocess-task, .st-cleanup-previous").count() === 0, `${label}: detail renders full action forms or cleanup metadata inline`);
+  const initialConfig = await page.evaluate(() => JSON.stringify(window.__streamlinedFixture.controller.config));
+  await cleanup.click();
+  const cleanupFlow = root.locator(".st-cleanup-workflow");
+  await cleanupFlow.waitFor();
+  check(await cleanupFlow.getByText(/Estimated cleanup: 2 pages · 1 request · about \$0\.0010/).isVisible(), `${label}: cleanup estimate is missing or not based on the selected model`);
+  check(await cleanupFlow.locator(".st-cleanup-previous").count() === 1 && !(await cleanupFlow.locator(".st-cleanup-previous").evaluate((details) => details.open)), `${label}: previous cleanup metadata is not in a collapsed details section`);
+  check(await cleanupFlow.locator(".st-cleanup-copy-field").isHidden(), `${label}: copy path is visible while save-as-copy is off`);
+  check(await cleanupFlow.locator(".st-cleanup-destination-path").innerText() === "Fixture Output/Reflection", `${label}: default cleanup destination is not the canonical transcript`);
+  await assertLayout("Cleanup workflow");
+  await screenshot("cleanup-workflow");
+  const model = cleanupFlow.getByLabel("Cleanup model", { exact: true });
+  await model.selectOption("__custom__");
+  const customModel = cleanupFlow.getByPlaceholder("Enter model name");
+  await customModel.fill("");
+  check(await root.getByText("Choose a valid cleanup model.", { exact: true }).isVisible(), `${label}: empty custom cleanup model has no specific disabled reason`);
+  check(await root.getByRole("button", { name: "Clean up document", exact: true }).isDisabled(), `${label}: cleanup can run with an empty custom model`);
+  await customModel.fill("custom-fixture-model");
+  check(await cleanupFlow.getByText(/about \$0\.0032/).isVisible(), `${label}: cleanup estimate did not refresh for the custom model`);
+  check(await root.getByRole("button", { name: "Clean up document", exact: true }).isEnabled(), `${label}: cleanup remains disabled after entering a valid custom model`);
+  await model.selectOption("gpt-6-luna");
+  const copyToggle = cleanupFlow.locator('input[data-testid="cleanup-save-copy"]');
+  await copyToggle.check();
+  const copyPath = cleanupFlow.getByLabel("Copy path", { exact: true });
+  check(await copyPath.isVisible() && (await copyPath.inputValue()).endsWith("(cleaned).md"), `${label}: enabled copy path did not show its default sibling path`);
+  check(await cleanupFlow.locator(".st-cleanup-destination").isHidden(), `${label}: save-as-copy repeats its destination below the editable path: ${JSON.stringify(await cleanupFlow.locator(".st-cleanup-destination").evaluate((node) => ({ hidden: node.hidden, display: getComputedStyle(node).display })))}`);
+  await screenshot("cleanup-save-copy-workflow");
+  await assertLayout("Cleanup save-as-copy workflow");
+  await copyPath.fill("");
+  check(await root.getByText("Enter a path for the cleaned copy.", { exact: true }).isVisible() && await root.getByRole("button", { name: "Clean up document", exact: true }).isDisabled(), `${label}: empty copy path lacks a specific disabled reason`);
+  await copyPath.fill("Fixture Output/Reflection (reviewed).md");
+  check(await copyPath.inputValue() === "Fixture Output/Reflection (reviewed).md", `${label}: editable copy destination did not retain the entered path`);
+  await copyToggle.uncheck();
+  check(await cleanupFlow.locator(".st-cleanup-copy-field").isHidden() && await cleanupFlow.locator(".st-cleanup-destination").isVisible() && await cleanupFlow.locator(".st-cleanup-destination-path").innerText() === "Fixture Output/Reflection", `${label}: disabling save-as-copy did not hide the path and restore canonical destination`);
+  await root.getByRole("button", { name: "Cancel", exact: true }).click();
+  check(await root.locator(".st-detail-controls").isVisible(), `${label}: cleanup Cancel did not return to notebook detail`);
+  await reprocess.click();
+  const reprocessFlow = root.locator(".st-reprocess-workflow");
+  await reprocessFlow.waitFor();
+  check(await root.getByText("Enter pages or choose outdated pages.", { exact: true }).isVisible(), `${label}: empty reprocess range has no specific disabled reason`);
+  check(await root.getByRole("button", { name: "Re-recognize selected pages", exact: true }).isDisabled(), `${label}: reprocess can run without a page selection`);
+  const pageRange = reprocessFlow.getByLabel("Pages", { exact: true });
+  await pageRange.fill("1-2");
+  check(await reprocessFlow.getByText(/2 selected pages · 1 request/).isVisible() && await root.getByRole("button", { name: "Re-recognize selected pages", exact: true }).isEnabled(), `${label}: valid reprocess range did not refresh estimate or enable Run`);
+  await screenshot("reprocess-workflow");
+  await assertLayout("Reprocess workflow");
+  await root.getByRole("button", { name: "Cancel", exact: true }).click();
+  check(await root.locator(".st-detail-controls").isVisible(), `${label}: reprocess Cancel did not return to notebook detail`);
+  const afterCancel = await page.evaluate(() => {
+    const c = window.__streamlinedFixture.controller;
+    const state = Object.values(c.store.notebooks).find((item) => item.ruleId === "reflection-single");
+    return { config: JSON.stringify(c.config), output: state.output, cleanup: JSON.stringify(state.cleanup), counters: { ...c.actionCounters } };
+  });
+  check(afterCancel.config === initialConfig, `${label}: cancelled workflows changed saved source or model configuration`);
+  check(afterCancel.output === "Fixture Output/Reflection" && afterCancel.cleanup.includes("synthetic-cleanup-output"), `${label}: cancelled workflows changed transcript destination or cleanup receipt`);
+  check(afterCancel.counters.cleanupDocument === 0 && afterCancel.counters.reprocessPages === 0 && afterCancel.counters.saveConfig === 0, `${label}: opening/cancelling an action workflow invoked an action or saved settings`);
+  const blockedAiState = await page.evaluate(() => {
+    const c = window.__streamlinedFixture.controller;
+    const wasEnabled = c.aiEnabled;
+    c.aiEnabled = false;
+    c.notify();
+    return wasEnabled;
+  });
+  await detail.getByRole("button", { name: "Clean up document", exact: true }).click();
+  check(await root.locator(".st-cleanup-workflow").isVisible() && await root.getByText("Turn on AI recognition in Settings to run this action.", { exact: true }).isVisible() && await root.getByRole("button", { name: "Clean up document", exact: true }).isDisabled(), `${label}: AI-off cleanup form is not inspectable with an actionable disabled reason`);
+  await root.getByRole("button", { name: "Cancel", exact: true }).click();
+  await page.evaluate((enabled) => { const c = window.__streamlinedFixture.controller; c.aiEnabled = enabled; c.notify(); }, blockedAiState);
+  const wasPaused = await page.evaluate(() => {
+    const c = window.__streamlinedFixture.controller;
+    const state = Object.values(c.store.notebooks).find((item) => item.ruleId === "reflection-single");
+    const prior = state.paused;
+    state.paused = true;
+    c.notify();
+    return prior;
+  });
+  await root.locator(".st-detail-controls").getByRole("button", { name: "Clean up document", exact: true }).click();
+  check(await root.getByText("Resume this notebook before running it.", { exact: true }).isVisible() && await root.getByRole("button", { name: "Clean up document", exact: true }).isDisabled(), `${label}: paused cleanup is not inspectable with a specific disabled reason`);
+  await root.getByRole("button", { name: "Cancel", exact: true }).click();
+  await page.evaluate((paused) => { const c = window.__streamlinedFixture.controller; const state = Object.values(c.store.notebooks).find((item) => item.ruleId === "reflection-single"); state.paused = paused; c.notify(); }, wasPaused);
+  const removedPage = await page.evaluate(() => {
+    const c = window.__streamlinedFixture.controller;
+    const state = Object.values(c.store.notebooks).find((item) => item.ruleId === "reflection-single");
+    const page = state.pages[state.desired[0].id];
+    delete state.pages[state.desired[0].id];
+    c.notify();
+    return page;
+  });
+  await root.locator(".st-detail-controls").getByRole("button", { name: "Clean up document", exact: true }).click();
+  check(await root.getByText("Recognize all pages before cleanup.", { exact: true }).isVisible() && await root.getByRole("button", { name: "Clean up document", exact: true }).isDisabled(), `${label}: incomplete cleanup is not inspectable with a specific disabled reason`);
+  await root.getByRole("button", { name: "Cancel", exact: true }).click();
+  await page.evaluate((page) => {
+    const c = window.__streamlinedFixture.controller;
+    const state = Object.values(c.store.notebooks).find((item) => item.ruleId === "reflection-single");
+    state.pages[page.id] = page;
+    for (const descriptor of state.desired) state.pages[descriptor.id] ??= {
+      fingerprint: descriptor.fingerprint, text: `Synthetic reflection page ${descriptor.number}.`, recipe: "fixture", number: descriptor.number,
+    };
+    c.notify();
+  }, removedPage);
+  await detail.getByRole("button", { name: "Clean up document", exact: true }).click();
+  await root.locator(".st-cleanup-workflow").waitFor();
+  check(await root.getByRole("button", { name: "Clean up document", exact: true }).isEnabled(), `${label}: restored complete cleanup is still disabled: ${await root.locator(".st-cleanup-workflow").innerText()}`);
+  await root.getByRole("button", { name: "Clean up document", exact: true }).click();
+  await detail.waitFor();
+  check(await root.locator(".st-cleanup-workflow").count() === 0, `${label}: successful cleanup did not redraw the returned detail screen`);
+  await detail.getByRole("button", { name: "Clean up document", exact: true }).click();
+  check(await root.getByRole("button", { name: "Clean up document", exact: true }).isEnabled(), `${label}: successful cleanup left its run control busy`);
+  await root.getByRole("button", { name: "Cancel", exact: true }).click();
+  await detail.getByRole("button", { name: "Re-recognize pages", exact: true }).click();
+  await root.locator(".st-reprocess-workflow").waitFor();
+  await root.locator(".st-reprocess-workflow").getByLabel("Pages", { exact: true }).fill("1");
+  await root.getByRole("button", { name: "Re-recognize selected pages", exact: true }).click();
+  await detail.waitFor();
+  check(await root.locator(".st-reprocess-workflow").count() === 0, `${label}: successful reprocess did not redraw the returned detail screen`);
+  await detail.getByRole("button", { name: "Re-recognize pages", exact: true }).click();
+  check(await root.getByRole("button", { name: "Re-recognize selected pages", exact: true }).isVisible(), `${label}: successful reprocess left its workflow busy`);
+  await root.getByRole("button", { name: "Cancel", exact: true }).click();
+  const stubCompletionCalls = await page.evaluate(() => ({ ...window.__streamlinedFixture.controller.workflowCapture }));
+  check(stubCompletionCalls.cleanupCalls.length === 1 && stubCompletionCalls.reprocessCalls.length === 1, `${label}: expected only the explicitly controlled workflow success stubs to run: ${JSON.stringify(stubCompletionCalls)}`);
   await assertLayout("Reflection detail");
   await screenshot("reflection-detail-actions");
   const actionCounts = await page.evaluate(() => ({ ...window.__streamlinedFixture.controller.actionCounters }));
@@ -582,6 +729,36 @@ async function inspectViewport(platform, viewport, label) {
 
   // Satsang folder editor, with the folder scope and chooser also available at narrow widths.
   await root.getByRole("button", { name: "Back", exact: true }).click();
+  const reflectionConfigure = root.locator('button.st-edit[data-config-id="reflection-single"]');
+  check(await reflectionConfigure.isVisible(), `${label}: standalone Reflection Configure button missing`);
+  await reflectionConfigure.click();
+  await root.locator(".st-notebook-actions").waitFor();
+  await page.evaluate(() => { window.__streamlinedFixture.controller.workflowCapture.deferCleanup = true; });
+  await root.locator(".st-notebook-actions").getByRole("button", { name: "Clean up document", exact: true }).click();
+  await root.locator(".st-cleanup-workflow").waitFor();
+  await root.getByRole("button", { name: "Clean up document", exact: true }).click();
+  await root.getByRole("button", { name: "Settings", exact: true }).click();
+  await root.locator(".st-form").waitFor();
+  await page.evaluate(() => window.__streamlinedFixture.controller.workflowCapture.resolveCleanup?.());
+  await page.waitForFunction(() => window.__streamlinedFixture.controller.workflowCapture.cleanupResolved);
+  check(await root.locator(".st-form").isVisible() && await root.locator(".st-cleanup-workflow").count() === 0, `${label}: completed cleanup pulled the user back from Settings`);
+  await root.getByRole("button", { name: "Close settings", exact: true }).click();
+  await root.locator(".st-cleanup-workflow").waitFor();
+  await root.getByRole("button", { name: "Cancel", exact: true }).click();
+  check(await root.locator(".st-notebook-actions").isVisible(), `${label}: cancelled pending cleanup did not return to source settings`);
+  await page.evaluate(() => { window.__streamlinedFixture.controller.workflowCapture.deferCleanup = false; });
+  await root.locator(".st-notebook-actions").getByRole("button", { name: "Clean up document", exact: true }).click();
+  await root.getByRole("button", { name: "Clean up document", exact: true }).click();
+  await root.locator(".st-notebook-actions").waitFor();
+  check(await root.locator(".st-notebook-actions").isVisible(), `${label}: successful cleanup did not return to source settings`);
+  await root.locator(".st-notebook-actions").getByRole("button", { name: "Clean up document", exact: true }).click();
+  check(await root.getByRole("button", { name: "Clean up document", exact: true }).isEnabled(), `${label}: successful source-settings cleanup left the run button busy`);
+  await root.getByRole("button", { name: "Cancel", exact: true }).click();
+  await root.locator(".st-form .st-source-title").waitFor();
+  await root.getByRole("button", { name: "Cancel", exact: true }).click();
+  await root.locator('button.st-edit[data-config-id="research-source"]').waitFor();
+  const successfulStubs = await page.evaluate(() => ({ cleanup: window.__streamlinedFixture.controller.workflowCapture.cleanupCalls.length, reprocess: window.__streamlinedFixture.controller.workflowCapture.reprocessCalls.length }));
+  check(successfulStubs.cleanup === 3 && successfulStubs.reprocess === 1, `${label}: controlled success path stubs did not run the expected cleanup/reprocess count: ${JSON.stringify(successfulStubs)}`);
   const satsangConfigure = root.locator('button.st-edit[data-config-id="research-source"]');
   check(await satsangConfigure.isVisible(), `${label}: Satsang folder Configure button missing`);
   await satsangConfigure.click();
@@ -594,7 +771,8 @@ async function inspectViewport(platform, viewport, label) {
   check(finalCounters.cleanupDocument === 0 && finalCounters.reprocessPages === 0 && finalCounters.update === 0, `${label}: fixture action counters changed unexpectedly: ${JSON.stringify(finalCounters)}`);
   check(errors.length === 0, `${label}: browser errors: ${errors.join("; ")}`);
   check(externalRequests.length === 0, `${label}: fixture attempted external requests: ${externalRequests.join(", ")}`);
-  reports.push({ label, viewport, browserErrors: errors, externalRequests, syntheticActionCounts: finalCounters });
+  const successfulWorkflowStubs = await page.evaluate(() => ({ cleanup: window.__streamlinedFixture.controller.workflowCapture.cleanupCalls.length, reprocess: window.__streamlinedFixture.controller.workflowCapture.reprocessCalls.length }));
+  reports.push({ label, viewport, browserErrors: errors, externalRequests, syntheticActionCounts: finalCounters, successfulWorkflowStubs });
   await browser.close();
 }
 

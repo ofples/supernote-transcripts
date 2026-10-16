@@ -1,6 +1,6 @@
 # Interface examples
 
-These are captures of the plugin UI rendered from synthetic fixtures for the 0.12.2 working tree. The final fixture run reported 469 assertions across desktop, narrow desktop, and Nomad-sized layouts, with no production Obsidian use, external requests, recognition calls, browser errors, or fixture mutations. The notebook labels and paths are fixture display values; no notebook contents, account data, tokens, settings profiles, or reading positions are included. These screenshots show layout and controls; they do not establish release status or live Nomad validation.
+These are captures of the plugin UI rendered from synthetic fixtures for the 0.12.3 working tree. The final fixture run reported 652 assertions across desktop, narrow desktop, and Nomad-sized layouts, with no production Obsidian/config use, external requests, or real recognition calls. Per viewport, controlled success stubs exercised three cleanup completions and one re-recognition completion; they did not contact a provider. The notebook labels and paths are fixture display values; no notebook contents, account data, tokens, settings profiles, or reading positions are included. These screenshots show layout and controls; they do not establish release status or live Nomad validation.
 
 ## Sources overview
 
@@ -17,6 +17,28 @@ The source editor shows a single-notebook source and the aligned Markdown output
 The narrow layout stacks the output path and folder button while keeping both aligned to the form's right edge.
 
 ![Synthetic narrow desktop source editor showing the aligned output-folder control](source-editor-narrow.png)
+
+## Notebook actions
+
+Expanded notebook children keep their row focused on the notebook name, progress and available actions. Open **Details** to reach document workflows.
+
+![Synthetic Sources view with compact expanded notebook children and Details actions](notebook-child-actions-desktop.png)
+
+The notebook Details view opens the separate cleanup and page re-recognition workflows.
+
+![Synthetic notebook Details view with separate Cleanup and Re-recognize actions](notebook-details-actions-desktop.png)
+
+## Transcript workflows
+
+Cleanup is a text-only operation with a per-run model and estimate. **Save cleaned text as a separate copy** reveals a new Markdown path field; the original transcript remains unchanged.
+
+![Synthetic Cleanup workflow showing the model and estimate](cleanup-workflow-desktop.png)
+
+![Synthetic Cleanup workflow with the separate-copy path enabled](cleanup-save-copy-desktop.png)
+
+Re-recognition accepts selected page numbers or ranges and shows the expected work before the request.
+
+![Synthetic Re-recognize pages workflow with range and estimate](reprocess-workflow-desktop.png)
 
 ## Queue estimate
 

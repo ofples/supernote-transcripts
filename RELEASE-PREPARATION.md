@@ -4,7 +4,7 @@
 
 | Component | Source | Candidate | Installation boundary |
 | --- | --- | --- | --- |
-| Supernote Transcripts | `ofples/supernote-transcripts` | 0.12.2 | Standalone plugin; no theme or reader requirement |
+| Supernote Transcripts | `ofples/supernote-transcripts` | 0.12.3 | Standalone plugin; no theme or reader requirement |
 | MD Reader fork | `ofples/obsidian-md-reader` | 2.1.2 | Optional pagination; replaces upstream under the same `md-reader` ID |
 | Paper | `ofples/obsidian-paper` | 0.5.10 | Optional theme |
 | Sidebar | Paper repository, separate plugin | 0.4.1 | Optional navigation; normal Markdown fallback without a reader |
@@ -22,7 +22,7 @@ See [the integration contract and fallback matrix](INTEGRATION.md).
 
 ## Verified source checks
 
-- Transcripts 0.12.2: **460/460 tests**, TypeScript checking and the final synthetic browser checker (**469 assertions**) pass across wide desktop, narrow desktop and Nomad layouts, with no outbound requests, recognition calls or fixture mutations. Production build and device activation evidence are pending the coordinating agent's final record. [Readiness findings](PRODUCTION-READINESS.md) document the inventory, Careful-mode and Force update changes; [user documentation](docs/installation.md) includes setup and synthetic screenshots.
+- Transcripts 0.12.3: **464/464 tests**, TypeScript checking, production build, and the final synthetic browser checker (**652 assertions**) pass. The browser fixtures recorded no errors or external requests. Per viewport, controlled synthetic success stubs covered three cleanup completions and one re-recognition completion; no real provider request or production Obsidian/config access is claimed. Desktop and Nomad candidate activation evidence remains pending. [Readiness findings](PRODUCTION-READINESS.md) document the dedicated cleanup and re-recognition workflows; [user documentation](docs/installation.md) includes setup and synthetic screenshots.
 - Canonical Reader 2.1.2 at `2c05d4b0a8d2ec2dcb3e7be6b553947302efdbe3`: 123 logic and 113 UI checks pass.
 - A headless Chromium check combines the actual Reader chapter renderer with the actual Transcripts adapter, without Paper or Sidebar. It checks inline chips, provider unload, disabled and unsupported adapters, and partial-render errors with ordinary Markdown fallback.
 - Paper's coordinated source checks: offline build, all pinned Reader hashes, 24 Node tests and 10 synthetic Chromium component/fullscreen combinations pass. These synthetic checks are not live Obsidian or device acceptance.
@@ -35,4 +35,4 @@ Source and fixture checks cover optional provider absence, disabled/legacy/incom
 
 Keep public release tags, repository visibility changes and device deployment separate from this preparation. The user selected MIT for Paper/Sidebar's original code on 2026-10-16; the Paper repository owns that license implementation and its distribution notices. MD Reader's MIT attribution, Transcripts' GPL-3.0-or-later and the fonts' SIL OFL notices remain separate.
 
-Desktop and Nomad Transcripts **0.12.2** are installed and active, with matching approved artifact hashes and successful guarded preservation checks. Both queues remain paused and no recognition was requested during this pass. Live settings propagation, provider-quality testing of the new pipeline, handwriting-edit/native Cloud upload, and foreground desktop page-viewer checks from [workflow validation](VALIDATION.md) remain open. See [the cumulative checklist](FEEDBACK-TRACKER.md).
+Desktop and Nomad Transcripts **0.12.3** are installed and active, with matching approved artifact hashes and successful guarded preservation checks. Both queues remain paused and no recognition was requested during this installation pass. Live settings propagation, provider-quality testing of the new pipeline, handwriting-edit/native Cloud upload, and foreground desktop page-viewer checks from [workflow validation](VALIDATION.md) remain open. See [the cumulative checklist](FEEDBACK-TRACKER.md).

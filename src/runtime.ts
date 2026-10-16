@@ -2407,20 +2407,28 @@ export default class SupernoteTranscripts extends Plugin implements Controller {
     if(!numbers.length)throw Error(outdatedOnly?"All selected pages already use the current recognition settings.":"Enter pages such as 3, 8-12.");
     await this.manual(source,numbers,true,numbers.map(n=>state.desired[n-1].id));
   }
-  cleanupEstimate(source: string) {
+  private cleanupProfile(profile:Profile,model?:string):Profile {
+    const selected=model===undefined?profile.model:model.trim();
+    if(!selected||selected.length>200||/[\u0000-\u001f]/.test(selected))throw Error("Choose a valid cleanup model.");
+    return {...profile,model:selected,quality:"careful"};
+  }
+  cleanupEstimate(source: string, options:{model?:string}={}) {
     const state=this.store.notebooks[source],rule=ruleFor(source,this.config.rules),profile=this.config.profiles.find(p=>p.id===rule?.profileId);
     if(!state||!profile)return {pages:0,requests:0,samples:0,provisional:true};
     const chars=buildMarkdown(state,false).length+profile.prompt.length+profile.glossaries.length*4000;
     const output=Math.min(128000,Math.max(8192,Math.ceil(chars/2)+8192));
-    const price=this.provider==="api"?priceFor(profile.endpoint,profile.model,this.costs.settings):undefined;
+    const selected=this.cleanupProfile(profile,options.model);
+    const price=this.provider==="api"?priceFor(selected.endpoint,selected.model,this.costs.settings):undefined;
     return {pages:state.desired.length,requests:1,samples:0,provisional:true,
       ...(price?{usd:((chars/2+1000)*price.input+output*price.output)/1e6}:{} )};
   }
-  async cleanupDocument(source: string, options: {saveCopy?:boolean} = {}) {
+  async cleanupDocument(source: string, options: {saveCopy?:boolean;copyPath?:string;model?:string} = {}) {
+    options={...options};
     this.assertStateReady();this.assertAttemptStorageReady();
     if(this.task)throw Error("Pause and wait for active requests before cleaning a document.");
     await this.refreshSharedSettings();
     this.assertSharedSettings(source);
+    if(this.task)throw Error("Pause and wait for active requests before cleaning a document.");
     if(!this.aiEnabled)throw Error("Switch on AI recognition before cleaning a document.");
     const original=this.store.notebooks[source],rule=ruleFor(source,this.config.rules);
     if(!original||!rule||!this.sourceSelected(source))throw Error("Choose an enabled notebook with a mirrored transcript.");
@@ -2431,6 +2439,14 @@ export default class SupernoteTranscripts extends Plugin implements Controller {
     this.setPaused(false);
     const operation=(async()=>{
       const resolved=await this.profile(rule.profileId),state=clone(original),reader=this.reader(false);
+      const cleanupProfile=this.cleanupProfile(resolved.profile,options.model);
+      const explicitCopy=options.saveCopy&&options.copyPath!==undefined?options.copyPath.trim():undefined;
+      if(explicitCopy!==undefined){
+        validateDestination(explicitCopy);
+        if(!/\.md$/i.test(explicitCopy)||/[<>:"|?*]/.test(explicitCopy)||isSharedPath(explicitCopy.toLowerCase(),"supernote transcripts/shared data")||explicitCopy.toLowerCase()===state.output.toLowerCase())
+          throw Error("Choose a new Markdown copy path inside this vault, outside Shared Data and the original transcript.");
+        if(await this.app.vault.adapter.exists(explicitCopy))throw Error("The cleanup copy destination already exists. Choose a new path.");
+      }
       if(state.desired.some(p=>state.pages[p.id]?.fingerprint!==p.fingerprint))throw Error("Finish AI recognition for every page before cleaning the complete document. Device OCR remains readable meanwhile.");
       const current=await this.app.vault.adapter.read(state.output);
       if(!isManagedTranscript(current))throw Error("Cleanup is available only for this notebook's generated transcript.");
@@ -2442,7 +2458,7 @@ export default class SupernoteTranscripts extends Plugin implements Controller {
       const signature=signatureNow();
       const prompt=cleanupInput(state,current,resolved.profile.prompt,resolved.reference);
       if(prompt.length>400000)throw Error("This document and its references exceed the single-pass cleanup size limit. No request was sent.");
-      const cleanupRecipe=`cleanup:${await hash(JSON.stringify([resolved.recipe,prompt]))}`;
+      const cleanupRecipe=`cleanup:${await hash(JSON.stringify([resolved.recipe,cleanupProfile.model,prompt]))}`;
       const assertCurrent=async()=>{
         if(this.store.notebooks[source]!==original||signatureNow()!==signature||(await this.profile(rule.profileId)).recipe!==resolved.recipe||await reader.revision(source)!==revision||await this.app.vault.adapter.read(state.output)!==current)
           throw Error("The notebook, its settings, or transcript changed during cleanup. Current text was preserved.");
@@ -2452,8 +2468,8 @@ export default class SupernoteTranscripts extends Plugin implements Controller {
       try {
         if(shared){lease=await shared.acquire(id);if(!lease)throw Error("Another device is updating this notebook. Try cleanup after it finishes.");heartbeat=setInterval(()=>{void shared.heartbeat(lease!).then(ok=>{if(!ok)lost=true;}).catch(()=>{lost=true;});},30000);}
         await assertCurrent();
-        const request={targets:state.desired,images:[] as {label:string;image:string}[],prompt,textOnly:true,usedModel:resolved.profile.model,maxOutputTokens:Math.min(128000,Math.max(8192,Math.ceil(current.length/2)+8192))};
-        const raw=await this.transcribe("",1,{...resolved.profile,quality:"careful"},resolved.reference,source,cleanupRecipe,async()=>{await assertCurrent();if(lost||shared&&lease&&!await shared.checkLease(lease))throw Error("Another device took priority. No cleanup request was sent.");return true;},undefined,request);
+        const request={targets:state.desired,images:[] as {label:string;image:string}[],prompt,textOnly:true,usedModel:cleanupProfile.model,maxOutputTokens:Math.min(128000,Math.max(8192,Math.ceil(current.length/2)+8192))};
+        const raw=await this.transcribe("",1,cleanupProfile,resolved.reference,source,cleanupRecipe,async()=>{await assertCurrent();if(lost||shared&&lease&&!await shared.checkLease(lease))throw Error("Another device took priority. No cleanup request was sent.");if(explicitCopy!==undefined&&await this.app.vault.adapter.exists(explicitCopy))throw Error("The cleanup copy destination already exists. Choose a new path.");return true;},undefined,request);
         if(raw===null){this.stage("Cleanup cancelled","No cleanup was sent. Your transcript is unchanged.");return;}
         const cleaned=cleanupPages(raw,state);
         state.cleanedPages=cleaned;
@@ -2467,10 +2483,12 @@ export default class SupernoteTranscripts extends Plugin implements Controller {
         try {
         await assertCurrent();if(lost||shared&&lease&&!await shared.checkLease(lease))throw Error("Another device took priority while cleanup was running.");
         if(options.saveCopy){
-          const stem=state.output.replace(/\.md$/i,"");let copy=`${stem} (cleaned).md`,n=1;
-          while(await this.app.vault.adapter.exists(copy))copy=`${stem} (cleaned ${++n}).md`;
+          const stem=state.output.replace(/\.md$/i,"");let copy=explicitCopy??`${stem} (cleaned).md`,n=1;
+          if(explicitCopy!==undefined&&await this.app.vault.adapter.exists(copy))throw Error("The cleanup copy destination appeared while cleanup was running. Its current contents were preserved.");
+          if(explicitCopy===undefined)while(await this.app.vault.adapter.exists(copy))copy=`${stem} (cleaned ${++n}).md`;
+          await this.ensureFolder(copy);
           await this.app.vault.create(copy,text);
-          if(io)await new PublicationReceipts(io).save(id,text,state.desired,state.pages,this.presentationFor(state));
+          // A separate copy must not replace the canonical mirror's receipt.
           this.stage("Cleanup saved",`Cleaned copy: ${copy}`);
         } else {
           // Cache the paid result before writing. A failed publication can be recovered without another request.

@@ -96,9 +96,33 @@ Failed pages remain visible for review and are not retried automatically. Use **
 
 ## Maintain a transcript
 
-Open a notebook’s actions to see its page progress and saved transcript. **Clean up document** sends the existing transcript text for a text-only cleanup request; it does not resend notebook images. Review the estimate first. You can save the cleanup as a separate copy; otherwise the previous version is retained in history. Cleanup may alter text, so compare the result with the source before relying on it.
+Open a notebook’s details to see its progress and saved transcript. For a notebook inside a folder source, use the child row’s **Details** action to open the same view. Choose **Clean up document** or **Re-recognize pages** there to open the corresponding workflow.
 
-**Re-recognize pages** explicitly sends selected page images again. This may use provider credit and can replace transcript content for those pages. Save or copy important edits before re-recognizing. Re-recognition is not automatic after changing a prompt or model.
+![Synthetic expanded notebook children showing progress and the Details action](screenshots/notebook-child-actions-desktop.png)
+
+![Synthetic notebook Details view with separate Cleanup and Re-recognize actions](screenshots/notebook-details-actions-desktop.png)
+
+### Clean up a transcript
+
+Cleanup sends the existing transcript text for one text-only request; it does not resend notebook images. All notebook pages need saved recognition results before cleanup is available. Before you run it, choose a listed model or enter a custom model ID supported by your provider, then review the estimate. Changing the model applies only to this cleanup and updates its estimate; it does not change the notebook’s saved recognition profile.
+
+By default, cleanup replaces the current generated transcript after preserving the previous version in History. To keep a separate result, turn on **Save cleaned text as a separate copy** and choose a new Markdown file in the vault. The path must be a new `.md` file; it cannot be the existing transcript or a file under `Supernote Transcripts/Shared Data/`. Saving a copy leaves the current transcript and its cleanup record unchanged.
+
+If the transcript or notebook changes while cleanup is running, the paid result is kept in History so you can review it without sending another request. Check the cleaned text against the original handwriting before relying on it. Expand **Previous cleanup details** to see the model, quality, date, and whether the source text has changed since that cleanup.
+
+![Synthetic Cleanup workflow with per-run model choice, estimate and History details](screenshots/cleanup-workflow-desktop.png)
+
+*Example Cleanup workflow rendered from a synthetic fixture.*
+
+When the separate-copy option is on, the form shows the new path field and confirms the original transcript stays unchanged.
+
+![Synthetic Cleanup workflow with the optional new Markdown copy path](screenshots/cleanup-save-copy-desktop.png)
+
+### Re-recognize selected pages
+
+Choose **Re-recognize pages**, enter page numbers or ranges, and review the selection estimate. The option to limit the action to pages with outdated recognition helps avoid resending pages that already match the current settings. Re-recognition sends selected page images again, may use provider credit, and can replace transcript text for those pages. Save important manual edits before running it. Changing a prompt or model does not start re-recognition automatically.
+
+![Synthetic Re-recognize pages workflow with page range and selection estimate](screenshots/reprocess-workflow-desktop.png)
 
 When source pages change, use **Update** to detect and process the changes. Keep original notebooks and transcript backups until the new output is checked. Concurrent edits or delayed Sync can create conflicts; resolve conflicts after both devices finish syncing and preserve the copy you want.
 

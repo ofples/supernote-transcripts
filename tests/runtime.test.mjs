@@ -311,6 +311,48 @@ test("document cleanup uses one text-only high-reasoning request, backs up and p
   const history=[...f.files.entries()].filter(([path,text])=>path.startsWith("Supernote Transcripts/History/")&&path.endsWith(".md")&&text===before);assert.equal(history.length,1);
 });
 
+test("cleanup model override applies to this request, its estimate, and cleanup metadata only",async()=>{
+  const f=await populatedCleanupFixture(1),profile=f.plugin.config.profiles[0];
+  const price=f.plugin.costs.settings.prices.find(item=>item.model===profile.model);
+  f.plugin.saveCostSettings({...f.plugin.costs.settings,prices:[...f.plugin.costs.settings.prices,{...price,model:"test",input:25,output:30}]});
+  const standard=f.plugin.cleanupEstimate(source),alternate=f.plugin.cleanupEstimate(source,{model:"test"});
+  assert.ok(alternate.usd>standard.usd);
+  await f.plugin.cleanupDocument(source,{model:"test"});
+  assert.equal(f.calls.at(-1).model,"test");
+  assert.equal(f.plugin.store.notebooks[source].cleanup.model,"test");
+  assert.equal(profile.model,"gpt-6.1-sol");
+});
+
+test("cleanup can save to a validated explicit nested vault copy path",async()=>{
+  const f=fixture(1);sharing(f,"cleanup-copy");f.plugin.config.continuous=true;enableCleanupApi(f);await f.plugin.update();cleanupResponse(f);
+  const state=f.plugin.store.notebooks[source],original=f.files.get(state.output),raw=structuredClone(state.pages),id=await notebookIdentity("linked-reflections","a.note"),receipts=new PublicationReceipts(f.plugin.sharedIO());
+  const canonicalReceipt=await receipts.find(id,original);assert.ok(canonicalReceipt);
+  const copyPath="Mirror/Cleaned/2026/a.md";
+  await f.plugin.cleanupDocument(source,{saveCopy:true,copyPath});
+  assert.ok(f.files.has("Mirror/Cleaned"));assert.ok(f.files.has("Mirror/Cleaned/2026"));
+  assert.match(f.files.get(copyPath),/clean page 1/);assert.equal(f.files.get(state.output),original);assert.deepEqual(state.pages,raw);
+  assert.deepEqual(await receipts.find(id,original),canonicalReceipt);
+  assert.equal(state.cleanup,undefined);
+});
+
+test("invalid explicit cleanup copy paths are rejected before any AI request",async()=>{
+  for(const copyPath of ["/absolute.md","C:/outside.md","../escape.md","Supernote Transcripts/Shared Data/shared.md","supernote transcripts/shared data/shared.md","Mirror/a.md","Mirror/already.md"]){
+    const f=await populatedCleanupFixture(1);f.files.set("Mirror/already.md","keep existing");const calls=f.calls.length;
+    await assert.rejects(f.plugin.cleanupDocument(source,{saveCopy:true,copyPath}),/path|vault|exist|reserved|copy|destination|shared/i,copyPath);
+    assert.equal(f.calls.length,calls,copyPath);assert.equal(f.files.get("Mirror/already.md"),"keep existing",copyPath);
+  }
+});
+
+test("a cleanup copy destination created during the paid request is preserved and result remains in History",async()=>{
+  const f=await populatedCleanupFixture(1),copyPath="Mirror/Cleaned/result.md";
+  let entered;const dispatched=new Promise(resolve=>{entered=resolve;});let release;const gate=new Promise(resolve=>{release=resolve;});
+  globalThis.__response=async request=>{const body=JSON.parse(request.body);f.calls.push(body);const prompt=body.input?.[0]?.content?.[0]?.text??"";if(prompt.includes("Clean this entire document")){entered();await gate;return answer(JSON.stringify({pages:[{number:1,text:"paid race result",joinPrevious:false}]}),body);}return answer("unused",body);};
+  const operation=f.plugin.cleanupDocument(source,{saveCopy:true,copyPath});await dispatched;
+  f.files.set(copyPath,"created concurrently");release();await assert.rejects(operation,/exist|changed|destination/i);
+  assert.equal(f.files.get(copyPath),"created concurrently");
+  assert.ok([...f.files.entries()].some(([path,text])=>path.startsWith("Supernote Transcripts/History/")&&path.endsWith("-cleanup-result.md")&&/paid race result/.test(text)));
+});
+
 test("cleanup output remains overlaid when pages append and only changed page cleanup is invalidated",async()=>{
   const f=await populatedCleanupFixture(2);await f.plugin.cleanupDocument(source);let state=f.plugin.store.notebooks[source];
   f.change([...state.desired,{id:"native:3",number:3,fingerprint:"f3"}]);await f.plugin.update();state=f.plugin.store.notebooks[source];

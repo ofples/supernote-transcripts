@@ -3,6 +3,16 @@
 This checklist is cumulative. Later feedback does not replace earlier requests.
 Source implementation, fixture checks, installed builds and live verification are separate states.
 
+## Notebook actions workflow — 0.12.3
+
+- [x] Keep expanded folder notebook rows compact; move cleanup and page-recognition forms into dedicated workflows reached through details/configuration.
+- [x] Open cleanup setup after **Clean up document**, with a per-run model selector, Save as copy and conditional copy path.
+- [x] Hide previous cleanup metadata behind Details rather than presenting it inline.
+- [x] Apply model overrides to the cleanup request/estimate without changing saved source settings.
+- [x] Validate explicit copy destinations before recognition; preserve a colliding file and the paid result if a destination appears during a request.
+- [x] Preserve the canonical transcript and publication receipt when saving a separate copy.
+- [x] Verify, install and document the workflow update; preserve notes/settings and keep test recognition mocked. Actual Nomad inspection passed; an unexpected desktop draft was left untouched.
+
 ## Follow-up fixes — 0.12.2
 
 - [x] Diagnose Careful re-recognition appearing stuck on page 29 using saved screenshot and local attempt records.
