@@ -2,7 +2,7 @@
 
 ## Current verification boundary
 
-Version 0.11 is active on Nomad and desktop Vedas. Quality choices remain source-specific or inherited from the General profile. Device OCR is a secondary hint in Balanced/Careful; Fast remains image-only. Whole-document cleanup is a separate explicit text-only operation. Automated provider tests use mocks. No real provider recognition or cleanup quality comparison was run, and no paid calls were made. Bounded live UI checks are still in progress; see [VALIDATION.md](VALIDATION.md).
+Version 0.11 is active on Nomad and desktop Vedas. Quality choices remain source-specific or inherited from the General profile. Device OCR is a secondary hint in Balanced/Careful; Fast remains image-only. Whole-document cleanup is a separate explicit text-only operation. Automated provider tests use mocks. Live settings checks passed on both devices, including quality/model controls and Cancel preservation. No real provider recognition or cleanup quality comparison was run, and no paid calls were made; see [VALIDATION.md](VALIDATION.md).
 
 Version 0.8 adds a three-position **Recognition quality** slider in each source's settings. Settings also has the default quality for the General profile. Quality changes apply to future requests; saving a setting does not force previously saved pages to run again.
 
