@@ -66,7 +66,7 @@ export function attentionReason(state) {
       error,
     )
   )
-    return "Update the local .note source, then retry.";
+    return "Sync the original notebook to this device, then choose Update or Resume on Sources.";
   if (
     /shared transcript.{0,100}(?:not arrived|not synchronized|not synced|conflict)|shared notebook claim could not be validated|wait for (?:source )?synchronization/i.test(
       error,

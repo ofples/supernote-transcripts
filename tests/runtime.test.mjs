@@ -2275,3 +2275,90 @@ test("saved deferred settings retain publication intent through transient failur
   assert.equal(rule.sharedPending,undefined);assert.equal(f.app.data.config.rules[0].sharedPending,undefined);
   assert.deepEqual(f.plugin.sharedSettingsIssues,[]);assert.equal(f.calls.length,0);
 });
+
+test("a failed local settings save never publishes the uncommitted edit",async()=>{
+  const f=settingsFixture("local-save-failure");await f.plugin.saveConfig();
+  const original=mirrorRecord(f).record.revision;
+  activeRuleProfile(f).prompt="Uncommitted prompt";
+  f.plugin.saveData=async()=>{throw Error("Disk full");};
+  await assert.rejects(f.plugin.saveConfig(),/Disk full/);
+  assert.equal(mirrorRecord(f).record.revision,original);
+  assert.equal(mirrorRecord(f).record.profile.prompt,"transcribe");
+  await assert.rejects(f.plugin.manual(source,"1"));
+  assert.equal(f.calls.length,0);
+});
+
+test("failure saving a shared acknowledgement keeps the committed edit and retries durability",async()=>{
+  const f=settingsFixture("ack-save-failure");await f.plugin.saveConfig();
+  let saves=0;
+  f.plugin.saveData=async data=>{if(++saves>1)throw Error("Disk full");f.app.data=structuredClone(data);};
+  activeRuleProfile(f).prompt="Committed prompt";
+  await f.plugin.saveConfig();
+  assert.equal(mirrorRecord(f).record.profile.prompt,"Committed prompt");
+  assert.equal(f.app.data.config.rules[0].sharedPending,true);
+  assert.equal(f.plugin.settingsPersistencePending,true);
+  assert.match(f.plugin.sharedSettingsIssues[0].reason,/could not be saved/);
+  await assert.rejects(f.plugin.update(),/Disk full/);assert.equal(f.calls.length,0);
+  f.plugin.saveData=async data=>{f.app.data=structuredClone(data);};
+  await f.plugin.refreshSharedSettings();
+  assert.equal(f.plugin.settingsPersistencePending,false);
+  assert.equal(f.app.data.config.rules[0].sharedPending,undefined);
+  assert.deepEqual(f.plugin.sharedSettingsIssues,[]);
+});
+
+test("remote settings whose first disk save fails are retried even without another remote change",async()=>{
+  const f=settingsFixture("remote-save-failure");await f.plugin.saveConfig();
+  f.app.data=structuredClone(f.app.data);
+  await editMirrorRecord(f,r=>{r.profile.prompt="Remote durable retry";});
+  f.plugin.saveData=async()=>{throw Error("Disk full");};
+  await assert.rejects(f.plugin.refreshSharedSettings(),/Disk full/);
+  assert.equal(activeRuleProfile(f).prompt,"Remote durable retry");
+  assert.equal(f.app.data.config.profiles.some(p=>p.prompt==="Remote durable retry"),false);
+  f.plugin.saveData=async data=>{f.app.data=structuredClone(data);};
+  await f.plugin.refreshSharedSettings();
+  assert.equal(f.app.data.config.profiles.some(p=>p.prompt==="Remote durable retry"),true);
+  assert.deepEqual(f.plugin.sharedSettingsIssues,[]);assert.equal(f.calls.length,0);
+});
+
+test("keeping local settings cannot publish a conflict choice until local storage accepts it",async()=>{
+  const f=settingsFixture("resolve-save-failure");await f.plugin.saveConfig();
+  activeRuleProfile(f).prompt="Local choice";
+  await editMirrorRecord(f,r=>{r.profile.prompt="Remote choice";});
+  await f.plugin.saveConfig();
+  f.plugin.saveData=async()=>{throw Error("Disk full");};
+  await assert.rejects(f.plugin.resolveSharedSettings("r","local"),/Disk full/);
+  assert.equal(mirrorRecord(f).record.profile.prompt,"Remote choice");assert.equal(f.calls.length,0);
+});
+
+test("queue forecast excludes blocked and locally paused notebooks, while explicit estimates remain available",async()=>{
+  const f=fixture(3);f.plugin.aiEnabled=false;await f.plugin.update();
+  const state=f.plugin.store.notebooks[source];assert.equal(f.plugin.queueEstimate().pages,3);
+  f.plugin.progress.paused=true;assert.equal(f.plugin.queueEstimate().pages,3);
+  for(const status of ["conflict","failed","missing","excluded"]){
+    state.status=status;assert.equal(f.plugin.queueEstimate().pages,0);
+    assert.equal(f.plugin.queueEstimate(source,[1,2]).pages,2);
+  }
+  state.status="queued";state.paused=true;assert.equal(f.plugin.queueEstimate().pages,0);
+  state.paused=false;f.plugin.sharedSettingsIssues=[{ruleId:"r",name:"Test",fields:[],reason:"Storage unavailable"}];
+  assert.equal(f.plugin.queueEstimate().pages,0);assert.equal(f.calls.length,0);
+});
+
+test("a temporarily unreadable shared catalog leaves the plugin loaded and recognition blocked until retry",async()=>{
+  const f=settingsFixture("catalog-startup-failure");await f.plugin.saveConfig();
+  const list=f.app.vault.adapter.list;
+  f.app.vault.adapter.list=async path=>{if(path.includes("/Mirrors"))throw Error("Temporary storage failure");return list(path);};
+  const restart=new Runtime(f.app);restart.reader=()=>f.reader;
+  await restart.onload();
+  assert.equal(restart.initializing,false);
+  assert.match(restart.sharedSettingsIssues[0].reason,/could not sync/);
+  await assert.rejects(restart.update(),/Temporary storage failure/);
+  assert.equal(f.calls.length,0);
+  f.app.vault.adapter.list=list;await restart.refreshSharedSettings();
+  assert.deepEqual(restart.sharedSettingsIssues,[]);assert.equal(f.calls.length,0);
+});
+
+test("settings persistence stores an independent snapshot rather than later in-memory mutations",async()=>{
+  const f=settingsFixture("immutable-local-save");await f.plugin.saveConfig();
+  activeRuleProfile(f).prompt="Not saved yet";
+  assert.equal(f.app.data.config.profiles.some(p=>p.prompt==="Not saved yet"),false);
+});

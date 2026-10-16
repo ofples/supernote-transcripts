@@ -196,7 +196,7 @@ test("attention reasons give specific actions for known errors and keep unknowns
   failed.error = "Shared transcript has a newer or conflicting page inventory. Wait for source synchronization before retrying.";
   assert.equal(
     notebookPresentation(failed).reason,
-    "Update the local .note source, then retry.",
+    "Sync the original notebook to this device, then choose Update or Resume on Sources.",
   );
   failed.error = "Unexpected provider response: 502";
   assert.equal(

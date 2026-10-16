@@ -934,6 +934,16 @@ class MirrorsModal extends Modal {
       );
       this.renderQueueEstimate(overview);
       this.renderQueueEstimateInfo(overview);
+      const blockerReason = this.c.progress.budgetBlocked ||
+        (this.c.progress as typeof this.c.progress & { executionBlocked?: string }).executionBlocked;
+      if (blockerReason) {
+        const reason = el(overview, "details", undefined, "st-queue-blocker-details");
+        reason.dataset.queueSection = "blocker reason";
+        el(reason, "summary", "Why recognition is paused");
+        el(reason, "p", blockerReason, "st-error st-caption");
+        reason.open = openSections.has(reason.dataset.queueSection);
+      }
+      this.renderQueueBlockerAction(overview);
       if (q.working) el(this.summary, "h2", "Working now", "st-section-heading");
       if (q.working) {
         const row = el(
@@ -1043,16 +1053,6 @@ class MirrorsModal extends Modal {
           )
           ?.focus({ preventScroll: true });
       this.body.scrollTop = scroll;
-      const blockerReason = this.c.progress.budgetBlocked ||
-        (this.c.progress as typeof this.c.progress & { executionBlocked?: string }).executionBlocked;
-      if (blockerReason) {
-        const reason = el(this.summary, "details", undefined, "st-queue-blocker-details");
-        reason.dataset.queueSection = "blocker reason";
-        el(reason, "summary", "Why recognition is paused");
-        el(reason, "p", blockerReason, "st-error st-caption");
-        reason.open = openSections.has(reason.dataset.queueSection);
-      }
-      this.renderQueueBlockerAction(this.summary);
     }
     if (this.updateButton) {
       setText(this.updateButton, this.actionLabel());
@@ -1163,13 +1163,13 @@ class MirrorsModal extends Modal {
       pieces.push(`${estimate.requests} request${estimate.requests === 1 ? "" : "s"}`);
       if (estimate.seconds !== undefined && Number.isFinite(estimate.seconds))
         pieces.push(`about ${this.duration(estimate.seconds)}`);
-      el(parent, "p", `${source ? "Estimated" : "Remaining estimate"}: ${pieces.join(" · ")}`, "st-caption st-queue-estimate");
+      el(parent, "p", `${source ? "Estimate" : "Eligible work estimate"}: ${pieces.join(" · ")}`, "st-caption st-queue-estimate");
       return;
     }
     if (estimate.usd !== undefined && Number.isFinite(estimate.usd))
       pieces.push(`about $${estimate.usd.toFixed(4)}`);
     else if (source) pieces.push("cost unavailable");
-    el(parent, "p", `${source ? "Estimated" : "Remaining estimate"}: ${pieces.join(" · ")}`, "st-caption st-queue-estimate");
+    el(parent, "p", `${source ? "Estimate" : "Eligible work estimate"}: ${pieces.join(" · ")}`, "st-caption st-queue-estimate");
   }
   private renderQueueEstimateInfo(parent: HTMLElement) {
     const controller = this.c as Controller & {
@@ -1184,11 +1184,11 @@ class MirrorsModal extends Modal {
     const details = el(parent, "details", undefined, "st-queue-estimate-info");
     el(details, "summary", "About this estimate");
     if (controller.provider === "subscription") {
-      el(details, "p", "Page and request counts are tracked by this plugin. ChatGPT manages plan allowance; no dollar charge is estimated.", "st-caption st-estimate-note");
+      el(details, "p", "Forecasts eligible work after you press Update or Resume. Individually paused or blocked notebooks are excluded. Spending or execution limits can still stop requests. Page and request counts are tracked by this plugin. ChatGPT manages plan allowance; no dollar charge is estimated.", "st-caption st-estimate-note");
       return;
     }
     const sample = `${estimate.samples} recent comparable page${estimate.samples === 1 ? "" : "s"}`;
-    el(details, "p", `${estimate.provisional ? "Provisional; " : ""}based on ${sample}. Estimates are not bills.`, "st-caption st-estimate-note");
+    el(details, "p", `Forecasts eligible work after you press Update or Resume. Individually paused or blocked notebooks are excluded. Spending or execution limits can still stop requests. ${estimate.provisional ? "Provisional; " : ""}Based on ${sample}. Estimates are not bills.`, "st-caption st-estimate-note");
     if (estimate.reservationUsd !== undefined && Number.isFinite(estimate.reservationUsd) && estimate.reservationUsd > 0)
       el(details, "p", `Conservative budget reservation: $${estimate.reservationUsd.toFixed(4)}.`, "st-caption st-reservation-note");
   }
@@ -1225,15 +1225,42 @@ class MirrorsModal extends Modal {
     const controller = this.c as Controller & {
       sharedSettingsIssues?: Array<{ ruleId: string; name: string; fields: string[]; reason: string }>;
       resolveSharedSettings?: (ruleId: string, choice: "local" | "remote") => Promise<void>;
+      refreshSharedSettings?: () => Promise<void>;
     };
     const issues = controller.sharedSettingsIssues?.filter((issue) => issue.ruleId === ruleId) ?? [];
     if (!issues.length) return;
     const alert = el(parent, "aside", undefined, "st-shared-settings-conflict");
+    const fieldLabels: Record<string, string> = {
+      "profile.model": "Model",
+      "profile.quality": "Recognition quality",
+      "profile.prompt": "Instructions",
+      "profile.glossaries": "Reference files",
+      "profile.endpoint": "API endpoint",
+      output: "Output folder",
+      recursive: "Include subfolders",
+      exclude: "Excluded notebooks",
+      "settings history": "Settings history",
+    };
     for (const issue of issues) {
-      el(alert, "strong", "Settings conflict · " + issue.name);
-      el(alert, "p", issue.fields.join(", ") + " · " + issue.reason, "st-caption");
+      const hasConflict = issue.fields.length > 0;
+      el(alert, "strong", `${hasConflict ? "Settings conflict" : "Settings need attention"} · ${issue.name}`);
+      const fields = issue.fields.map((field) => fieldLabels[field] ?? field);
+      el(alert, "p", `${fields.length ? `${fields.join(", ")} · ` : ""}${issue.reason}`, "st-caption");
     }
     const actions = el(alert, "div", undefined, "st-conflict-actions");
+    const conflicts = issues.filter((issue) => issue.fields.length > 0);
+    if (issues.some((issue) => issue.fields.length === 0)) {
+      const retry = btn(actions, "Retry Sync", () => {
+        if (!controller.refreshSharedSettings) return;
+        retry.disabled = true;
+        void controller.refreshSharedSettings().then(() => this.refreshHome()).catch((error) => {
+          new Notice("Could not sync settings: " + err(error));
+          retry.disabled = false;
+        });
+      }, "st-button st-text-button");
+      retry.disabled = !controller.refreshSharedSettings;
+    }
+    if (!conflicts.length) return;
     const resolving = !controller.resolveSharedSettings;
     let local: HTMLButtonElement;
     let remote: HTMLButtonElement;
@@ -1830,7 +1857,7 @@ class MirrorsModal extends Modal {
         option.value = mirror.id;
       }
       select.value = rule.sharedId ?? "";
-      this.help(field, "Link this local source to a shared logical mirror across your devices.", "Shared mirror");
+      this.help(field, "Link this local source to a shared logical mirror across your devices. Keep each device's Obsidian configuration folder separate; syncing one profile can overwrite local source paths, settings, and queue state. Shared Data and Markdown transcripts are the cross-device content.", "Shared mirror");
       const consequence = el(field, "small", "Saving to a different existing mirror replaces this source’s recognition profile, folder selection and exclusions with the shared versions. Local edits to those settings may be discarded.", "st-shared-mirror-warning");
       consequence.hidden = !select.value || select.value === originalSharedId;
       select.addEventListener("change", () => {

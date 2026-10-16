@@ -61,7 +61,7 @@ async function seedReviewCases(page, root, platform) {
       for (const page of state.desired) {
         state.pages[page.id] ??= { fingerprint: page.fingerprint, text: `Synthetic Satsang page ${page.number}.`, recipe: "fixture", number: page.number };
       }
-      state.status = "complete";
+      state.status = "current";
       moved[nextSource] = state;
       delete c.store.notebooks[source];
       for (const task of c.store.queue) if (task.source === source) task.source = nextSource;
@@ -69,6 +69,19 @@ async function seedReviewCases(page, root, platform) {
     Object.assign(c.store.notebooks, moved);
     folderRule.source = satsang;
     folderRule.output = "Fixture Output/Satsang";
+    const formerlyWorking = c.store.notebooks[paths.working];
+    for (const page of formerlyWorking.desired) {
+      formerlyWorking.pages[page.id] ??= { fingerprint: page.fingerprint, text: `Synthetic completed page ${page.number}.`, recipe: "fixture", number: page.number };
+    }
+    formerlyWorking.status = "current";
+    c.store.queue = c.store.queue.filter((task) => {
+      const state = c.store.notebooks[task.source];
+      return state?.desired.some((page) =>
+        (state.forcePending?.includes(page.id) || state.pages[page.id]?.fingerprint !== page.fingerprint) &&
+        state.pageIssues?.[page.id]?.fingerprint !== page.fingerprint,
+      );
+    });
+    c.store.queue = c.store.queue.filter((task) => task.source.toLowerCase() !== `${satsang}/reflection.note`.toLowerCase());
 
     const singleSource = `${base}/Reflection.note`;
     const soloRule = {
@@ -86,7 +99,7 @@ async function seedReviewCases(page, root, platform) {
       pages: Object.fromEntries(desired.map((page) => [page.id, {
         fingerprint: page.fingerprint, text: `Synthetic reflection page ${page.number}.`,
         recipe: "fixture", number: page.number,
-      }])), status: "complete", paused: false,
+      }])), status: "current", paused: false,
     };
     c.aiEnabled = true;
     c.progress.running = false;
@@ -97,6 +110,51 @@ async function seedReviewCases(page, root, platform) {
     c.reprocessEstimate = () => ({ pages: 2, requests: 1, usd: 0.001 });
     c.cleanupDocument = async () => { c.actionCounters.cleanupDocument++; };
     c.reprocessPages = async () => { c.actionCounters.reprocessPages++; };
+    const pendingPageCount = (state) => state.desired.filter((page) =>
+      (state.forcePending?.includes(page.id) || state.pages[page.id]?.fingerprint !== page.fingerprint) &&
+      state.pageIssues?.[page.id]?.fingerprint !== page.fingerprint,
+    ).length;
+    const sourceBlocked = (source, state) => {
+      const rule = c.config.rules.find((candidate) => candidate.id === state?.ruleId);
+      return !rule?.enabled || !!state?.paused || !!rule.paused ||
+        (c.automaticRun && rule.autoRecognize === false) ||
+        c.sharedSettingsIssues?.some((issue) => issue.ruleId === rule.id) ||
+        !!state?.legacyPageFailure || !!state?.executionIssue ||
+        ["conflict", "failed", "missing", "excluded"].includes(state?.status);
+    };
+    Object.defineProperty(c, "queueView", {
+      configurable: true,
+      get() {
+        const active = c.progress.running ? (c.progress.activeSource ?? c.progress.activePage?.source) : undefined;
+        const queued = [...c.store.queue];
+        const waiting = queued.filter((task) => {
+          const state = c.store.notebooks[task.source];
+          return task.source !== active && !sourceBlocked(task.source, state) && pendingPageCount(state) > 0;
+        }).map((task) => task.source);
+        const paused = queued.filter((task) => {
+          const state = c.store.notebooks[task.source];
+          return task.source !== active && sourceBlocked(task.source, state) && pendingPageCount(state) > 0;
+        }).map((task) => task.source);
+        const attention = Object.values(c.store.notebooks).filter((state) =>
+          state.status === "failed" || state.status === "conflict" || state.executionIssue || state.legacyPageFailure ||
+          Object.values(state.pageIssues ?? {}).some((issue) => issue.status !== "skipped"),
+        ).map((state) => state.source);
+        return { working: active ? { source: active, stage: c.progress.stage } : undefined, waiting, paused, attention };
+      },
+    });
+    const estimateForSource = c.queueEstimate.bind(c);
+    c.queueEstimate = (source) => {
+      if (source) return estimateForSource(source);
+      const estimate = estimateForSource();
+      const eligiblePages = Object.values(c.store.notebooks).reduce((total, state) =>
+        sourceBlocked(state.source, state) ? total : total + pendingPageCount(state), 0,
+      );
+      return {
+        ...estimate,
+        pages: eligiblePages,
+        requests: c.provider === "subscription" ? Math.max(1, Math.ceil(eligiblePages / 3)) : Math.max(1, Math.ceil(eligiblePages / 2)),
+      };
+    };
   });
   await page.evaluate(() => window.__streamlinedFixture.commands.get("open")?.callback());
   await root.waitFor();
@@ -162,6 +220,52 @@ async function inspectViewport(platform, viewport, label) {
     const visibleLabels = (await labels.allTextContents()).map((text) => text.trim()).filter(Boolean);
     check(visibleLabels.includes("Settings") && visibleLabels.includes("Pause") && visibleLabels.includes("Configure"), `${label}: desktop action labels are missing: ${JSON.stringify(visibleLabels)}`);
   }
+  await page.evaluate(() => {
+    const c = window.__streamlinedFixture.controller;
+    c.sharedSettingsIssues = [{
+      ruleId: "research-source",
+      name: "Satsang",
+      fields: ["profile.model", "profile.quality"],
+      reason: "This device and a synced copy changed these settings separately.",
+    }];
+    c.resolveSharedSettings = async () => {};
+    c.notify();
+  });
+  const conflict = root.locator(".st-shared-settings-conflict").filter({ hasText: "Settings conflict · Satsang" });
+  await conflict.waitFor();
+  check(await conflict.innerText().then((text) => /Model, Recognition quality/.test(text) && /changed these settings separately/.test(text)), `${label}: settings conflict does not identify changed fields in user-facing terms and cause`);
+  for (const name of ["Keep this device", "Use synced settings"]) {
+    const action = conflict.getByRole("button", { name, exact: true });
+    check(await action.isVisible() && !(await action.isDisabled()), `${label}: conflict resolution action ${name} is missing or disabled`);
+  }
+  await assertLayout("Source settings conflict");
+  await screenshot("source-settings-conflict");
+  await page.evaluate(() => {
+    const c = window.__streamlinedFixture.controller;
+    c.sharedSettingsIssues = [{
+      ruleId: "research-source",
+      name: "Satsang",
+      fields: [],
+      reason: "Could not read shared source settings from this vault.",
+    }];
+    c.refreshAttempts = 0;
+    c.refreshSharedSettings = async () => {
+      c.refreshAttempts++;
+      c.sharedSettingsIssues = [];
+      c.notify();
+    };
+    c.notify();
+  });
+  const syncIssue = root.locator(".st-shared-settings-conflict").filter({ hasText: "Settings need attention · Satsang" });
+  await syncIssue.waitFor();
+  check(await syncIssue.locator("p").innerText().then((text) => !/^\s*·/.test(text) && /Could not read shared source settings/.test(text)), `${label}: sync failure has conflict punctuation or missing reason`);
+  check(await syncIssue.getByRole("button", { name: "Retry Sync", exact: true }).isVisible(), `${label}: shared settings failure has no retry action`);
+  check(await syncIssue.getByRole("button", { name: "Keep this device", exact: true }).count() === 0 && await syncIssue.getByRole("button", { name: "Use synced settings", exact: true }).count() === 0, `${label}: sync failure incorrectly offers conflict choices`);
+  await assertLayout("Shared settings sync failure");
+  await screenshot("source-settings-sync-failure");
+  await syncIssue.getByRole("button", { name: "Retry Sync", exact: true }).click();
+  await syncIssue.waitFor({ state: "detached" });
+  check(await page.evaluate(() => window.__streamlinedFixture.controller.refreshAttempts) === 1, `${label}: Retry Sync did not call the shared settings refresh`);
   await root.getByRole("button", { name: "Expand Satsang", exact: true }).click();
   const child = root.locator(".st-folder-contents .st-notebook-child").filter({ hasText: "Reflection" }).first();
   await child.waitFor();
@@ -175,7 +279,61 @@ async function inspectViewport(platform, viewport, label) {
   await root.getByRole("button", { name: "Queue", exact: true }).click();
   await root.getByText(/Waiting|Working|paused|attention|No pending/i).first().waitFor();
   await assertLayout("Queue");
+  const queuedCompletedSources = await page.evaluate(() => window.__streamlinedFixture.controller.queueView.waiting.filter((source) => {
+    const state = window.__streamlinedFixture.controller.store.notebooks[source];
+    return state && state.desired.every((page) => state.pages[page.id]?.fingerprint === page.fingerprint);
+  }));
+  check(queuedCompletedSources.length === 0, `${label}: completed notebooks remain in the mocked waiting queue: ${JSON.stringify(queuedCompletedSources)}`);
   await screenshot("queue");
+  const estimateInfo = root.locator(".st-queue-estimate-info");
+  await estimateInfo.locator("summary").click();
+  check(await estimateInfo.locator("p").first().innerText().then((text) => /after you press Update or Resume\. Individually paused or blocked notebooks are excluded/i.test(text)), `${label}: total estimate scope does not distinguish eligible work from paused or blocked sources`);
+  const aggregateEstimate = root.locator(".st-queue-overview .st-queue-estimate");
+  const eligiblePages = await page.evaluate(() => {
+    const c = window.__streamlinedFixture.controller;
+    const pending = (state) => state.desired.filter((item) =>
+      (state.forcePending?.includes(item.id) || state.pages[item.id]?.fingerprint !== item.fingerprint) &&
+      state.pageIssues?.[item.id]?.fingerprint !== item.fingerprint,
+    ).length;
+    const blocked = (state) => {
+      const rule = c.config.rules.find((candidate) => candidate.id === state.ruleId);
+      return !rule?.enabled || !!state.paused || !!rule.paused ||
+        (c.automaticRun && rule.autoRecognize === false) ||
+        c.sharedSettingsIssues?.some((issue) => issue.ruleId === rule.id) ||
+        !!state.legacyPageFailure || !!state.executionIssue ||
+        ["conflict", "failed", "missing", "excluded"].includes(state.status);
+    };
+    return Object.values(c.store.notebooks).reduce((total, state) => total + (blocked(state) ? 0 : pending(state)), 0);
+  });
+  const aggregateText = await aggregateEstimate.innerText();
+  check(/Eligible work estimate/.test(aggregateText), `${label}: total estimate is not labeled as eligible work`);
+  check(new RegExp(`\\b${eligiblePages} pages?\\b`).test(aggregateText), `${label}: aggregate estimate does not match ${eligiblePages} eligible remaining pages: ${aggregateText}`);
+  await screenshot("queue-estimate-explained");
+
+  // A budget block can stop eligible work while the selected-work estimate remains useful.
+  await page.evaluate(() => {
+    const c = window.__streamlinedFixture.controller;
+    c.progress.running = false;
+    c.progress.budgetBlocked = "Synthetic spending limit reached.";
+    c.aiEnabled = true;
+    c.notify();
+  });
+  check(await root.locator(".st-queue-status").innerText() === "Spending paused", `${label}: budget-blocked queue status is unclear`);
+  const reviewCosts = root.locator(".st-blocker-action");
+  check(await reviewCosts.innerText() === "Review Costs", `${label}: budget-blocked queue has no direct Costs action`);
+  const reviewCostsBounds = await reviewCosts.boundingBox();
+  check(reviewCostsBounds && reviewCostsBounds.y >= 0 && reviewCostsBounds.y + reviewCostsBounds.height <= viewport.height, `${label}: Review Costs action is below the visible area in a budget-blocked queue: ${JSON.stringify(reviewCostsBounds)}`);
+  check(await root.locator(".st-update").isDisabled(), `${label}: Update remains enabled while spending is blocked`);
+  check(await estimateInfo.locator("p").first().innerText().then((text) => /spending or execution limits can still stop requests/i.test(text)), `${label}: budget-blocked state hides the estimate scope explanation`);
+  await assertLayout("Budget-blocked queue");
+  await screenshot("queue-spending-paused");
+  await page.evaluate(() => {
+    const c = window.__streamlinedFixture.controller;
+    c.progress.running = false;
+    c.progress.budgetBlocked = undefined;
+    c.aiEnabled = true;
+    c.notify();
+  });
 
   // Settings: compact rows and keyboard-operable contextual help.
   await root.getByRole("button", { name: "Settings", exact: true }).click();
@@ -270,6 +428,13 @@ async function inspectViewport(platform, viewport, label) {
     check(editorHeadings.includes(heading), `${label}: source editor is missing the ${heading} section heading: ${JSON.stringify(editorHeadings)}`);
   }
   check(await root.locator(".st-form .st-source-advanced").count() === 0, `${label}: single-note editor still has a Source Advanced disclosure`);
+  const mirrorHelp = root.locator(".st-form .st-help-button[aria-label='Help: Shared mirror']");
+  await mirrorHelp.focus();
+  await page.keyboard.press("Enter");
+  const mirrorHelpText = root.locator(`#${await mirrorHelp.getAttribute("aria-controls")}`);
+  check(await mirrorHelpText.innerText().then((text) => /configuration folder separate/i.test(text) && /queue state/i.test(text) && /Shared Data and Markdown transcripts/i.test(text)), `${label}: Shared mirror help omits separate device configuration guidance`);
+  await screenshot("reflection-editor-shared-mirror-help");
+  await page.keyboard.press("Space");
   const chooseFolder = root.getByRole("button", { name: "Choose folder", exact: true });
   check(await chooseFolder.isVisible(), `${label}: output folder picker button missing`);
   const outputField = root.locator(".st-output-choice .st-field");

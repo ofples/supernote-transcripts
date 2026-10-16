@@ -126,6 +126,7 @@ export default class SupernoteTranscripts extends Plugin implements Controller {
   private boundMirrors = new Set<string>();
   sharedSettingsIssues: { ruleId: string; name: string; fields: string[]; reason: string }[] = [];
   private settingsWork: Promise<void> = Promise.resolve();
+  private settingsPersistencePending = false;
   private sharedSettingsTimer?: ReturnType<typeof setTimeout>;
   private sharedCache?: SharedNotebookCache;
   private chatGPT?: ChatGPTSession;
@@ -244,6 +245,9 @@ export default class SupernoteTranscripts extends Plugin implements Controller {
     let requests=0,pages=0,usd=0,seconds=0,samples=0,priced=true,timed=true,provisional=false;
     const sampled=new Set<string>();
     for(const s of states){
+      // The overview forecasts work that can run when the global queue resumes.
+      // Explicit notebook/page estimates still describe the requested operation.
+      if(!source&&!selectedNumbers&&(this.sourcePaused(s.source)||["conflict","failed","missing","excluded"].includes(s.status)))continue;
       const pending=selectedNumbers?s.desired.filter(p=>selectedNumbers.includes(p.number)):pendingPages(s);
       const n=!selectedNumbers&&(s.legacyPageFailure||s.executionIssue)?0:pending.length;
       if(!n)continue;pages+=n;
@@ -477,7 +481,10 @@ export default class SupernoteTranscripts extends Plugin implements Controller {
     });
     if(!this.stateStorageIssue)await this.saveConfig();
     this.initializing=false;
-    if(!this.stateStorageIssue)await this.refreshSharedSettings();
+    if(!this.stateStorageIssue) {
+      try { await this.refreshSharedSettings(); }
+      catch { this.stage("Settings need attention", "Shared settings are unavailable. Check storage and try Retry Sync in Sources."); }
+    }
     if(this.app.vault.on)for(const event of ["create", "modify", "delete", "rename"] as const)
       this.registerEvent(this.app.vault.on(event as "modify", file => {
         if(file.path.startsWith("Supernote Transcripts/Shared Data/Mirrors/"))this.scheduleSharedSettings();
@@ -494,11 +501,20 @@ export default class SupernoteTranscripts extends Plugin implements Controller {
   }
   async saveConfig() {
     return this.settingsOperation(async () => {
-      if(!this.initializing) {
-        if(this.task)for(const rule of this.config.rules)rule.sharedPending=true;
-        else await this.syncMirrorSettings(true);
-      }
+      // Commit the user's intent locally before any other device can observe it.
+      // Only this first failure may reject Save and let the form roll back.
+      if(!this.initializing)for(const rule of this.config.rules)rule.sharedPending=true;
       await this.persistSettings();
+      if(!this.initializing&&!this.task) {
+        try {
+          await this.syncMirrorSettings(true);
+          await this.persistSettings();
+        } catch(error) {
+          // The edit is already durable. Keep it and retry synchronization;
+          // rejecting here would falsely tell the form to undo a committed edit.
+          this.settingsSyncIssue(error);
+        }
+      }
       this.emit();
     });
   }
@@ -508,8 +524,21 @@ export default class SupernoteTranscripts extends Plugin implements Controller {
     return operation;
   }
   private async persistSettings() {
-    await this.saveData({ config: this.config, ...(this.stateEstablished?{stateInitialized:true}:{}) });
+    try {
+      await this.saveData({ config: clone(this.config), ...(this.stateEstablished?{stateInitialized:true}:{}) });
+      this.settingsPersistencePending=false;
+    } catch(error) {
+      this.settingsPersistencePending=true;
+      this.settingsSyncIssue(error);
+      throw error;
+    }
     await Promise.all(this.config.profiles.map(p=>this.profile(p.id).catch(()=>{this.recipes.delete(p.id);}))); 
+  }
+  private settingsSyncIssue(error: unknown) {
+    const reason=this.settingsPersistencePending
+      ? "Settings could not be saved on this device. Check available storage, then choose Retry Sync in Sources. Recognition is paused until settings are saved."
+      : `Settings are saved on this device but could not sync. Choose Retry Sync in Sources. ${readable(error)}`;
+    this.sharedSettingsIssues=this.config.rules.map(rule=>({ruleId:rule.id,name:rule.source.replace(/\\/g,"/").split("/").pop()??"Source",fields:[],reason}));
   }
   private scheduleSharedSettings() {
     if(this.disposed || this.initializing)return;
@@ -591,8 +620,12 @@ export default class SupernoteTranscripts extends Plugin implements Controller {
     if(this.task||this.disposed||this.initializing)return;
     return this.settingsOperation(async () => {
       if(this.task||this.disposed)return;
+      // Retry even if the previous refresh already applied the remote values in
+      // memory; equality with the next refresh does not mean they reached disk.
+      if(this.settingsPersistencePending)await this.persistSettings();
       const before=JSON.stringify(this.config);
-      await this.syncMirrorSettings(false);
+      try { await this.syncMirrorSettings(false); }
+      catch(error) { this.settingsSyncIssue(error);throw error; }
       if(before!==JSON.stringify(this.config))await this.persistSettings();
       this.emit();
     });
@@ -604,9 +637,14 @@ export default class SupernoteTranscripts extends Plugin implements Controller {
       if(!rule?.sharedId||!io)throw Error("Shared source is unavailable.");
       const catalog=new MirrorCatalog(io),remote=await catalog.load(rule.sharedId);
       const profileId=`shared-${(await hash(rule.sharedId)).slice(0,40)}`;
-      const signature=JSON.stringify(this.config),local=this.portableSettings(rule);
+      const local=this.portableSettings(rule);
       if(choice==="remote"&&!remote)throw Error("Shared settings have not arrived. Wait for Sync and try again.");
       const value=choice==="remote"?remote!:local;
+      if(choice==="local") {
+        rule.sharedPending=true;
+        await this.persistSettings();
+      }
+      const signature=JSON.stringify(this.config);
       const agreed=choice==="local"?await catalog.save(rule.sharedId,remote?.name??rule.source.split("/").pop()??"Source",
         {...value,profile:{...value.profile,id:remote?.profile.id??value.profile.id,name:remote?.profile.name??value.profile.name}},mirrorFingerprint(remote)):remote;
       if(signature!==JSON.stringify(this.config))throw Error("Settings changed while resolving. Try again.");
@@ -2158,13 +2196,16 @@ export default class SupernoteTranscripts extends Plugin implements Controller {
     return text;
   }
   private assertSharedSettings(source: string) {
+    if(this.settingsPersistencePending)throw Error("Settings could not be saved. Check available storage, then choose Retry Sync in Sources before recognition.");
     const rule=ruleFor(source,this.config.rules),issue=this.sharedSettingsIssues.find(i=>i.ruleId===rule?.id);
+    if(issue&&!issue.fields.length)throw Error(issue.reason);
     if(issue)throw Error("Resolve this source's shared settings before recognition: choose Keep this device or Use synced settings in Sources.");
   }
   private sourcePaused(source: string) {
     const rule = ruleFor(source, this.config.rules);
     return (
       !this.sourceSelected(source) ||
+      this.settingsPersistencePending ||
       this.sharedSettingsIssues.some(issue=>issue.ruleId===rule?.id) ||
       (this.automaticRun && rule?.autoRecognize === false) ||
       !!rule?.paused ||
