@@ -61,7 +61,7 @@ function notebook(v: any, source: string): boolean {
       !optional(v.pageAttempts, attempts => record(attempts) && Object.values(attempts).every((p: any) =>
         record(p) && nonempty(p.fingerprint) && integer(p.count))) ||
       !optional(v.executionIssue, issue => record(issue) && ["source", "batch"].includes(issue.scope) &&
-        nonempty(issue.reason) && optional(issue.recipe, nonempty))) return false;
+        nonempty(issue.reason) && optional(issue.recipe, nonempty) && optional(issue.code, nonempty))) return false;
   if (!optional(v.deviceOcr, pages => keyedPageText(pages, v.desired, false)) ||
       !optional(v.cleanedPages, pages => keyedPageText(pages, v.desired, true)) ||
       !optional(v.cleanup, cleanup)) return false;

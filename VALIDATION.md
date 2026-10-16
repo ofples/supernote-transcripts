@@ -1,5 +1,11 @@
 # Validation — 16 October 2026
 
+## Version 0.11.1 — settings and reconnect recovery
+
+- Targeted synthetic settings checks pass **205 assertions** across desktop and Nomad, including narrow viewports, consistent type, visible action borders, draft preservation and exact address copying. Existing source/queue and subscription-pairing browser checks pass. All use synthetic state and block external requests.
+- Read-only diagnosis on Nomad found a fresh connected session with no renewal block or pending login, while the queue retained the previous renewal error. Recovery now reconciles these separate states without resetting page failures, spending limits or pause preferences.
+- Final source gate passed: **385/385** tests, TypeScript check and production build. Auth regressions cover the session-initialization callback, stale legacy and typed queue stops, offline preflight, separate quota/storage failures and persistence failure. Test log: `test-artifacts/tests-0.11.1-final.txt`. Guarded installation verification is pending. Real recognition, cleanup and new sign-in are not part of this cost-free verification.
+
 ## Version 0.11 — active on Nomad and desktop; live UI checks passed
 
 - `npm test` passes **377/377**, `npm run check` passes, and the production build passes.

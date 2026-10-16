@@ -33,6 +33,12 @@ test("subscription interruption identity and explicit decision persist without c
 });
 const deferred = () => { let resolve, reject; const promise = new Promise((a, b) => { resolve = a; reject = b; }); return { promise, resolve, reject }; };
 const until = async (fn) => { for (let i = 0; i < 100; i++) { if (fn()) return; await new Promise((r) => setImmediate(r)); } throw Error("Mock operation did not settle"); };
+async function withOnline(online, action) {
+  const original = Object.getOwnPropertyDescriptor(globalThis, "navigator");
+  Object.defineProperty(globalThis, "navigator", { configurable: true, value: { onLine: online } });
+  try { return await action(); }
+  finally { if (original) Object.defineProperty(globalThis, "navigator", original); else delete globalThis.navigator; }
+}
 const savedRecord = (extra = {}) => ({ hostId: "urn:uuid:00000000-0000-4000-8000-000000000000", clientId: "oaiapp_test", subject: "subject", email: "test@example.test",
   tokens: { accessToken: "old-access", refreshToken: "old-refresh", scope: "openid chatgpt.tokens.use.direct", expiresAt: Date.now() + 3600000, earliestRefreshAt: 0 }, ...extra });
 function storage(record = undefined) {
@@ -217,6 +223,43 @@ test("ambiguous refresh failures are not retried in this session or after restar
   const restarted = new ChatGPTSession(s.app, () => {}, { request }); await assert.rejects(restarted.access(), /uncertain/);
   assert.equal(restarted.needsSignIn, true);
   assert.equal(sends, 1); assert.equal(s.value().renewalBlocked, true);
+});
+
+test("known offline recognition avoids refresh, reservation and send; a later online call refreshes once", async () => {
+  const initial = savedRecord();
+  initial.tokens.expiresAt = Date.now() + 1000;
+  const s = storage(initial);
+  const requests = [];
+  let beforeSend = 0;
+  const session = new ChatGPTSession(s.app, () => {}, { request: async (r) => {
+    requests.push(r);
+    assert.equal(r.url, ISSUER + "/api/accounts/oauth/token");
+    return { status: 200, json: grant() };
+  } });
+  await session.initialize();
+  const image = "data:image/png;base64,AAAA";
+
+  await withOnline(false, async () => {
+    await assert.rejects(
+      session.recognize("test-model", image, "transcribe", () => { beforeSend++; return true; }),
+      (error) => error.code === "subscription_offline" && /Offline/.test(error.message),
+    );
+  });
+
+  assert.equal(beforeSend, 0);
+  assert.equal(requests.length, 0);
+  assert.deepEqual(s.value().tokens, initial.tokens);
+  assert.equal(s.value().renewalBlocked, undefined);
+  assert.equal(session.needsSignIn, false);
+
+  await withOnline(true, async () => {
+    assert.equal(await session.access(), "new-access");
+  });
+
+  assert.equal(requests.length, 1);
+  assert.equal(s.value().tokens.refreshToken, "new-refresh");
+  assert.equal(s.value().renewalBlocked, undefined);
+  assert.equal(session.status, "ChatGPT plan connected");
 });
 
 test("renewal-uncertain session can explicitly reconnect while retaining old tokens until verified exchange", async (t) => {

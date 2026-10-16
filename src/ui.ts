@@ -17,7 +17,6 @@ import {
   parentBrowserPath,
 } from "./browser.mjs";
 import { availableModalHeight } from "./viewport.mjs";
-import { qualitySettings } from "./quality.mjs";
 import {
   endpointKey,
   priceFor,
@@ -215,7 +214,6 @@ class MirrorsModal extends Modal {
   private editorProfile?: Profile;
   private editorBaseId = "";
   private editorUsesGeneral = true;
-  private editorGuidanceOpen = false;
   private prompt = "";
   private glossaries: string[] = [];
   private modelDraft = "";
@@ -1544,7 +1542,6 @@ class MirrorsModal extends Modal {
   }
   private openEditor(rule: FolderRule) {
     this.editorRule = JSON.parse(JSON.stringify(rule));
-    this.editorGuidanceOpen = false;
     this.editorProfile =
       this.c.config.profiles.find((p) => p.id === rule.profileId) ??
       this.c.config.profiles[0];
@@ -1664,25 +1661,14 @@ class MirrorsModal extends Modal {
     );
     const sourceOverrides = el(sourceProfile, "div", undefined, "st-source-profile-overrides");
     this.modelPicker(sourceOverrides, "Model", this.modelDraft, (v) => (this.modelDraft = v));
-    this.qualitySlider(sourceOverrides, this.qualityDraft, (value) => { this.qualityDraft = value; }, () => this.modelDraft, () => this.endpointDraft, (this.c as Controller & { provider?: string }).provider === "subscription", this.c.costs.settings.maxOutputTokens);
+    this.qualitySlider(sourceOverrides, this.qualityDraft, (value) => { this.qualityDraft = value; });
     const instructions = el(
       transcription,
-      "details",
+      "section",
       undefined,
-      "st-instructions",
+      "st-instructions st-guidance-section",
     );
-    instructions.open = this.editorGuidanceOpen;
-    instructions.addEventListener("toggle", () => {
-      this.editorGuidanceOpen = instructions.open;
-    });
-    const instructionSummary = this.glossaries.length
-      ? `Instructions and reference files · ${this.glossaries.length} ${this.glossaries.length === 1 ? "file" : "files"}`
-      : "Instructions and reference files (optional)";
-    el(
-      instructions,
-      "summary",
-      instructionSummary,
-    );
+    el(instructions, "h3", "Instructions and reference files", "st-field-heading");
     this.textarea(
       instructions,
       "Instructions",
@@ -1706,8 +1692,8 @@ class MirrorsModal extends Modal {
       (Array.from(instructions.querySelectorAll("input, select, textarea, button")) as Array<HTMLInputElement | HTMLSelectElement | HTMLTextAreaElement | HTMLButtonElement>).forEach((control) => { control.disabled = true; });
     }
 
-    const advanced = el(root, "details", undefined, "st-source-advanced");
-    el(advanced, "summary", "Advanced source settings");
+    const advanced = el(root, "details", undefined, "st-source-advanced st-settings-section");
+    el(advanced, "summary", "Advanced");
     const sourceOptions = el(advanced, "section", undefined, "st-advanced-group");
     el(sourceOptions, "h3", "Folder exclusions", "st-field-heading");
     this.textarea(
@@ -1723,8 +1709,8 @@ class MirrorsModal extends Modal {
     );
     const technical = el(advanced, "section", undefined, "st-advanced-group");
     el(technical, "h3", "Provider and device options", "st-field-heading");
-    const sharedMirrorField = el(technical, "details", undefined, "st-shared-mirror-field");
-    el(sharedMirrorField, "summary", "Link across devices");
+    const sharedMirrorField = el(technical, "div", undefined, "st-shared-mirror-field");
+    el(sharedMirrorField, "h3", "Link across devices", "st-field-heading");
     void this.renderSharedMirrors(sharedMirrorField, r);
     this.text(
       technical,
@@ -2083,7 +2069,6 @@ class MirrorsModal extends Modal {
       profileId: p.id,
     };
     this.editorRule = r;
-    this.editorGuidanceOpen = false;
     this.editorProfile = p;
     this.editorBaseId = p.id;
     this.editorUsesGeneral = p.id === (this.c.config.profiles.find((profile) => profile.id === "general")?.id ?? "general");
@@ -2719,6 +2704,8 @@ class MirrorsModal extends Modal {
       safe(Promise.resolve().then(() => action?.call(this.c)).then(() => {
         if (this.screen === "settings") this.render();
       }));
+    let showBrowserSigninFallback = false;
+    let browserSigninAction = "Connect ChatGPT account";
     this.select(
       connection,
       "Provider",
@@ -2776,7 +2763,24 @@ class MirrorsModal extends Modal {
           el(addresses, "span", pairing.addresses.length === 1 ? "Address" : "Addresses", "st-pairing-label");
           if (pairing.addresses.length) {
             const list = el(addresses, "ul", undefined, "st-pairing-address-list");
-            for (const address of pairing.addresses) el(list, "li", address);
+            for (const address of pairing.addresses) {
+              const item = el(list, "li");
+              const row = el(item, "div", undefined, "st-pairing-address-row");
+              el(row, "code", address, "st-pairing-address");
+              const copyAddress = btn(row, "Copy", () => {
+                const clipboard = card.ownerDocument.defaultView?.navigator.clipboard;
+                if (!clipboard) {
+                  new Notice("Clipboard access is unavailable. Select and copy the address instead.");
+                  return;
+                }
+                void clipboard.writeText(address).then(
+                  () => new Notice("Desktop address copied."),
+                  () => new Notice("Could not copy the address. Select and copy it instead."),
+                );
+              }, "st-button st-secondary st-pairing-address-copy");
+              copyAddress.setAttribute("aria-label", `Copy desktop address ${address}`);
+              copyAddress.title = `Copy desktop address ${address}`;
+            }
           } else {
             el(addresses, "p", "Waiting for a local network address…", "st-caption");
           }
@@ -2811,16 +2815,8 @@ class MirrorsModal extends Modal {
       }
 
       if (status?.connected) {
-        const details = el(connection, "details", undefined, "st-connection-details");
-        el(details, "summary", "Connection details");
-        el(details, "p", "Usage is reported by ChatGPT. This plugin tracks attempts locally but cannot show remaining plan allowance or estimate subscription charges.", "st-caption");
-        const manage = el(details, "a", "Manage subscription usage") as HTMLAnchorElement;
-        manage.href = "https://chatgpt.com/#settings/Subscription";
-        manage.target = "_blank";
-        manage.rel = "noopener noreferrer";
-        manage.addClass("st-manage-usage");
         btn(
-          details,
+          connection,
           "Disconnect ChatGPT account",
           () => runSubscriptionAction(controller.disconnectSubscription),
           "st-button st-text-button",
@@ -2893,27 +2889,17 @@ class MirrorsModal extends Modal {
             "st-button st-text-button",
           );
         } else {
-          const advanced = el(connection, "details", undefined, "st-connection-details st-advanced-connection");
-          el(advanced, "summary", "Advanced connection");
-          el(advanced, "p", "Use browser sign-in if desktop pairing is unavailable.", "st-caption");
-          btn(
-            advanced,
-            status?.needsSignIn ? "Reconnect ChatGPT account" : "Connect ChatGPT account",
-            () => runSubscriptionAction(controller.connectSubscription),
-            "st-button st-text-button",
-          );
+          showBrowserSigninFallback = true;
+          browserSigninAction = status?.needsSignIn ? "Reconnect ChatGPT account" : "Connect ChatGPT account";
         }
       }
-      if (!status?.connected) {
-        const details = el(connection, "details", undefined, "st-connection-details");
-        el(details, "summary", "Connection details");
-        el(details, "p", "ChatGPT reports plan usage. This plugin tracks attempts locally but cannot show remaining plan allowance or estimate subscription charges.", "st-caption");
-        const manage = el(details, "a", "Manage subscription usage") as HTMLAnchorElement;
-        manage.href = "https://chatgpt.com/#settings/Subscription";
-        manage.target = "_blank";
-        manage.rel = "noopener noreferrer";
-        manage.addClass("st-manage-usage");
-      }
+      const information = el(connection, "div", undefined, "st-connection-details");
+      el(information, "p", "ChatGPT manages plan allowance; this plugin tracks local attempts and cannot show remaining quota.", "st-caption");
+      const manage = el(information, "a", "Manage subscription usage") as HTMLAnchorElement;
+      manage.href = "https://chatgpt.com/#settings/Subscription";
+      manage.target = "_blank";
+      manage.rel = "noopener noreferrer";
+      manage.addClass("st-manage-usage");
     }
     btn(
       connection,
@@ -2923,7 +2909,7 @@ class MirrorsModal extends Modal {
     );
 
     const runBehavior = el(root, "section", undefined, "st-form-section st-settings-section st-run-behavior");
-    el(runBehavior, "h2", "Run behavior", "st-section-heading");
+    el(runBehavior, "h2", "Updates", "st-section-heading");
     this.toggle(
       runBehavior,
       "AI recognition",
@@ -2939,29 +2925,17 @@ class MirrorsModal extends Modal {
       "Runs while Obsidian is active",
     );
     this.number(runBehavior, "Simultaneous requests", d.concurrency, 1, 32, (v) => (d.concurrency = v));
-    const schedule = el(runBehavior, "details", undefined, "st-settings-schedule");
-    schedule.open = d.autoEnabled;
-    el(schedule, "summary", "Automatic catch-up schedule");
-    this.number(schedule, "Check interval (minutes)", d.intervalMinutes, 1, 60, (v) => (d.intervalMinutes = v));
+    this.number(runBehavior, "Check interval (minutes)", d.intervalMinutes, 1, 60, (v) => (d.intervalMinutes = v));
     const general = d.profiles.find((p) => p.id === "general") ?? d.profiles[0];
     if (general) {
       const defaults = el(root, "section", undefined, "st-form-section st-settings-section st-recognition-defaults");
-      el(defaults, "h2", "Default recognition", "st-section-heading");
+      el(defaults, "h2", "Recognition", "st-section-heading");
       el(defaults, "p", "Used by sources without custom recognition settings.", "st-caption st-section-help");
       this.modelPicker(defaults, "Default model", general.model, (v) => (general.model = v));
-      this.qualitySlider(defaults, general.quality ?? "fast", (value) => { general.quality = value; }, () => general.model, () => general.endpoint, d.provider === "subscription", this.c.costs.settings.maxOutputTokens);
-      const advanced = el(defaults, "details", undefined, "st-settings-advanced");
-      el(advanced, "summary", "Provider options");
-      this.input(
-        advanced,
-        "Responses API endpoint",
-        general.endpoint,
-        "text",
-        (v) => (general.endpoint = v),
-      );
+      this.qualitySlider(defaults, general.quality ?? "fast", (value) => { general.quality = value; });
     }
-    const presentation = el(root, "details", undefined, "st-settings-presentation");
-    el(presentation, "summary", "Transcript appearance");
+    const presentation = el(root, "section", undefined, "st-form-section st-settings-section st-settings-presentation");
+    el(presentation, "h2", "Transcript", "st-section-heading");
     this.toggle(
       presentation,
       "Show page headings in transcripts",
@@ -2969,6 +2943,27 @@ class MirrorsModal extends Modal {
       (v) => (d.showPageHeadings = v),
       "Presentation only; changing this does not run recognition again.",
     );
+    if (general || showBrowserSigninFallback) {
+      const advanced = el(root, "details", undefined, "st-settings-section st-settings-advanced");
+      el(advanced, "summary", "Advanced");
+      if (general) this.input(
+          advanced,
+          "Responses API endpoint",
+          general.endpoint,
+          "text",
+          (v) => (general.endpoint = v),
+        );
+      if (showBrowserSigninFallback) {
+        const browserSignin = el(advanced, "div", undefined, "st-connection-details st-advanced-connection");
+        el(browserSignin, "p", "Use browser sign-in if desktop pairing is unavailable.", "st-caption");
+        btn(
+          browserSignin,
+          browserSigninAction,
+          () => runSubscriptionAction(controller.connectSubscription),
+          "st-button st-text-button",
+        );
+      }
+    }
     const actions = el(this.footer, "div", undefined, "st-actions");
     btn(
       actions,
@@ -4104,7 +4099,7 @@ class MirrorsModal extends Modal {
     el(field, "small", "Choose a listed model or enter the exact model name supplied by your provider.");
     return select;
   }
-  private qualitySlider(parent: HTMLElement, quality: "fast" | "balanced" | "careful", change: (value: "fast" | "balanced" | "careful") => void, getModel: () => string = () => "", getEndpoint: () => string = () => "", subscription = false, perPageOutputTokens = 1024) {
+  private qualitySlider(parent: HTMLElement, quality: "fast" | "balanced" | "careful", change: (value: "fast" | "balanced" | "careful") => void) {
     const field = el(parent, "div", undefined, "st-field st-quality-field st-quality-control");
     el(field, "span", "Recognition quality");
     const slider = el(field, "input") as HTMLInputElement;
@@ -4118,33 +4113,10 @@ class MirrorsModal extends Modal {
     const labels = el(field, "div", undefined, "st-quality-labels");
     QUALITY.forEach((item) => el(labels, "span", qualityLabel(item)));
     const summary = el(field, "p", qualitySummary(quality), "st-quality-summary");
-    const details = el(field, "details", undefined, "st-quality-details");
-    el(details, "summary", "Details");
-    const detail = el(details, "div", undefined, "st-quality-detail-copy");
-    const updateDetails = (value: "fast" | "balanced" | "careful") => {
-      const settings = qualitySettings(value);
-      detail.empty();
-      el(detail, "p", `Up to ${settings.pagesPerRequest} target page${settings.pagesPerRequest === 1 ? "" : "s"} per request.`);
-      const model = getModel();
-      let officialEndpoint = false;
-      try { officialEndpoint = endpointKey(getEndpoint()) === "https://api.openai.com/v1/responses"; } catch { /* A custom endpoint has unknown reasoning support. */ }
-      const official = subscription || officialEndpoint;
-      const outputCap = recognitionOutputAllowance(value, settings.pagesPerRequest, perPageOutputTokens, model, official);
-      const outputLimit = settings.pagesPerRequest > 1
-        ? `Maximum ${settings.pagesPerRequest}-target request output cap: ${outputCap.toLocaleString()} tokens.`
-        : `One-target request output cap: ${outputCap.toLocaleString()} tokens.`;
-      el(detail, "p", `Up to ${settings.neighborPages} neighbor page images before and after; nearby cached text limit: ${settings.textContextChars.toLocaleString()} characters. ${outputLimit}`);
-      const supportsReasoning = /^gpt-(?:5|6)(?:[.-]|$)/.test(model) && (subscription || officialEndpoint);
-      const reasoning = supportsReasoning ? `Reasoning: ${settings.reasoningEffort}.` : `Reasoning control unavailable for this model or provider.`;
-      el(detail, "p", `${reasoning} Context and reasoning can increase usage; estimates use this mode’s history.`);
-    };
-    updateDetails(quality);
-    details.addEventListener("toggle", () => { if (details.open) updateDetails(QUALITY[Number(slider.value)] ?? "fast"); });
     slider.addEventListener("input", () => {
       const value = QUALITY[Number(slider.value)] ?? "fast";
       slider.setAttribute("aria-valuetext", qualityLabel(value));
       setText(summary, qualitySummary(value));
-      updateDetails(value);
       change(value);
     });
   }

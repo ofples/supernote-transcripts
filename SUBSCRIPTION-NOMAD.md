@@ -1,12 +1,22 @@
-# Subscription sign-in and desktop pairing (0.10.2)
+# Subscription sign-in and desktop pairing
+
+## Connection recovery in 0.11.1
+
+The account and the recognition queue have separate state. Previously a successful reconnect could leave the queue's old "Session renewal uncertain" error in place. A healthy saved session or a newly completed sign-in now clears only matching login blockers, including the older message-only records, and makes never-sent pending pages eligible again. Existing manual pause, page errors, ambiguous request holds, quotas and budgets remain in effect. Recognition follows the existing automatic/manual settings.
+
+When the device reports that it is offline, no renewal or recognition request is sent and the saved session remains intact. Going online clears the corresponding offline blocker. A lost response after a renewal was actually sent still requires reconnecting because its replacement credential cannot be assumed; the plugin does not repeatedly reuse a possibly rotated refresh token. Storage failures and refresh backoff remain actionable errors rather than being mistaken for successful reconnection. Fresh pre-send account failures carry explicit recovery codes in the local notebook journal.
+
+Renewal behavior was checked against OpenAI's [accounts and sessions](https://developers.openai.com/siwc/token-sharing-open-source/profiles-and-sessions) and [errors and recovery](https://developers.openai.com/siwc/token-sharing-open-source/errors-and-recovery) guidance. Tokens remain in encrypted local SecretStorage.
+
+## Desktop pairing
 
 The first experimental SIWC device-code compatibility POST, using the Nomad’s own issued registration, returned HTTP 400 `invalid_client`. It issued no device code, so there was no poll or token exchange and no AI request. This rejects the tested request for that registration; it does not prove every possible device-code flow is unsupported.
 
-The desktop-assisted pairing fallback is implemented in 0.10.2 source and covered by automated tests. The desktop hosts a ten-minute relay on private IPv4. A temporary 128-bit code (32 hexadecimal characters, shown in groups of four) protects purpose-bound HKDF/AES-GCM messages. The `/info` response contains only a session ID and remaining lifetime. The desktop opens the normal browser authorization flow and receives the OAuth callback only on `127.0.0.1:19456`. The relay returns the callback result encrypted under the pairing code until the Nomad acknowledges it or the relay expires; only the OAuth code exchange is one-use. The Nomad redeems it using its own PKCE verifier and stores credentials in its own encrypted SecretStorage. Desktop credentials and shared-vault configuration are not copied or transferred. Desktop keeps its normal **Connect ChatGPT account** browser flow; on Nomad the legacy Android helper sign-in remains under **Advanced connection**. The helper is also retained for native notebook page links.
+The desktop-assisted pairing fallback is implemented in 0.10.2 source and covered by automated tests. The desktop hosts a ten-minute relay on private IPv4. A temporary 128-bit code (32 hexadecimal characters, shown in groups of four) protects purpose-bound HKDF/AES-GCM messages. The `/info` response contains only a session ID and remaining lifetime. The desktop opens the normal browser authorization flow and receives the OAuth callback only on `127.0.0.1:19456`. The relay returns the callback result encrypted under the pairing code until the Nomad acknowledges it or the relay expires; only the OAuth code exchange is one-use. The Nomad redeems it using its own PKCE verifier and stores credentials in its own encrypted SecretStorage. Desktop credentials and shared-vault configuration are not copied or transferred. Desktop keeps its normal **Connect ChatGPT account** browser flow; on Nomad the legacy Android helper sign-in remains under **Advanced**. The helper is also retained for native notebook page links.
 
 ### Pairing steps
 
-1. On desktop, open subscription settings and choose **Connect a Nomad**. Keep desktop Obsidian open. Copy or manually transcribe one displayed private IPv4 address and the temporary pairing code. It expires after ten minutes.
+1. On desktop, open subscription settings and choose **Connect a Nomad**. Keep desktop Obsidian open. Use **Copy** beside one displayed address (including its port), and copy the temporary pairing code. It expires after ten minutes.
 2. Connect the Nomad to the same Wi-Fi network. In its **Sign in from desktop** section, enter the displayed address and code, then choose **Connect**. The first version requires manual entry and does not discover devices automatically.
 3. Complete the OpenAI sign-in and approval in the normal browser opened on desktop. The callback returns to the desktop loopback listener.
 4. The Nomad receives the encrypted one-use result, exchanges the code with its own PKCE verifier, and saves its own credentials in encrypted native storage.

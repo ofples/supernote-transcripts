@@ -146,7 +146,7 @@ export interface NotebookState {
   pageAttempts?: Record<string, { fingerprint: string; count: number }>;
   /** Old failures did not retain a reliable page ID. Explicit notebook retry only. */
   legacyPageFailure?: string;
-  executionIssue?: { scope: "source" | "batch"; reason: string; recipe?: string };
+  executionIssue?: { scope: "source" | "batch"; reason: string; recipe?: string; code?: string };
 }
 export interface QueueTask {
   source: string;

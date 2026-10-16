@@ -1,7 +1,7 @@
 {
   "id": "nomad-transcripts",
   "name": "Supernote Transcripts",
-  "version": "0.11.0",
+  "version": "0.11.1",
   "minAppVersion": "1.7.2",
   "description": "Keep selected Supernote notebooks mirrored as AI-recognized Markdown, with resumable updates and folder-specific glossaries.",
   "author": "Personal tools",

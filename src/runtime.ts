@@ -89,6 +89,10 @@ const emptyProgress = (): Progress => ({
 const clone = <T>(value: T): T => JSON.parse(JSON.stringify(value));
 const readable = (error: unknown) =>
   error instanceof Error ? error.message : String(error);
+// Older journals stored only the display message. Keep this migration narrow:
+// reconnecting must never release quota, spending or ambiguous page holds.
+const subscriptionAuthStop = (reason?: string, code?: string) => code === "subscription_auth" || !code &&
+  /^(?:Session renewal uncertain\. Sign in again\.|ChatGPT session renewal failed\. Sign in again\.|Connect your ChatGPT plan in settings first\.|ChatGPT connection interrupted\. No automatic request retry\.)$/.test(reason ?? "");
 async function hash(value: string) {
   return Array.from(
     new Uint8Array(
@@ -130,7 +134,41 @@ export default class SupernoteTranscripts extends Plugin implements Controller {
   set provider(value:"api"|"subscription") { if(this.task)throw Error("Pause and wait for active requests before changing provider."); localStorage.setItem(`${this.devicePrefix}:provider`,value);this.emit(); }
   get showPageHeadings() { return this.config.showPageHeadings!==false; }
   set showPageHeadings(value:boolean) { this.config.showPageHeadings=value;for(const s of Object.values(this.store.notebooks))if(this.sourceSelected(s.source)&&!["missing","conflict"].includes(s.status))this.enqueue(s.source);this.emit(); }
-  private get session() { return this.chatGPT??=new ChatGPTSession(this.app,()=>this.emit()); }
+  private subscriptionRecovery?: Promise<void>;
+  private get session() { return this.chatGPT??=new ChatGPTSession(this.app,()=>{
+    this.emit();
+    void this.recoverSubscriptionConnection().catch(() => this.emit());
+  }); }
+  private recoverSubscriptionConnection(): Promise<void> {
+    if(this.subscriptionRecovery)return this.subscriptionRecovery;
+    if(this.disposed||this.task||this.stateStorageIssue||this.provider!=="subscription"||
+      !this.chatGPT?.connected||this.chatGPT.needsSignIn||this.chatGPT.status!=="ChatGPT plan connected")return Promise.resolve();
+    const states=Object.values(this.store.notebooks).filter(s=>s.executionIssue?.scope==="batch"&&
+      (subscriptionAuthStop(s.executionIssue.reason,s.executionIssue.code)||
+        s.executionIssue.code==="subscription_offline"&&(typeof navigator==="undefined"||navigator.onLine!==false)));
+    const blocked=this.progress.executionBlocked;
+    const clearProgress=subscriptionAuthStop(blocked)||states.some(s=>s.executionIssue?.reason===blocked);
+    if(!states.length&&!clearProgress)return Promise.resolve();
+    this.subscriptionRecovery=(async()=>{
+      for(const state of states){
+        const reason=state.executionIssue!.reason;
+        delete state.executionIssue;
+        if(state.error===reason)delete state.error;
+        if(state.status==="failed")state.status=pendingPages(state).length?"queued":Object.keys(state.pageIssues??{}).length?"partial":"current";
+        if(this.sourceSelected(state.source)&&!["missing","conflict","excluded"].includes(state.status)&&
+          !state.legacyPageFailure&&pendingPages(state).length)this.enqueue(state.source);
+      }
+      if(clearProgress){
+        this.progress.executionBlocked=Object.values(this.store.notebooks).find(s=>s.executionIssue?.scope==="batch")?.executionIssue?.reason;
+        if(this.progress.detail===blocked)this.progress.detail=this.progress.paused
+          ? "ChatGPT is connected. Saved pages are preserved; resume when ready."
+          : "ChatGPT is connected. Pending pages can continue with your update settings.";
+      }
+      if(states.length)await this.persist();
+      this.emit();
+    })().finally(()=>{this.subscriptionRecovery=undefined;});
+    return this.subscriptionRecovery;
+  }
   get subscriptionStatus(){return {connected:this.session.connected,needsSignIn:this.session.needsSignIn,pairingPending:this.session.pairingPending,status:this.session.status,email:this.session.email};}
   private get subscriptionBook(){return this.planUsage??=new SubscriptionUsage(localStorage,`${this.devicePrefix}:subscription-usage-v1`);}
   get subscriptionUsage(){return {...this.subscriptionBook.snapshot(),dailyLimit:this.costs.settings.dailyRequests};}
@@ -312,7 +350,7 @@ export default class SupernoteTranscripts extends Plugin implements Controller {
     for (const state of Object.values(this.store.notebooks)) {
       if (state.status === "recognizing" || state.status === "checking")
         state.status = "queued";
-      if(state.status==="failed"&&!Object.keys(state.pageIssues??{}).length&&!state.legacyPageFailure&&
+      if(state.status==="failed"&&!Object.keys(state.pageIssues??{}).length&&!state.legacyPageFailure&&!state.executionIssue&&
           /stream.*(?:complete|finish)|AI response.*(?:incomplete|empty)|connection.*interrupted|AI request failed.*HTTP 5\d\d/i.test(state.error??"")){
         state.legacyPageFailure=state.error; migratedFailure=true;
       }
@@ -364,7 +402,7 @@ export default class SupernoteTranscripts extends Plugin implements Controller {
         !this.disposed &&
         !this.progress.paused &&
         this.active &&
-        !this.task && !this.stateStorageIssue && !this.progress.executionBlocked && !this.progress.budgetBlocked
+        !this.task && !this.subscriptionRecovery && !this.stateStorageIssue && !this.progress.executionBlocked && !this.progress.budgetBlocked
       )
         void this.update(true).catch((error) =>
           this.stage("Needs attention", readable(error)),
@@ -372,6 +410,9 @@ export default class SupernoteTranscripts extends Plugin implements Controller {
     };
     this.registerDomEvent(document, "visibilitychange", wake);
     this.registerDomEvent(window, "focus", wake);
+    this.registerDomEvent(window, "online", () => {
+      void this.recoverSubscriptionConnection().catch(() => this.emit());
+    });
     const nativeApp = (window as any).Capacitor?.Plugins?.App;
     if (Platform.isAndroidApp && nativeApp?.getState) {
       try {
@@ -644,6 +685,7 @@ export default class SupernoteTranscripts extends Plugin implements Controller {
     else this.store.queue.push({ source, force, ...(pageIds?{pageIds:[...new Set(pageIds)]}:{}) });
   }
   async update(automatic = false): Promise<void> {
+    await this.subscriptionRecovery;
     this.assertStateReady();
     this.assertAttemptStorageReady();
     if (this.task) {
@@ -669,6 +711,7 @@ export default class SupernoteTranscripts extends Plugin implements Controller {
       this.task = null;
       this.automaticRun = false;
       this.progress.running = false;
+      await this.recoverSubscriptionConnection();
       this.emit();
     }
   }
@@ -1104,7 +1147,7 @@ export default class SupernoteTranscripts extends Plugin implements Controller {
             : "failed";
           state.error = readable(error);
           if(isRecognitionFailure(error)&&error.fatal){
-            state.executionIssue??={scope:error.scope==="batch"?"batch":"source",reason:readable(error),recipe:this.recipes.get(entry.profileId)};
+            state.executionIssue??={scope:error.scope==="batch"?"batch":"source",reason:readable(error),recipe:this.recipes.get(entry.profileId),...(error.code?{code:error.code}:{})};
             if(error.scope==="batch")this.progress.executionBlocked=readable(error);
           }
           if(error instanceof Error&&error.name==="SourceChangedError")state.executionIssue??={scope:"source",reason:readable(error),recipe:this.recipes.get(entry.profileId)};
@@ -1410,7 +1453,7 @@ export default class SupernoteTranscripts extends Plugin implements Controller {
           if(!guardFailed&&!(error instanceof Error&&error.name==="SourceChangedError")&&(phase==="render"||phase==="recognize")&&!(error instanceof BudgetBlocked)&&(!isRecognitionFailure(error)||!error.fatal)&&await reader.revision(entry.path)===descriptor.revision){
             await commit(async()=>{for(const page of targets)await markFailure(page,readable(error),isRecognitionFailure(error)?error.kind:phase==="render"?"render":"provider");await this.persist();});return;
           }
-          workerFailed=true;if(error instanceof BudgetBlocked)this.progress.budgetBlocked=readable(error);if(isRecognitionFailure(error)&&error.fatal){state.executionIssue={scope:error.scope==="batch"?"batch":"source",reason:readable(error),recipe:resolved.recipe};if(error.scope==="batch")this.progress.executionBlocked=readable(error);}if(error instanceof Error&&error.name==="SourceChangedError")state.executionIssue={scope:"source",reason:readable(error),recipe:resolved.recipe};throw error;
+          workerFailed=true;if(error instanceof BudgetBlocked)this.progress.budgetBlocked=readable(error);if(isRecognitionFailure(error)&&error.fatal){state.executionIssue={scope:error.scope==="batch"?"batch":"source",reason:readable(error),recipe:resolved.recipe,...(error.code?{code:error.code}:{})};if(error.scope==="batch")this.progress.executionBlocked=readable(error);}if(error instanceof Error&&error.name==="SourceChangedError")state.executionIssue={scope:"source",reason:readable(error),recipe:resolved.recipe};throw error;
         }finally{for(const page of planned)activePages.delete(page.number);this.progress.activePages=[...activePages].sort((a,b)=>a-b);this.emit();}
       },mayStart);
       this.progress.reused += descriptor.pages.filter(

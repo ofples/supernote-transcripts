@@ -38,11 +38,11 @@ async function snapshots(page) {
   });
 }
 
-async function layout(page, root, label) {
-  return page.evaluate((name) => {
+async function layout(page, root, label, minimumTarget = 48) {
+  return page.evaluate(({ name, minimumTarget }) => {
     const modal = document.querySelector(".st-fullscreen-modal");
     const footer = modal?.querySelector(".st-footer");
-    const buttons = [...(modal?.querySelectorAll(".st-pairing-start, .st-pairing-copy, .st-pairing-cancel, .st-pairing-connect") ?? [])];
+    const buttons = [...(modal?.querySelectorAll(".st-pairing-start, .st-pairing-copy, .st-pairing-cancel, .st-pairing-connect, .st-pairing-address-copy") ?? [])];
     const bounds = (element) => {
       const r = element.getBoundingClientRect();
       return { left: Math.round(r.left), top: Math.round(r.top), right: Math.round(r.right), bottom: Math.round(r.bottom), width: Math.round(r.width), height: Math.round(r.height) };
@@ -54,12 +54,13 @@ async function layout(page, root, label) {
       modal: modal ? bounds(modal) : null,
       footer: footer ? bounds(footer) : null,
       pairingTargets: buttons.map((button) => bounds(button)),
-      targetsAtLeast48px: buttons.every((button) => {
+      minimumTargetPx: minimumTarget,
+      targetsAtLeastMinimum: buttons.every((button) => {
         const r = button.getBoundingClientRect();
-        return r.width >= 48 && r.height >= 48;
+        return r.width >= minimumTarget && r.height >= minimumTarget;
       }),
     };
-  }, label);
+  }, { name: label, minimumTarget });
 }
 
 {
@@ -94,9 +95,9 @@ async function layout(page, root, label) {
   assert((await card.innerText()).includes("Code expires in about 10 minutes."), "pairing expiry is missing");
   await card.getByRole("button", { name: "Copy pairing code", exact: true }).click();
   assert(await page.evaluate(() => window.__syntheticClipboard) === secretFixtureCode, "Copy code did not copy the complete ungrouped value");
-  assert(await root.locator(".st-connection-details:not(.st-advanced-connection) button").filter({ hasText: "Disconnect ChatGPT account" }).count() === 1, "pairing card hid the existing connected account controls");
-  const desktopLayout = await layout(page, root, "desktop-pairing-1100x900");
-  assert(!desktopLayout.documentOverflowX && desktopLayout.targetsAtLeast48px, "desktop pairing controls overflow or miss the 48px target size");
+  assert(await root.locator(".st-settings-connection > button").filter({ hasText: "Disconnect ChatGPT account" }).count() === 1, "pairing card hid the existing connected account controls");
+  const desktopLayout = await layout(page, root, "desktop-pairing-1100x900", 36);
+  assert(!desktopLayout.documentOverflowX && desktopLayout.targetsAtLeastMinimum, `desktop pairing controls overflow or miss the 36px target size: ${JSON.stringify(desktopLayout)}`);
   await page.screenshot({ path: join(evidenceDir, "desktop-pairing-1100x900.png"), fullPage: false });
   await card.getByRole("button", { name: "Cancel pairing", exact: true }).click();
   assert(await root.locator(".st-pairing-card").count() === 0, "Cancel pairing left the card open");
@@ -114,7 +115,7 @@ async function layout(page, root, label) {
     addressesAndStatusDisplayed: true, fullCodeDisplayedInEightGroups: true,
     copyUsesFullUnformattedCode: true, cancelCallsFakeOnce: true,
     connectedAccountAndConfigPreserved: true, noHorizontalOverflow: !desktopLayout.documentOverflowX,
-    pairingTargetsAtLeast48px: desktopLayout.targetsAtLeast48px,
+    pairingTargetsAtLeast36px: desktopLayout.targetsAtLeastMinimum,
     externalRequests: externalRequests.length, browserErrors: errors.length,
   });
   await browser.close();
@@ -155,18 +156,19 @@ async function layout(page, root, label) {
   assert(await address.inputValue() === "192.168.1.40:19457" && await code.inputValue() === groupedFixtureCode, "Cancel sign-in lost address/code drafts");
   assert((await snapshots(page)) === beforeCancel, "Cancel sign-in changed the fake account/config state");
 
-  const advanced = root.locator(".st-advanced-connection");
-  assert(await advanced.count() === 1 && await advanced.locator("summary").innerText() === "Advanced connection", "Nomad Advanced connection disclosure missing");
-  assert(await advanced.locator("button").filter({ hasText: "Reconnect ChatGPT account" }).count() === 1, "legacy reconnect control missing inside Advanced connection");
+  const advanced = root.locator(".st-settings-advanced");
+  assert(await advanced.count() === 1 && await advanced.locator("summary").innerText() === "Advanced", "Nomad Advanced disclosure missing");
+  assert(await root.locator(".st-settings-section details details").count() === 0, "Nomad settings contain nested Advanced disclosures");
+  assert(await advanced.locator("button").filter({ hasText: "Reconnect ChatGPT account" }).count() === 1, "legacy reconnect control missing inside Advanced");
   assert(await root.getByRole("button", { name: /Reconnect ChatGPT account/ }).count() === 0, "legacy reconnect control is exposed before opening Advanced connection");
   await advanced.locator("summary").click();
-  assert(await advanced.getByRole("button", { name: "Reconnect ChatGPT account", exact: true }).isVisible(), "legacy reconnect does not open from Advanced connection");
+  assert(await advanced.getByRole("button", { name: "Reconnect ChatGPT account", exact: true }).isVisible(), "legacy reconnect does not open from Advanced");
   await advanced.locator("summary").click();
   await root.locator(".st-body").evaluate((body) => { body.scrollTop = 32; });
   await page.screenshot({ path: join(evidenceDir, "nomad-pairing-768x1024.png"), fullPage: false });
 
   const nomadLayout = await layout(page, root, "nomad-pairing-768x1024");
-  assert(!nomadLayout.documentOverflowX && nomadLayout.targetsAtLeast48px, "Nomad pairing controls overflow or miss the 48px target size");
+  assert(!nomadLayout.documentOverflowX && nomadLayout.targetsAtLeastMinimum, "Nomad pairing controls overflow or miss the 48px target size");
   await address.focus();
   // The builder's generic desktop-style frame has a 16px inset; Nomad uses a full-screen modal.
   await root.evaluate((element) => { element.style.inset = "0px"; });
@@ -190,9 +192,9 @@ async function layout(page, root, label) {
     platform: "nomad", viewport: nomadLayout.viewport,
     desktopPairingDefault: true, draftFieldsAndSettingsPreserved: true,
     pairingCalledOnceWithNormalizedValues: true, finishSignInReachable: finishCount === counts.finish + 1,
-    legacyBrowserControlHiddenInAdvancedByDefault: true,
+    legacyBrowserControlHiddenInTheSingleAdvancedDisclosureByDefault: true,
     noHorizontalOverflow: !nomadLayout.documentOverflowX,
-    pairingTargetsAtLeast48px: nomadLayout.targetsAtLeast48px,
+    pairingTargetsAtLeast48px: nomadLayout.targetsAtLeastMinimum,
     simulatedKeyboardModalHeight: keyboardLayout.modal.height,
     keyboardFixtureUsesFullScreenFrame: true,
     footerVisibleAboveSimulatedKeyboard: keyboardLayout.footer.bottom <= 664,

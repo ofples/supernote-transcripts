@@ -1,6 +1,12 @@
 # Supernote Transcripts
 
-## Version 0.11 — active on Nomad and desktop Vedas
+## Version 0.11.1 — simpler settings and connection recovery
+
+Settings and source forms now use ordinary labelled sections with one **Advanced** disclosure each. Desktop controls use compact labelled rows, consistent typography and outlined secondary buttons. Pairing has **Copy** beside every complete desktop address.
+
+A successful ChatGPT sign-in clears stale login-related queue blockers. Known offline attempts do not send a renewal request or invalidate the saved login. Page failure holds, budgets, cached text and pause settings are retained. See [SUBSCRIPTION-NOMAD.md](SUBSCRIPTION-NOMAD.md) and [VALIDATION.md](VALIDATION.md) for behavior and verification status.
+
+## Previous release: Version 0.11
 
 Source controls, provisional device OCR, readable page provenance, text-only whole-document cleanup, desktop page viewing and MD Reader 2.1.1 page chips are implemented. Validation passes: **377/377** plugin tests, the MD Reader suites (**123** logic and **106** UI checks), and **5/5** page-link browser/integration checks. Guarded activation and installed-byte evidence confirm Nomad Transcripts 0.11.0 active on Nomad and desktop Vedas, with MD Reader 2.1.1 active on Nomad only. Desktop and Nomad live UI checks passed, and 19/19 reader chips rendered correctly. Protected state was preserved; both workers remain idle and paused, and activation made zero recognition requests. No paid calls were made; real provider recognition and cleanup quality were not exercised. See [ENHANCEMENTS.md](ENHANCEMENTS.md) and [VALIDATION.md](VALIDATION.md). Native Digest capture remains deferred.
 

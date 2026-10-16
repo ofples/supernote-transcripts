@@ -276,6 +276,8 @@ export class ChatGPTSession {
     await this.secureStorage();
     if (this.starting || this.finishing || this.disconnecting) throw Error("Finish the current account operation first.");
     if (!this.record.tokens) throw Error("Connect your ChatGPT plan in settings first.");
+    if (typeof navigator !== "undefined" && navigator.onLine === false)
+      throw Error("Offline. Connect to the internet, then continue recognition.");
     // Waiting callers must join the same rotation before considering its stop marker.
     if (this.renewing) await this.renewing;
     if (this.record.renewalBlocked) throw Error("Session renewal uncertain. Sign in again.");
@@ -293,7 +295,7 @@ export class ChatGPTSession {
             await identity(r.json.id_token, keys.json, this.record.clientId, undefined, this.record.subject);
           }
           const next = { ...this.record, tokens, renewalBlocked: undefined };
-          await this.persist(next); this.record = next;
+          await this.persist(next); this.record = next; this.setStatus("ChatGPT plan connected");
         } catch (error) { this.setStatus("Session renewal uncertain. Sign in again."); throw error; }
       })().finally(() => { this.renewing = undefined; });
       await this.renewing;
@@ -318,7 +320,7 @@ export class ChatGPTSession {
     ] }] });
     let token: string;
     try { token = await this.access(); }
-    catch (error) { throw new RecognitionFailure("provider", error instanceof Error ? error.message : "Reconnect your ChatGPT account.", { scope: "batch" }); }
+    catch (error) { throw new RecognitionFailure("provider", error instanceof Error ? error.message : "Reconnect your ChatGPT account.", { scope: "batch", code: typeof navigator !== "undefined" && navigator.onLine === false ? "subscription_offline" : this.needsSignIn || !this.connected ? "subscription_auth" : "subscription_preflight" }); }
     if (await beforeSend() !== true) return null;
     let r;
     try { r = await this.native(RESOURCE + "/responses", "POST", body, { Authorization: "Bearer " + token, "Content-Type": "application/json" }); }

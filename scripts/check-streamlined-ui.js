@@ -82,7 +82,7 @@ for (const platform of platforms) {
   await root.locator(".st-output-browser").waitFor();
   await root.locator(".st-output-browser .st-browser-entry").filter({ hasText: "Fixture Output" }).click();
   await root.getByRole("button", { name: "Choose this folder" }).click();
-  await root.locator(".st-instructions summary").click();
+  assert(await root.getByText("Instructions and reference files", { exact: true }).isVisible(), `${platform}: instructions and reference files are not directly accessible in the editor`);
   await root.getByRole("button", { name: "Choose reference files" }).click();
   await root.locator(".st-glossary-picker").waitFor();
   const glossaryLabel = root.locator(".st-glossary-picker label").filter({ hasText: "Fixture glossary.md" }).first();

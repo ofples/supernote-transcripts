@@ -1910,3 +1910,190 @@ test("runtime does not open a removed page and desktop uses its viewer or verifi
   await assert.rejects(missing.f.plugin.openNotebookPage(missing.state.output,"native:1",1),/original notebook could not be read/);
   assert.equal(missing.f.app.modalOpens,undefined);
 });
+
+test("connected subscription recovery clears only auth stops and preserves quota, source issues, page holds and pause", async () => {
+  const f = fixture(3);
+  f.plugin.provider = "subscription";
+  f.plugin.aiEnabled = false;
+  await f.plugin.update();
+  const state = f.plugin.store.notebooks[source];
+  const authReason = "Session renewal uncertain. Sign in again.";
+  state.pages["native:1"] = { fingerprint: "f1", number: 1, text: "saved page", recipe: "recipe" };
+  state.pageIssues = { "native:2": { fingerprint: "f2", number: 2, status: "failed", kind: "interrupted", reason: "Request outcome is unconfirmed.", attempts: 1, updatedAt: new Date().toISOString() } };
+  state.status = "failed";
+  state.error = authReason;
+  state.executionIssue = { scope: "batch", reason: authReason, code: "subscription_auth", recipe: "recipe" };
+  const sourcePath = "/storage/emulated/0/Note/Reflections/other.note";
+  const sourceReason = "This source has an invalid endpoint.";
+  f.plugin.store.notebooks[sourcePath] = {
+    ...structuredClone(state), source: sourcePath, id: "other", output: "Mirror/other.md", order: [], desired: [], pages: {}, pageIssues: undefined,
+    status: "failed", error: sourceReason, executionIssue: { scope: "source", reason: sourceReason, recipe: "source-recipe" },
+  };
+  const quotaPath = "/storage/emulated/0/Note/Reflections/quota.note";
+  const quotaReason = "Daily ChatGPT request limit reached.";
+  f.plugin.store.notebooks[quotaPath] = {
+    ...structuredClone(state), source: quotaPath, id: "quota", output: "Mirror/quota.md", order: [], desired: [], pages: {}, pageIssues: undefined,
+    status: "failed", error: quotaReason, executionIssue: { scope: "batch", reason: quotaReason, code: "subscription_quota", recipe: "quota-recipe" },
+  };
+  f.plugin.store.queue = [];
+  f.plugin.progress.executionBlocked = authReason;
+  f.plugin.progress.detail = authReason;
+  f.plugin.progress.budgetBlocked = "Daily ChatGPT request limit reached.";
+  f.plugin.progress.paused = true;
+  f.plugin.chatGPT = { connected: true, needsSignIn: false, status: "ChatGPT plan connected" };
+  const reservation = f.plugin.subscriptionBook.reserve(source, "test-model", "recipe", 4);
+  f.plugin.subscriptionBook.finish(reservation, { usage: { input_tokens: 5, output_tokens: 2 } });
+  const usage = structuredClone(f.plugin.subscriptionUsage);
+  const apiUsage = structuredClone(f.plugin.costs.total);
+  const calls = f.calls.length;
+
+  await f.plugin.recoverSubscriptionConnection();
+
+  assert.equal(state.executionIssue, undefined);
+  assert.equal(state.error, undefined);
+  assert.equal(state.status, "queued");
+  assert.deepEqual(state.pages["native:1"], { fingerprint: "f1", number: 1, text: "saved page", recipe: "recipe" });
+  assert.deepEqual(state.pageIssues["native:2"], { fingerprint: "f2", number: 2, status: "failed", kind: "interrupted", reason: "Request outcome is unconfirmed.", attempts: 1, updatedAt: state.pageIssues["native:2"].updatedAt });
+  assert.equal(f.plugin.store.notebooks[sourcePath].executionIssue.scope, "source");
+  assert.equal(f.plugin.store.notebooks[quotaPath].executionIssue.code, "subscription_quota");
+  assert.equal(f.plugin.progress.executionBlocked, quotaReason);
+  assert.equal(f.plugin.progress.budgetBlocked, "Daily ChatGPT request limit reached.");
+  assert.equal(f.plugin.progress.paused, true);
+  assert.deepEqual(f.plugin.store.queue, [{ source, force: false }]);
+  assert.deepEqual(f.plugin.subscriptionUsage, usage);
+  assert.deepEqual(f.plugin.costs.total, apiUsage);
+  assert.equal(f.calls.length, calls);
+});
+
+test("a stale legacy progress banner clears after a verified subscription reconnect", async () => {
+  const f = fixture(1);
+  f.plugin.provider = "subscription";
+  const reason = "Session renewal uncertain. Sign in again.";
+  f.plugin.progress.executionBlocked = reason;
+  f.plugin.progress.detail = reason;
+  f.plugin.chatGPT = { connected: true, needsSignIn: false, status: "ChatGPT plan connected" };
+
+  await f.plugin.recoverSubscriptionConnection();
+
+  assert.equal(f.plugin.progress.executionBlocked, undefined);
+  assert.match(f.plugin.progress.detail, /ChatGPT is connected/);
+  assert.equal(f.calls.length, 0);
+});
+
+test("loaded subscription session callback clears a stale auth banner", async () => {
+  const f = fixture(1);
+  f.plugin.provider = "subscription";
+  const secret = {
+    hostId: "urn:uuid:00000000-0000-4000-8000-000000000000",
+    clientId: "oaiapp_test",
+    subject: "subject",
+    email: "test@example.test",
+    tokens: {
+      accessToken: "test-access",
+      refreshToken: "test-refresh",
+      scope: "openid chatgpt.tokens.use.direct",
+      expiresAt: Date.now() + 3_600_000,
+      earliestRefreshAt: 0,
+    },
+  };
+  f.app.secretStorage = {
+    isEncryptionAvailable: async () => true,
+    getSecret: (key) => {
+      assert.equal(key, "nomad-transcripts-chatgpt-session");
+      return JSON.stringify(secret);
+    },
+    setSecret: async () => assert.fail("session recovery should not write credentials"),
+  };
+  const reason = "ChatGPT connection interrupted. No automatic request retry.";
+  f.plugin.progress.executionBlocked = reason;
+  f.plugin.progress.detail = reason;
+
+  await f.plugin.session.initialize();
+  await f.plugin.subscriptionRecovery;
+
+  assert.equal(f.plugin.chatGPT.connected, true);
+  assert.equal(f.plugin.chatGPT.needsSignIn, false);
+  assert.equal(f.plugin.chatGPT.status, "ChatGPT plan connected");
+  assert.equal(f.plugin.progress.executionBlocked, undefined);
+  assert.match(f.plugin.progress.detail, /ChatGPT is connected/);
+  assert.equal(f.calls.length, 0);
+});
+
+test("subscription recovery leaves auth-looking banners untouched unless the ready-state gates pass", async () => {
+  const cases = [
+    { name: "API provider", provider: "api", connected: true, needsSignIn: false, status: "ChatGPT plan connected" },
+    { name: "disconnected account", provider: "subscription", connected: false, needsSignIn: false, status: "Disconnected" },
+    { name: "pending sign-in", provider: "subscription", connected: true, needsSignIn: true, status: "ChatGPT plan connected" },
+    { name: "pending account status", provider: "subscription", connected: true, needsSignIn: false, status: "Checking connection" },
+    { name: "saved-state blocker", provider: "subscription", connected: true, needsSignIn: false, status: "ChatGPT plan connected", stateBlocked: "Notebook state could not be saved." },
+  ];
+  const reason = "Session renewal uncertain. Sign in again.";
+  for (const item of cases) {
+    const f = fixture(1);
+    f.plugin.provider = item.provider;
+    f.plugin.progress.executionBlocked = reason;
+    f.plugin.stateStorageIssue = item.stateBlocked;
+    f.plugin.chatGPT = { connected: item.connected, needsSignIn: item.needsSignIn, status: item.status };
+    await f.plugin.recoverSubscriptionConnection();
+    assert.equal(f.plugin.progress.executionBlocked, reason, item.name);
+  }
+});
+
+test("typed preflight stops and refresh-backoff banners remain blocked on a ready cached session", async () => {
+  const f = fixture(1);
+  f.plugin.provider = "subscription";
+  const reason = "Session renewal is not yet available.";
+  f.plugin.progress.executionBlocked = reason;
+  f.plugin.chatGPT = { connected: true, needsSignIn: false, status: "ChatGPT plan connected" };
+  const state = {
+    source, id: "test", ruleId: "r", output: "Mirror/a.md", revision: "", order: [], desired: [], pages: {}, status: "failed",
+    error: reason, executionIssue: { scope: "batch", reason, code: "subscription_preflight", recipe: "recipe" },
+  };
+  f.plugin.store.notebooks[source] = state;
+
+  await f.plugin.recoverSubscriptionConnection();
+
+  assert.equal(state.executionIssue.code, "subscription_preflight");
+  assert.equal(f.plugin.progress.executionBlocked, reason);
+  assert.equal(f.calls.length, 0);
+});
+
+test("failed auth-state persistence blocks the next dispatch", async () => {
+  const f = fixture(1);
+  f.plugin.provider = "subscription";
+  f.plugin.aiEnabled = false;
+  await f.plugin.update();
+  const state = f.plugin.store.notebooks[source];
+  const reason = "ChatGPT connection interrupted. No automatic request retry.";
+  state.status = "failed";
+  state.executionIssue = { scope: "batch", reason, code: "subscription_auth", recipe: "recipe" };
+  f.plugin.progress.executionBlocked = reason;
+  f.plugin.chatGPT = { connected: true, needsSignIn: false, status: "ChatGPT plan connected" };
+  f.app.vault.adapter.write = async () => { throw Error("disk full"); };
+
+  await assert.rejects(f.plugin.recoverSubscriptionConnection(), /Notebook state could not be saved/);
+  assert.ok(f.plugin.progress.stateBlocked);
+  await assert.rejects(f.plugin.update(), /Notebook state could not be saved/);
+  assert.equal(f.calls.length, 0);
+});
+
+test("typed pre-send auth stops are not migrated into ambiguous paid-page holds on load", async () => {
+  const f = fixture(1);
+  f.plugin.provider = "subscription";
+  f.plugin.aiEnabled = false;
+  await f.plugin.update();
+  const state = f.plugin.store.notebooks[source];
+  const reason = "Session renewal uncertain. Sign in again.";
+  state.status = "failed";
+  state.error = reason;
+  state.executionIssue = { scope: "batch", reason, code: "subscription_auth", recipe: "recipe" };
+  await f.plugin.persist();
+
+  const restarted = new Runtime(f.app);
+  restarted.reader = () => f.reader;
+  await restarted.onload();
+
+  assert.equal(restarted.store.notebooks[source].legacyPageFailure, undefined);
+  assert.equal(restarted.store.notebooks[source].executionIssue.code, "subscription_auth");
+  assert.equal(restarted.store.notebooks[source].pageIssues, undefined);
+});
