@@ -4,7 +4,7 @@
 
 | Component | Source | Candidate | Installation boundary |
 | --- | --- | --- | --- |
-| Supernote Transcripts | `ofples/supernote-transcripts` | 0.11.3 | Standalone plugin; no theme or reader requirement |
+| Supernote Transcripts | `ofples/supernote-transcripts` | 0.12.0 | Standalone plugin; no theme or reader requirement |
 | MD Reader fork | `ofples/obsidian-md-reader` | 2.1.2 | Optional pagination; replaces upstream under the same `md-reader` ID |
 | Paper | `ofples/obsidian-paper` | 0.5.10 | Optional theme |
 | Sidebar | Paper repository, separate plugin | 0.4.1 | Optional navigation; normal Markdown fallback without a reader |
@@ -22,7 +22,7 @@ See [the integration contract and fallback matrix](INTEGRATION.md).
 
 ## Verified source checks
 
-- Transcripts 0.11.3: 404 tests pass; TypeScript check and production build pass.
+- Transcripts 0.12.0: 432 tests pass; TypeScript check and production build pass. The rendered-browser checker passes 264 assertions across wide desktop, narrow desktop and Nomad layouts, without outbound requests or recognition.
 - Canonical Reader 2.1.2 at `2c05d4b0a8d2ec2dcb3e7be6b553947302efdbe3`: 123 logic and 113 UI checks pass.
 - A headless Chromium check combines the actual Reader chapter renderer with the actual Transcripts adapter, without Paper or Sidebar. It checks inline chips, provider unload, disabled and unsupported adapters, and partial-render errors with ordinary Markdown fallback.
 - Paper's coordinated source checks: offline build, all pinned Reader hashes, 24 Node tests and 10 synthetic Chromium component/fullscreen combinations pass. These synthetic checks are not live Obsidian or device acceptance.
@@ -35,4 +35,4 @@ Source and fixture checks cover optional provider absence, disabled/legacy/incom
 
 Keep public release tags, repository visibility changes and device deployment separate from this preparation. The user selected MIT for Paper/Sidebar's original code on 2026-10-16; the Paper repository owns that license implementation and its distribution notices. MD Reader's MIT attribution, Transcripts' GPL-3.0-or-later and the fonts' SIL OFL notices remain separate.
 
-Previously installed versions are Transcripts 0.11.2 and MD Reader 2.1.1. The pending handwriting-edit/native Cloud upload and foreground desktop page-viewer checks from [workflow validation](VALIDATION.md) are still open; this source restructuring does not claim to complete them.
+Desktop Transcripts 0.12.0 is installed and active with preservation checks and live Sources/Queue/Settings/source-form verification. Nomad 0.12.0 files are staged and hash-verified; its active version remains 0.11.2 while a Reflection source-settings form is open. Nomad MD Reader remains 2.1.1. Live settings propagation needs both devices updated and is still pending. The handwriting-edit/native Cloud upload and foreground desktop page-viewer checks from [workflow validation](VALIDATION.md) remain open. See [the cumulative checklist](FEEDBACK-TRACKER.md).

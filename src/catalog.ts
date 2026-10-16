@@ -15,6 +15,8 @@ export interface PortableMirror {
 export interface SharedMirror extends PortableMirror {
   id: string;
   name: string;
+  revision?: string;
+  ancestors?: string[];
 }
 export interface CatalogProblem { path: string; reason: string }
 export class CatalogConflictError extends Error {}
@@ -61,12 +63,26 @@ function portable(input: PortableMirror): PortableMirror {
   return { profile: { id: p.id, name: p.name, model: p.model, endpoint: p.endpoint,
     prompt: p.prompt, glossaries, ...(p.quality === undefined ? {} : { quality: p.quality }) }, output: input.output, recursive: input.recursive, exclude };
 }
-function validate(value: any): SharedMirror {
+async function validate(value: any): Promise<SharedMirror> {
   if (!value || value.kind !== "mirror" || value.version !== 1 ||
       !identity(value.id) || !text(value.name, 300)) throw new Error("Invalid shared mirror record.");
-  return { id: value.id, name: value.name, ...portable(value) };
+  const mirror: SharedMirror = { id: value.id, name: value.name, ...portable(value) };
+  if (value.revision !== undefined || value.ancestors !== undefined) {
+    if (!digest(value.revision) || !Array.isArray(value.ancestors) || value.ancestors.length > 256 ||
+        value.ancestors.some((item: unknown) => !digest(item) || item === value.revision) ||
+        new Set(value.ancestors).size !== value.ancestors.length)
+      throw Error("Invalid shared mirror revision history.");
+    if (value.revision !== await mirrorRevision(mirror)) throw Error("Shared mirror revision does not match its settings.");
+    mirror.revision = value.revision; mirror.ancestors = [...value.ancestors];
+  }
+  return mirror;
 }
-function decode(body: string): SharedMirror {
+function digest(value: unknown): value is string { return typeof value === "string" && /^[a-f0-9]{64}$/.test(value); }
+function content(mirror: SharedMirror): SharedMirror { return { id: mirror.id, name: mirror.name, ...portable(mirror) }; }
+export async function mirrorRevision(mirror: SharedMirror): Promise<string> {
+  return sharedHash(encode(content(mirror)));
+}
+function decode(body: string): Promise<SharedMirror> {
   if (!body.startsWith(HEADER) || !body.endsWith(FOOTER)) throw new Error("Invalid shared mirror envelope.");
   return validate(JSON.parse(body.slice(HEADER.length, -FOOTER.length)));
 }
@@ -74,6 +90,11 @@ function encode(mirror: SharedMirror): string {
   return HEADER + JSON.stringify({ kind: "mirror", version: 1, ...mirror }) + FOOTER;
 }
 const lexical = (a: string, b: string): number => a < b ? -1 : a > b ? 1 : 0;
+/** Canonical snapshot token; null means the record did not exist. */
+export function mirrorFingerprint(mirror: SharedMirror | undefined): string | null {
+  return mirror ? encode({ ...content(mirror), ...(mirror.revision === undefined ? {} : { revision: mirror.revision, ancestors: mirror.ancestors }) }) : null;
+}
+const writes = new WeakMap<SharedIO, Promise<SharedMirror>>();
 
 /** Logical source definitions only. Each device chooses its own local source mount. */
 export class MirrorCatalog {
@@ -90,7 +111,7 @@ export class MirrorCatalog {
     for (const path of files.sort(lexical)) {
       if (!path.startsWith(this.folder + "/") || path.slice(this.folder.length + 1).includes("/") || !path.endsWith(".md")) continue;
       try {
-        const mirror = decode(await this.io.read(path));
+        const mirror = await decode(await this.io.read(path));
         const hash = await sharedHash(mirror.id);
         const basename = path.slice(path.lastIndexOf("/") + 1);
         if (basename !== `${hash}.md` && !(basename.startsWith(`${hash} (`) && basename.endsWith(").md")))
@@ -115,14 +136,36 @@ export class MirrorCatalog {
     if (!identity(id)) throw new Error("Invalid shared mirror identity.");
     return (await this.list()).find((mirror) => mirror.id === id);
   }
-  async save(id: string, name: string, input: PortableMirror): Promise<void> {
+  async save(id: string, name: string, input: PortableMirror, expected?: string | null): Promise<SharedMirror> {
+    // Serialize catalog writers sharing this adapter, including different catalog instances.
+    const previous = writes.get(this.io) ?? Promise.resolve();
+    const next = previous.catch(() => {}).then(() => this.saveRecord(id, name, input, expected));
+    writes.set(this.io, next);
+    try { return await next; }
+    finally { if (writes.get(this.io) === next) writes.delete(this.io); }
+  }
+  private async saveRecord(id: string, name: string, input: PortableMirror, expected?: string | null): Promise<SharedMirror> {
     if (!identity(id) || !text(name, 300)) throw new Error("A shared mirror needs a stable ID and readable name.");
-    const mirror = { id, name, ...portable(input) };
+    const mirror: SharedMirror = { id, name, ...portable(input) };
     const hash = await sharedHash(id);
     const path = `${this.folder}/${hash}.md`;
-    await this.list();
+    const records = await this.list();
     if (this.problems.some((problem) => problem.path === path || problem.path.startsWith(`${this.folder}/${hash} (`)))
       throw new CatalogConflictError("Shared mirror metadata is damaged or conflicting. Inspect its Markdown records before saving.");
+    const current = records.find((record) => record.id === id);
+    if (expected !== undefined && mirrorFingerprint(current) !== expected)
+      throw new CatalogConflictError("Shared mirror settings changed while saving. Refresh the shared settings and resolve any differences before retrying.");
+    if (current && encode(content(current)) === encode(mirror)) return current;
+    mirror.revision = await mirrorRevision(mirror);
+    mirror.ancestors = current ? [...new Set([current.revision ?? await mirrorRevision(current), ...current.ancestors ?? []])]
+      .filter(revision => revision !== mirror.revision).slice(0, 256) : [];
+    const body = encode(mirror);
+    // Editing a canonical file while an identical Sync copy remains would create a conflict.
+    if (await this.io.exists(this.folder)) {
+      const { files } = await this.io.list(this.folder);
+      if (files.some((file) => file.startsWith(`${this.folder}/${hash} (`) && file.endsWith(").md")))
+        throw new CatalogConflictError("A Sync conflict copy exists for this mirror. Resolve its Markdown copies before changing shared settings.");
+    }
     const parts = this.folder.split("/");
     for (let n = 1; n <= parts.length; n++) {
       const parent = parts.slice(0, n).join("/");
@@ -131,8 +174,8 @@ export class MirrorCatalog {
         catch (error) { if (!await this.io.exists(parent)) throw error; }
       }
     }
-    const body = encode(mirror);
     if (await this.io.exists(path)) await this.io.write(path, body);
     else await this.io.create(path, body);
+    return mirror;
   }
 }

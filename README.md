@@ -1,5 +1,15 @@
 # Supernote Transcripts
 
+## 0.12 — shared source settings and clearer forms
+
+Portable source settings now reconcile through Obsidian Sync while queues, source mounts, sign-in and execution controls remain local. Independent field changes merge; conflicting or causally unrelated edits require an explicit choice. Settings refresh never starts recognition or reprocesses saved pages. See [settings synchronization](SETTINGS-SYNC.md) for setup and limits.
+
+Source forms use simpler headings, accessible question-mark help and an aligned **Choose folder** picker. Desktop actions have text labels and consistent spacing. Notebook cleanup and page re-recognition are reachable from single-notebook sources and folder children. Default recognition instructions reflow handwriting wraps while preserving wording and meaningful structure; saved custom prompts remain intact.
+
+The cumulative [feedback checklist](FEEDBACK-TRACKER.md) distinguishes implementation, installed builds and live verification.
+
+Desktop 0.12.0 is active and preservation-verified. Nomad files are staged but the active plugin stays on 0.11.2 until its open source-settings form is closed. Source tests pass 432/432; the rendered-browser suite passes 264 assertions. Actual desktop checks confirm the compact Sources/Queue/Settings/source controls, a single Settings label and fully contained footer buttons. Both queues remain paused; no recognition requests were made. Live cross-device settings propagation and Nomad acceptance are pending activation.
+
 ## 0.11.3 release candidate — optional companions
 
 Transcripts remains usable without Paper, Sidebar or a reader fork. The candidate publishes a versioned optional page-link adapter and safely refreshes compatible readers when it loads, unloads or page links change. Missing or failing reader hooks cannot interrupt normal Reading/Live Preview.

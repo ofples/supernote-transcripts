@@ -34,8 +34,8 @@ await build({
   ],
 });
 const { default: Runtime } = await import("../test-artifacts/runtime-test.mjs");
-await build({stdin:{contents:"export * from './src/shared'; export * from './src/publication'; export * from './src/state';",resolveDir:directory},outfile:`${directory}test-artifacts/runtime-shared.mjs`,bundle:true,format:"esm",platform:"browser"});
-const {SharedNotebookCache,PublicationReceipts,notebookIdentity,sharedHash,validateStateSnapshot,encodeStateSnapshot}=await import("../test-artifacts/runtime-shared.mjs");
+await build({stdin:{contents:"export * from './src/shared'; export * from './src/publication'; export * from './src/state'; export * from './src/catalog';",resolveDir:directory},outfile:`${directory}test-artifacts/runtime-shared.mjs`,bundle:true,format:"esm",platform:"browser"});
+const {SharedNotebookCache,PublicationReceipts,notebookIdentity,sharedHash,validateStateSnapshot,encodeStateSnapshot,MirrorCatalog,mirrorFingerprint}=await import("../test-artifacts/runtime-shared.mjs");
 const source = "/storage/emulated/0/Note/Reflections/a.note";
 const statePath=suffix=>`.obsidian-supernote/plugins/nomad-transcripts/state-${suffix}.json`;
 function requestedPages(request) {
@@ -2118,4 +2118,160 @@ test("fresh desktop hydrates mixed Nomad recipes and cleaned presentation withou
   assert.deepEqual(adopted.cleanup,original.cleanup);assert.equal(adopted.profileOutdated,true);
   assert.equal(adopted.status,"current");assert.equal(b.files.get("Mirror/a.md"),cleaned);
   await b.plugin.update();assert.equal(b.calls.length,0);assert.equal(adopted.profileOutdated,true);
+});
+
+function settingsFixture(device) { const f=fixture(1); sharing(f,device); f.plugin.initializing=false; return f; }
+function mirrorRecord(f) {
+  const path=[...f.files.keys()].find(p=>p.includes("/Shared Data/Mirrors/")&&p.endsWith(".md"));
+  assert.ok(path,"a shared mirror record was published");
+  const body=f.files.get(path);
+  return {path,record:JSON.parse(body.split("```json\n")[1].split("\n```\n")[0])};
+}
+async function editMirrorRecord(f,change) {
+  const catalog=new MirrorCatalog(f.plugin.sharedIO()), remote=await catalog.load(f.plugin.config.rules[0].sharedId);
+  const changed=structuredClone(remote);change(changed);
+  return catalog.save(changed.id,changed.name,changed,mirrorFingerprint(remote));
+}
+const activeRuleProfile=f=>f.plugin.config.profiles.find(p=>p.id===f.plugin.config.rules[0].profileId);
+
+test("shared settings publish a baseline and background refresh stays read-only for an unbound source",async()=>{
+  const f=settingsFixture("settings-initial");
+  await f.plugin.refreshSharedSettings();
+  assert.equal([...f.files.keys()].some(p=>p.includes("/Mirrors/")),false);
+  assert.equal(f.plugin.config.rules[0].sharedBaseline,undefined);
+  await f.plugin.saveConfig();
+  assert.equal(mirrorRecord(f).record.output,"Mirror");
+  assert.equal(f.plugin.config.rules[0].sharedBaseline.profile.prompt,"transcribe");
+  assert.equal(f.calls.length,0);
+});
+
+test("shared remote recipe and output refresh preserve local mounts and execution choices",async()=>{
+  const f=settingsFixture("settings-refresh");
+  const rule=f.plugin.config.rules[0];rule.autoRecognize=false;rule.paused=true;rule.enabled=false;
+  await f.plugin.saveConfig();
+  await editMirrorRecord(f,r=>{r.profile.prompt="Remote instructions";r.output="Synced destination";r.recursive=false;r.exclude=["Private/**"];});
+  const before=JSON.stringify({source:rule.source,paused:rule.paused,enabled:rule.enabled,autoRecognize:rule.autoRecognize});
+  await f.plugin.refreshSharedSettings();
+  assert.equal(activeRuleProfile(f).prompt,"Remote instructions");assert.equal(rule.output,"Synced destination");
+  assert.equal(rule.recursive,false);assert.deepEqual(rule.exclude,["Private/**"]);
+  assert.equal(JSON.stringify({source:rule.source,paused:rule.paused,enabled:rule.enabled,autoRecognize:rule.autoRecognize}),before);
+  assert.equal(f.plugin.config.profiles.find(p=>p.id==="general").prompt,"transcribe");
+  assert.deepEqual(f.plugin.sharedSettingsIssues,[]);assert.equal(f.calls.length,0);
+});
+
+test("saving local execution settings first adopts remote changes without republishing a stale profile",async()=>{
+  const f=settingsFixture("settings-save");await f.plugin.saveConfig();
+  await editMirrorRecord(f,r=>{r.profile.prompt="Newest remote prompt";});
+  f.plugin.config.intervalMinutes=11;await f.plugin.saveConfig();
+  assert.equal(mirrorRecord(f).record.profile.prompt,"Newest remote prompt");
+  assert.equal(activeRuleProfile(f).prompt,"Newest remote prompt");
+  activeRuleProfile(f).model="local-model";await f.plugin.saveConfig();
+  assert.equal(mirrorRecord(f).record.profile.model,"local-model");
+  assert.equal(mirrorRecord(f).record.profile.prompt,"Newest remote prompt");
+  assert.equal(f.plugin.config.intervalMinutes,11);assert.equal(f.calls.length,0);
+});
+
+test("divergent shared source settings block publication until explicit local or remote resolution",async()=>{
+  for(const choice of ["local","remote"]){
+    const f=settingsFixture(`settings-conflict-${choice}`);await f.plugin.saveConfig();
+    activeRuleProfile(f).prompt="Our prompt";
+    await editMirrorRecord(f,r=>{r.profile.prompt="Their prompt";});
+    await f.plugin.saveConfig();
+    assert.equal(mirrorRecord(f).record.profile.prompt,"Their prompt");
+    assert.equal(activeRuleProfile(f).prompt,"Our prompt");
+    assert.deepEqual(f.plugin.sharedSettingsIssues[0].fields,["profile.prompt"]);
+    await f.plugin.resolveSharedSettings("r",choice);
+    const expected=choice==="local"?"Our prompt":"Their prompt";
+    assert.equal(mirrorRecord(f).record.profile.prompt,expected);
+    assert.equal(activeRuleProfile(f).prompt,expected);
+    assert.equal(f.plugin.config.rules[0].sharedBaseline.profile.prompt,expected);
+    assert.deepEqual(f.plugin.sharedSettingsIssues,[]);assert.equal(f.calls.length,0);
+  }
+});
+
+test("explicit binding adopts a shared source while legacy bindings without baselines require a choice",async()=>{
+  const f=settingsFixture("settings-bind");await f.plugin.saveConfig();
+  await editMirrorRecord(f,r=>{r.profile.prompt="Shared recipe";r.output="Shared output";});
+  delete f.plugin.config.rules[0].sharedBaseline;f.plugin.boundMirrors.clear();
+  await f.plugin.saveConfig();
+  assert.equal(activeRuleProfile(f).prompt,"Shared recipe");assert.equal(f.plugin.config.rules[0].output,"Shared output");
+  delete f.plugin.config.rules[0].sharedBaseline;
+  activeRuleProfile(f).prompt="Legacy draft";
+  await f.plugin.saveConfig();
+  assert.equal(mirrorRecord(f).record.profile.prompt,"Shared recipe");
+  assert.equal(f.plugin.sharedSettingsIssues.length,1);assert.equal(f.calls.length,0);
+});
+
+
+test("conflicting shared settings stop Update and explicit recognition before sending requests",async()=>{
+  const f=settingsFixture("settings-no-spend");await f.plugin.saveConfig();
+  activeRuleProfile(f).prompt="Local unsynced recipe";
+  await editMirrorRecord(f,r=>{r.profile.prompt="Remote conflicting recipe";});
+  await f.plugin.update();
+  assert.equal(f.calls.length,0);assert.equal(f.plugin.sharedSettingsIssues.length,1);
+  await assert.rejects(f.plugin.manual(source,"1"),/Resolve this source's shared settings/);
+  await assert.rejects(f.plugin.reprocessPages(source,"1"),/Resolve this source's shared settings/);
+  await assert.rejects(f.plugin.cleanupDocument(source),/Resolve this source's shared settings/);
+  assert.equal(f.calls.length,0);
+});
+
+test("refresh defers remote settings while recognition task is active and applies after completion",async()=>{
+  const f=settingsFixture("settings-deferred");await f.plugin.saveConfig();
+  await editMirrorRecord(f,r=>{r.profile.prompt="Remote arrived during recognition";});
+  f.plugin.task=Promise.resolve();
+  await f.plugin.refreshSharedSettings();
+  assert.equal(activeRuleProfile(f).prompt,"transcribe");
+  f.plugin.task=null;await f.plugin.refreshSharedSettings();
+  assert.equal(activeRuleProfile(f).prompt,"Remote arrived during recognition");
+  assert.equal(f.calls.length,0);
+});
+
+
+test("offline shared settings branches are held without losing either local recipe until explicit resolution",async()=>{
+  const a=settingsFixture("offline-branch-a");await a.plugin.saveConfig();
+  const b=settingsFixture("offline-branch-b");
+  b.plugin.config=structuredClone(a.plugin.config);
+  b.plugin.boundMirrors=new Set(["linked-reflections"]);
+  for(const [path,body]of a.files)b.files.set(path,body);
+  const baseline=a.plugin.config.rules[0].sharedRevision;
+  activeRuleProfile(a).prompt="Offline edit A";await a.plugin.saveConfig();
+  activeRuleProfile(b).prompt="Offline edit B";await b.plugin.saveConfig();
+  const aRevision=a.plugin.config.rules[0].sharedRevision,bRevision=b.plugin.config.rules[0].sharedRevision;
+  assert.notEqual(aRevision,bRevision);
+  assert.ok(a.plugin.config.rules[0].sharedAncestors.includes(baseline));
+  assert.ok(b.plugin.config.rules[0].sharedAncestors.includes(baseline));
+  const incoming=mirrorRecord(b),destination=mirrorRecord(a).path;
+  a.files.set(destination,b.files.get(incoming.path));
+  await a.plugin.refreshSharedSettings();
+  assert.equal(activeRuleProfile(a).prompt,"Offline edit A");
+  assert.equal(a.plugin.config.rules[0].sharedRevision,aRevision);
+  assert.deepEqual(a.plugin.sharedSettingsIssues[0].fields,["settings history"]);
+  await a.plugin.update();assert.equal(a.calls.length,0);
+  await a.plugin.resolveSharedSettings("r","local");
+  assert.equal(mirrorRecord(a).record.profile.prompt,"Offline edit A");
+  assert.ok(mirrorRecord(a).record.ancestors.includes(bRevision));
+  assert.deepEqual(a.plugin.sharedSettingsIssues,[]);
+  b.files.set(incoming.path,a.files.get(destination));
+  await b.plugin.refreshSharedSettings();
+  assert.equal(activeRuleProfile(b).prompt,"Offline edit A");
+  assert.deepEqual(b.plugin.sharedSettingsIssues,[]);assert.equal(b.calls.length,0);
+});
+
+test("saved deferred settings retain publication intent through transient failure and retry in background",async()=>{
+  const f=settingsFixture("deferred-retry");await f.plugin.saveConfig();
+  activeRuleProfile(f).prompt="Saved during active recognition";
+  f.plugin.task=Promise.resolve();await f.plugin.saveConfig();
+  const rule=f.plugin.config.rules[0];assert.equal(rule.sharedPending,true);
+  assert.equal(f.app.data.config.rules[0].sharedPending,true);
+  assert.equal(mirrorRecord(f).record.profile.prompt,"transcribe");
+  f.plugin.task=null;
+  const write=f.app.vault.adapter.write;
+  f.app.vault.adapter.write=async(path,text)=>{if(path.includes("/Mirrors/"))throw Error("Temporary sync failure");return write(path,text);};
+  await f.plugin.refreshSharedSettings();
+  assert.equal(rule.sharedPending,true);assert.equal(f.plugin.sharedSettingsIssues.length,1);
+  assert.equal(mirrorRecord(f).record.profile.prompt,"transcribe");
+  f.app.vault.adapter.write=write;await f.plugin.refreshSharedSettings();
+  assert.equal(mirrorRecord(f).record.profile.prompt,"Saved during active recognition");
+  assert.equal(rule.sharedPending,undefined);assert.equal(f.app.data.config.rules[0].sharedPending,undefined);
+  assert.deepEqual(f.plugin.sharedSettingsIssues,[]);assert.equal(f.calls.length,0);
 });

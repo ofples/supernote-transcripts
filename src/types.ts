@@ -20,6 +20,13 @@ export interface FolderRule {
   exclude: string[];
   profileId: string;
   sharedId?: string;
+  /** Last agreed portable settings; paths and execution preferences remain local. */
+  sharedBaseline?: import("./catalog").PortableMirror;
+  /** Local durable intent to retry a saved settings publication. */
+  sharedPending?: boolean;
+  /** Causal settings history detects concurrent offline edits across Sync delivery. */
+  sharedRevision?: string;
+  sharedAncestors?: string[];
 }
 export interface ConfigV1 {
   version: 1;
@@ -201,6 +208,9 @@ export interface QueueEstimate {
   requests: number;
 }
 export interface Controller {
+  readonly sharedSettingsIssues?: { ruleId: string; name: string; fields: string[]; reason: string }[];
+  refreshSharedSettings?(): Promise<void>;
+  resolveSharedSettings?(ruleId: string, choice: "local" | "remote"): Promise<void>;
   readonly platform: "desktop" | "nomad";
   concurrency: number;
   provider: "api" | "subscription";

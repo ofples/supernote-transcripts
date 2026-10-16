@@ -14,7 +14,8 @@ import type {
 import { AndroidReadOnlySource } from "./reader";
 import { DesktopReadOnlySource } from "./desktop-reader";
 import { SharedNotebookCache, notebookIdentity, isSharedPath, type SharedIO, type LeaseHandle } from "./shared";
-import { MirrorCatalog } from "./catalog";
+import { MirrorCatalog, mirrorFingerprint, type PortableMirror } from "./catalog";
+import { portableMirrorEqual, reconcileMirror } from "./mirror-sync";
 import { ChatGPTSession } from "./subscription";
 import { advertise as advertisePairing, discover as discoverPairing } from "./subscription-pairing-discovery";
 import { SubscriptionUsage } from "./subscription-usage";
@@ -123,6 +124,9 @@ export default class SupernoteTranscripts extends Plugin implements Controller {
   private nativeActive = true;
   private initializing = true;
   private boundMirrors = new Set<string>();
+  sharedSettingsIssues: { ruleId: string; name: string; fields: string[]; reason: string }[] = [];
+  private settingsWork: Promise<void> = Promise.resolve();
+  private sharedSettingsTimer?: ReturnType<typeof setTimeout>;
   private sharedCache?: SharedNotebookCache;
   private chatGPT?: ChatGPTSession;
   private planUsage?: SubscriptionUsage;
@@ -424,7 +428,7 @@ export default class SupernoteTranscripts extends Plugin implements Controller {
         );
     };
     this.registerDomEvent(document, "visibilitychange", wake);
-    this.registerDomEvent(window, "focus", wake);
+    this.registerDomEvent(window, "focus", () => { this.scheduleSharedSettings(); wake(); });
     this.registerDomEvent(window, "online", () => {
       void this.recoverSubscriptionConnection().catch(() => this.emit());
     });
@@ -466,16 +470,19 @@ export default class SupernoteTranscripts extends Plugin implements Controller {
         }
       }, 60000),
     );
+    this.registerInterval(window.setInterval(() => this.scheduleSharedSettings(), 30000));
     this.app.workspace.onLayoutReady(() => {
       const timer = window.setTimeout(wake, 10000);
       this.register(() => clearTimeout(timer));
     });
     if(!this.stateStorageIssue)await this.saveConfig();
     this.initializing=false;
-    if(this.app.vault.on)this.registerEvent(this.app.vault.on("modify",file=>{
-      if(!isSharedPath(file.path))return;
-      for(const s of Object.values(this.store.notebooks))if(s.status==="conflict"&&s.error?.startsWith("Shared transcript")){s.status="queued";delete s.error;this.enqueue(s.source);}
-    }));
+    if(!this.stateStorageIssue)await this.refreshSharedSettings();
+    if(this.app.vault.on)for(const event of ["create", "modify", "delete", "rename"] as const)
+      this.registerEvent(this.app.vault.on(event as "modify", file => {
+        if(file.path.startsWith("Supernote Transcripts/Shared Data/Mirrors/"))this.scheduleSharedSettings();
+      }));
+    this.register(() => { if(this.sharedSettingsTimer)clearTimeout(this.sharedSettingsTimer); });
     if(this.stateStorageIssue)this.stage("Saved state needs attention",this.stateStorageIssue);
     this.emit();
   }
@@ -486,26 +493,133 @@ export default class SupernoteTranscripts extends Plugin implements Controller {
     this.chatGPT?.closeCallback();
   }
   async saveConfig() {
-    if(!this.initializing){
-      const io=this.sharedIO();
-      if(io){
-        const catalog=new MirrorCatalog(io),available=await catalog.list();
-        for(const rule of this.config.rules){
-          rule.sharedId??=crypto.randomUUID();
-          const existing=available.find(m=>m.id===rule.sharedId);
-          if(existing&&!this.boundMirrors.has(rule.sharedId)){
-            const profile={...existing.profile,id:`shared-${rule.sharedId}`};
-            this.config.profiles=this.config.profiles.filter(p=>p.id!==profile.id);this.config.profiles.push(profile);
-            rule.profileId=profile.id;rule.exclude=[...existing.exclude];rule.recursive=existing.recursive;
-          }
-          const profile=this.config.profiles.find(p=>p.id===rule.profileId);
-          if(profile)await catalog.save(rule.sharedId,rule.source.replace(/\\/g,"/").replace(/\/+$/,"").split("/").pop()??"Mirror",{profile,output:rule.output,recursive:rule.recursive,exclude:rule.exclude});
-          this.boundMirrors.add(rule.sharedId);
-        }
+    return this.settingsOperation(async () => {
+      if(!this.initializing) {
+        if(this.task)for(const rule of this.config.rules)rule.sharedPending=true;
+        else await this.syncMirrorSettings(true);
       }
-    }
+      await this.persistSettings();
+      this.emit();
+    });
+  }
+  private settingsOperation(run: () => Promise<void>): Promise<void> {
+    const operation = this.settingsWork.then(run, run);
+    this.settingsWork = operation.catch(() => {});
+    return operation;
+  }
+  private async persistSettings() {
     await this.saveData({ config: this.config, ...(this.stateEstablished?{stateInitialized:true}:{}) });
     await Promise.all(this.config.profiles.map(p=>this.profile(p.id).catch(()=>{this.recipes.delete(p.id);}))); 
+  }
+  private scheduleSharedSettings() {
+    if(this.disposed || this.initializing)return;
+    if(this.sharedSettingsTimer)clearTimeout(this.sharedSettingsTimer);
+    this.sharedSettingsTimer=setTimeout(() => {
+      this.sharedSettingsTimer=undefined;
+      if(this.disposed)return;
+      if(this.task){this.scheduleSharedSettings();return;}
+      void this.refreshSharedSettings().catch(() => this.emit());
+    }, 600);
+  }
+  private portableSettings(rule: FolderRule): PortableMirror {
+    const profile=this.config.profiles.find(p=>p.id===rule.profileId);
+    if(!profile)throw Error("Choose recognition settings for this source.");
+    return {profile:clone(profile),output:rule.output,recursive:rule.recursive,exclude:[...rule.exclude]};
+  }
+  private applyPortableSettings(rule: FolderRule, value: PortableMirror, profileId: string) {
+    const before=this.portableSettings(rule);
+    if(!portableMirrorEqual(before,value)) {
+      // Never mutate a general profile shared by unrelated local sources.
+      const profile={...clone(value.profile),id:profileId};
+      this.config.profiles=this.config.profiles.filter(p=>p.id!==profile.id);
+      this.config.profiles.push(profile);
+      rule.profileId=profile.id;
+      rule.output=value.output;rule.recursive=value.recursive;rule.exclude=[...value.exclude];
+    }
+  }
+  private async syncMirrorSettings(publishLocal: boolean) {
+    const io=this.sharedIO();if(!io)return;
+    const catalog=new MirrorCatalog(io),available=await catalog.list();
+    const issues: typeof this.sharedSettingsIssues=[];
+    for(const rule of this.config.rules) {
+      if(publishLocal)rule.sharedId??=crypto.randomUUID();
+      if(!rule.sharedId)continue;
+      const name=rule.source.replace(/\\/g,"/").replace(/\/+$/,"").split("/").pop()??"Source";
+      try {
+        const sharedHashId=await hash(rule.sharedId);
+        const recordPrefix=`${catalog.folder}/${sharedHashId}`;
+        if(catalog.problems.some(problem=>problem.path.startsWith(recordPrefix)))throw Error("Shared settings contain damaged or conflicting records. Resolve their Sync conflict copies before changing settings.");
+        const remote=available.find(m=>m.id===rule.sharedId);
+        const local=this.portableSettings(rule), signature=JSON.stringify([rule,local]);
+        if(rule.sharedRevision && remote?.revision!==rule.sharedRevision &&
+            (!remote?.revision || !remote.ancestors?.includes(rule.sharedRevision))) {
+          issues.push({ruleId:rule.id,name,fields:["settings history"],reason:
+            remote?.revision && rule.sharedAncestors?.includes(remote.revision)
+              ? "Synced settings are older than this device. Choose which version to use."
+              : "Settings were changed independently or by an older plugin. Choose which version to use."});
+          continue;
+        }
+        // Choosing an existing shared mirror explicitly binds a newly added source.
+        const firstBinding=remote&&!this.boundMirrors.has(rule.sharedId)&&!rule.sharedBaseline;
+        const result=firstBinding
+          ? {value:remote,baseline:remote,publish:false,conflicts:[]}
+          : reconcileMirror(local,rule.sharedBaseline,remote);
+        if(result.conflicts.length) {
+          issues.push({ruleId:rule.id,name,fields:result.conflicts,reason:"Settings changed on both devices. Choose which version to use."});
+          continue;
+        }
+        // Background reads never publish unfinished local drafts or create catalog records.
+        if(result.publish&&!publishLocal&&!rule.sharedPending)continue;
+        const agreed=result.publish?await catalog.save(rule.sharedId,remote?.name??name,
+          {...result.value,profile:{...result.value.profile,id:remote?.profile.id??result.value.profile.id,name:remote?.profile.name??result.value.profile.name}},
+          mirrorFingerprint(remote)):remote;
+        if(signature!==JSON.stringify([rule,this.portableSettings(rule)]))throw Error("Source settings changed while synchronization was running. Save again.");
+        this.applyPortableSettings(rule,result.value,`shared-${sharedHashId.slice(0,40)}`);
+        rule.sharedBaseline=clone(result.baseline??result.value);
+        rule.sharedRevision=agreed?.revision;
+        rule.sharedAncestors=agreed?.ancestors ? [...agreed.ancestors] : undefined;
+        delete rule.sharedPending;
+        this.boundMirrors.add(rule.sharedId);
+      } catch(error) {
+        if(publishLocal)rule.sharedPending=true;
+        issues.push({ruleId:rule.id,name,fields:[],reason:readable(error)});
+      }
+    }
+    this.sharedSettingsIssues=issues;
+  }
+  async refreshSharedSettings() {
+    if(this.task||this.disposed||this.initializing)return;
+    return this.settingsOperation(async () => {
+      if(this.task||this.disposed)return;
+      const before=JSON.stringify(this.config);
+      await this.syncMirrorSettings(false);
+      if(before!==JSON.stringify(this.config))await this.persistSettings();
+      this.emit();
+    });
+  }
+  async resolveSharedSettings(ruleId:string,choice:"local"|"remote") {
+    if(this.task)throw Error("Wait for active recognition to finish before resolving settings.");
+    return this.settingsOperation(async () => {
+      const rule=this.config.rules.find(r=>r.id===ruleId),io=this.sharedIO();
+      if(!rule?.sharedId||!io)throw Error("Shared source is unavailable.");
+      const catalog=new MirrorCatalog(io),remote=await catalog.load(rule.sharedId);
+      const profileId=`shared-${(await hash(rule.sharedId)).slice(0,40)}`;
+      const signature=JSON.stringify(this.config),local=this.portableSettings(rule);
+      if(choice==="remote"&&!remote)throw Error("Shared settings have not arrived. Wait for Sync and try again.");
+      const value=choice==="remote"?remote!:local;
+      const agreed=choice==="local"?await catalog.save(rule.sharedId,remote?.name??rule.source.split("/").pop()??"Source",
+        {...value,profile:{...value.profile,id:remote?.profile.id??value.profile.id,name:remote?.profile.name??value.profile.name}},mirrorFingerprint(remote)):remote;
+      if(signature!==JSON.stringify(this.config))throw Error("Settings changed while resolving. Try again.");
+      this.applyPortableSettings(rule,value,profileId);
+      rule.sharedBaseline=clone(value);
+      rule.sharedRevision=agreed?.revision;
+      rule.sharedAncestors=agreed?.ancestors ? [...agreed.ancestors] : undefined;
+      delete rule.sharedPending;
+      this.boundMirrors.add(rule.sharedId);
+      await this.persistSettings();
+      this.sharedSettingsIssues=this.sharedSettingsIssues.filter(i=>i.ruleId!==ruleId);
+      this.emit();
+    });
   }
   private async persist() {
     this.assertStateReady();
@@ -707,6 +821,8 @@ export default class SupernoteTranscripts extends Plugin implements Controller {
       await this.task;
       return;
     }
+    await this.refreshSharedSettings();
+    if(this.task){await this.task;return;}
     this.stop = false;
     this.automaticRun = automatic;
     this.callsThisRun = 0;
@@ -2041,10 +2157,15 @@ export default class SupernoteTranscripts extends Plugin implements Controller {
     this.emit();
     return text;
   }
+  private assertSharedSettings(source: string) {
+    const rule=ruleFor(source,this.config.rules),issue=this.sharedSettingsIssues.find(i=>i.ruleId===rule?.id);
+    if(issue)throw Error("Resolve this source's shared settings before recognition: choose Keep this device or Use synced settings in Sources.");
+  }
   private sourcePaused(source: string) {
     const rule = ruleFor(source, this.config.rules);
     return (
       !this.sourceSelected(source) ||
+      this.sharedSettingsIssues.some(issue=>issue.ruleId===rule?.id) ||
       (this.automaticRun && rule?.autoRecognize === false) ||
       !!rule?.paused ||
       !!this.store.notebooks[source]?.paused
@@ -2106,6 +2227,8 @@ export default class SupernoteTranscripts extends Plugin implements Controller {
   async reprocessPages(source: string, range: string, outdatedOnly = false) {
     this.assertStateReady();
     if(this.task)throw Error("Pause and wait for active work before re-recognizing pages.");
+    await this.refreshSharedSettings();
+    this.assertSharedSettings(source);
     const state=this.store.notebooks[source],rule=ruleFor(source,this.config.rules);
     if(!state||!rule||!this.sourceSelected(source))throw Error("Update this source once before selecting pages.");
     if(this.sourcePaused(source))throw Error("Resume this source before re-recognizing its pages.");
@@ -2127,6 +2250,8 @@ export default class SupernoteTranscripts extends Plugin implements Controller {
   async cleanupDocument(source: string, options: {saveCopy?:boolean} = {}) {
     this.assertStateReady();this.assertAttemptStorageReady();
     if(this.task)throw Error("Pause and wait for active requests before cleaning a document.");
+    await this.refreshSharedSettings();
+    this.assertSharedSettings(source);
     if(!this.aiEnabled)throw Error("Switch on AI recognition before cleaning a document.");
     const original=this.store.notebooks[source],rule=ruleFor(source,this.config.rules);
     if(!original||!rule||!this.sourceSelected(source))throw Error("Choose an enabled notebook with a mirrored transcript.");
@@ -2204,6 +2329,9 @@ export default class SupernoteTranscripts extends Plugin implements Controller {
         "Switch on AI recognition before requesting reprocessing.",
       );
     if (this.task) throw new Error("An update is already running.");
+    await this.refreshSharedSettings();
+    this.assertSharedSettings(path);
+    if(this.task)throw Error("An update is already running.");
     this.validateConfig();
     const rule = ruleFor(path, this.config.rules);
     const relative = rule ? path.slice(rule.source.length + 1) : "";
