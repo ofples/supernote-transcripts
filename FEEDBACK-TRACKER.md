@@ -3,6 +3,16 @@
 This checklist is cumulative. Later feedback does not replace earlier requests.
 Source implementation, fixture checks, installed builds and live verification are separate states.
 
+## Preview speed and simplified notebook controls — 0.13.1
+
+- [x] Render original-page previews without fingerprinting unrelated pages; retain revision and selected-content checks, deduplicate pending renders and bound the revision-aware memory cache.
+- [x] Reuse current cached device OCR for the selection grid without reopening the notebook; refresh when the original revision changes.
+- [x] Move image preview alongside the re-recognition page cards, with immediate loading feedback, inline errors and stale-completion guards.
+- [x] Consolidate notebook actions, put restore under History and keep technical details expandable; confirm notebook exclusion before changing the source.
+- [x] Simplify output folder browsing to Find; move creation to a separate name prompt reached beside Choose, with validation and Cancel.
+- [x] Remove Manage subscription usage from Settings and subscription activity.
+
+
 ## Restore, storage, cleanup and page-selection follow-up — 0.13.0 candidate
 
 - [x] Keep a single previous-version restore point per notebook containing exact Markdown and its matching recognition snapshot; expose **Restore last version**, pause the notebook after restoring, and use the current original on a later Update.

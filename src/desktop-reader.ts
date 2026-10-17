@@ -145,6 +145,13 @@ export class DesktopReadOnlySource implements ReadOnlySource {
   }
 
   async open(path: string): Promise<OpenNotebook> {
+    return this.openInternal(path);
+  }
+  async preview(path: string, page: number): Promise<string> {
+    const opened = await this.openInternal(path, page);
+    try { return await opened.render(page); } finally { opened.close(); }
+  }
+  private async openInternal(path: string, previewPage?: number): Promise<OpenNotebook> {
     path = normalizeDesktopSource(path);
     if (!path.toLowerCase().endsWith(".note"))
       throw new Error("Selected source is not a notebook.");
@@ -159,6 +166,6 @@ export class DesktopReadOnlySource implements ReadOnlySource {
     };
     const bytes = new DesktopRangeFile(stat.size, path, this.fs, revision, (read) =>
       this.progress?.("Reading notebook", `${name} - ${pass}: ${(read / 1048576).toFixed(1)} MB read`));
-    return openByteNotebook(path, revision, bytes, () => this.revision(path), this.progress, report);
+    return openByteNotebook(path, revision, bytes, () => this.revision(path), this.progress, report, previewPage);
   }
 }

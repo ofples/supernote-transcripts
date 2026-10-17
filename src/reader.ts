@@ -64,6 +64,7 @@ interface IndexedPage {
 export async function indexNotebook(
   source: ByteSource,
   onStage: (detail: string) => void = () => {},
+  previewPage?: number,
 ) {
   onStage("Checking file signature");
   if (source.size < 28) throw new Error("Notebook is too short.");
@@ -87,7 +88,7 @@ export async function indexNotebook(
       }
     }
   });
-  const entries = Object.keys(footer).filter((k) => /^PAGE\d+$/.test(k));
+  let entries = Object.keys(footer).filter((k) => /^PAGE\d+$/.test(k));
   const pageNumbers = new Set<number>();
   for (const key of entries) {
     if (!/^PAGE[1-9]\d*$/.test(key))
@@ -99,6 +100,13 @@ export async function indexNotebook(
   }
   entries.sort((a, b) => Number(a.slice(4)) - Number(b.slice(4)));
   if (!entries.length) throw new Error("Notebook contains no supported pages.");
+  // Read-only previews need no all-page identity/fingerprint inventory. Select
+  // the ordinal before loading page/layer/bitmap records, keeping sync indexing
+  // on the full, unchanged path.
+  if (previewPage !== undefined && (!Number.isSafeInteger(previewPage) || previewPage < 1 || previewPage > entries.length))
+    throw new Error("Page number is outside this notebook.");
+  const numbers = previewPage === undefined ? entries.map((_, i) => i + 1) : [previewPage];
+  if (previewPage !== undefined) entries = [entries[previewPage - 1]];
   onStage("Reading page metadata");
   const headerAddress = address(footer.FILE_FEATURE) || 24;
   const metadataHashes = new Map<number,string>();
@@ -180,7 +188,7 @@ export async function indexNotebook(
     pages.map((p) => p.meta.PAGEID),
     pages.map((p) => p.fingerprint),
   );
-  return { pages, ids, width, height };
+  return { pages, ids, numbers, width, height };
 }
 export class AndroidReadOnlySource implements ReadOnlySource {
   constructor(
@@ -228,6 +236,13 @@ export class AndroidReadOnlySource implements ReadOnlySource {
     return `${s.mtime}:${s.size}`;
   }
   async open(path: string): Promise<OpenNotebook> {
+    return this.openInternal(path);
+  }
+  async preview(path: string, page: number): Promise<string> {
+    const opened = await this.openInternal(path, page);
+    try { return await opened.render(page); } finally { opened.close(); }
+  }
+  private async openInternal(path: string, previewPage?: number): Promise<OpenNotebook> {
     path = sourcePath(path);
     const before = await this.fs.stat(path);
     const revision = `${before.mtime}:${before.size}`;
@@ -247,7 +262,7 @@ export class AndroidReadOnlySource implements ReadOnlySource {
           `${name} - ${pass}: ${(Math.min(read, size) / 1048576) | 0} / ${Math.ceil(size / 1048576)} MB`,
         ),
     );
-    return openByteNotebook(path, revision, source, () => this.revision(path), this.progress, report);
+    return openByteNotebook(path, revision, source, () => this.revision(path), this.progress, report, previewPage);
   }
 }
 
@@ -261,9 +276,10 @@ export async function openByteNotebook(
   progress?: (stage: string, detail: string) => void,
   report: (detail: string) => void = (detail) =>
     progress?.("Reading notebook", `${path.split("/").pop()} - ${detail}`),
+  previewPage?: number,
 ): Promise<OpenNotebook> {
   const name = path.split("/").pop();
-  const index = await indexNotebook(source, report);
+  const index = await indexNotebook(source, report, previewPage);
   if ((await readRevision()) !== revision)
     throw new Error(
       "Notebook changed while checking. Close it in Notes and retry.",
@@ -278,14 +294,14 @@ export async function openByteNotebook(
       height: index.height,
       pages: index.pages.map((p, i) => ({
         id: index.ids[i],
-        number: i + 1,
+        number: index.numbers[i],
         fingerprint: p.fingerprint,
       })),
     },
     render: (number: number) => {
       const job = tail.then(async () => {
         if (closed) throw new Error("Notebook was closed.");
-        const p = index.pages[number - 1];
+        const p = index.pages[index.numbers.indexOf(number)];
         if (!p || !Number.isInteger(number))
           throw new Error("Page number is outside this notebook.");
         if ((await readRevision()) !== revision)
@@ -342,7 +358,7 @@ export async function openByteNotebook(
     readOcr: (number: number) => {
       const job = tail.then(async () => {
         if (closed) throw new Error("Notebook was closed.");
-        const p = index.pages[number - 1];
+        const p = index.pages[index.numbers.indexOf(number)];
         if (!p || !Number.isInteger(number))
           throw new Error("Page number is outside this notebook.");
         let ocrAddress: number;
@@ -385,4 +401,15 @@ export async function openByteNotebook(
       index.pages.length = 0;
     },
   };
+}
+
+/** A selected-page render without indexing unrelated handwriting. */
+export async function previewByteNotebook(
+  path: string, page: number, revision: string, source: ByteSource,
+  readRevision: () => Promise<string>,
+  progress?: (stage: string, detail: string) => void,
+  report?: (detail: string) => void,
+): Promise<string> {
+  const opened = await openByteNotebook(path, revision, source, readRevision, progress, report, page);
+  try { return await opened.render(page); } finally { opened.close(); }
 }

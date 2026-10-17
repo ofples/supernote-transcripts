@@ -375,6 +375,28 @@ test("page selection preview prefers matching OCR then cached recognition withou
   assert.equal(rendered,0);assert.equal(ocrReads,2);assert.equal(f.calls.length,calls);
 });
 
+test("page selection preview returns a current all-OCR window without opening the notebook",async()=>{
+  const f=fixture(3);f.plugin.aiEnabled=false;withOcr(f,async number=>`Cached OCR ${number}`);await f.plugin.update();
+  const state=f.plugin.store.notebooks[source],savedState=JSON.stringify(state),revision=f.reader.revision.bind(f.reader),calls=f.calls.length;
+  let opens=0,revisionReads=0;
+  f.reader.revision=async(...args)=>{revisionReads++;return revision(...args);};
+  f.reader.open=async()=>{opens++;throw Error("current OCR preview should not reopen the source");};
+  const preview=await f.plugin.pageSelectionPreview(source);
+  assert.deepEqual(preview,Array.from({length:3},(_,i)=>({number:i+1,text:`Cached OCR ${i+1}`,origin:"device-ocr"})));
+  assert.equal(revisionReads,1);assert.equal(opens,0);
+  assert.equal(JSON.stringify(f.plugin.store.notebooks[source]),savedState);assert.equal(f.calls.length,calls);
+});
+
+test("page selection preview reopens and refreshes OCR after a source revision changes",async()=>{
+  const f=fixture(3);f.plugin.aiEnabled=false;withOcr(f,async number=>`Fresh OCR ${number}`);await f.plugin.update();
+  const calls=f.calls.length,ocrReads=[],open=f.reader.open;let opens=0,rendered=0;
+  f.change(Array.from({length:3},(_,i)=>({id:`native:${i+1}`,number:i+1,fingerprint:`edited:${i+1}`})));
+  f.reader.open=async(...args)=>{opens++;const notebook=await open(...args);const readOcr=notebook.readOcr;notebook.readOcr=async number=>{ocrReads.push(number);return readOcr(number);};notebook.render=async()=>{rendered++;return "image";};return notebook;};
+  const preview=await f.plugin.pageSelectionPreview(source);
+  assert.deepEqual(preview,Array.from({length:3},(_,i)=>({number:i+1,text:`Fresh OCR ${i+1}`,origin:"device-ocr"})));
+  assert.equal(opens,1);assert.deepEqual(ocrReads,[1,2,3]);assert.equal(rendered,0);assert.equal(f.calls.length,calls);
+});
+
 test("page selection preview reads only its bounded window from a large notebook",async()=>{
   const f=fixture(100);f.plugin.aiEnabled=false;withOcr(f,async()=>undefined);await f.plugin.update();
   const originalOpen=f.reader.open,ocrReads=[];let rendered=0;
@@ -2777,4 +2799,67 @@ test("settings persistence stores an independent snapshot rather than later in-m
   const f=settingsFixture("immutable-local-save");await f.plugin.saveConfig();
   activeRuleProfile(f).prompt="Not saved yet";
   assert.equal(f.app.data.config.profiles.some(p=>p.prompt==="Not saved yet"),false);
+});
+
+test("original page preview dispatches to the selective reader and rejects invalid pages before opening",async()=>{
+  const f=fixture(2);f.plugin.aiEnabled=false;await f.plugin.update();
+  const previews=[],open=f.reader.open;let opens=0;
+  f.reader.open=async(...args)=>{opens++;return open(...args);};
+  f.reader.preview=async(path,page)=>{previews.push([path,page]);return `selected:${page}`;};
+  assert.equal(await f.plugin.preview(source,2),"selected:2");
+  assert.deepEqual(previews,[[source,2]]);assert.equal(opens,0);
+  await assert.rejects(f.plugin.preview(source,0),/page|range/i);
+  await assert.rejects(f.plugin.preview(source,3),/page|range/i);
+  assert.deepEqual(previews,[[source,2]]);assert.equal(opens,0);
+});
+
+test("original page preview deduplicates in-flight reads, caches by revision, and retries failures",async()=>{
+  const f=fixture(1);f.plugin.aiEnabled=false;await f.plugin.update();
+  let calls=0,release;let fail=true;
+  f.reader.preview=async(_path,page)=>{
+    calls++;
+    if(fail){fail=false;throw Error("temporary preview failure");}
+    if(calls===2)await new Promise(resolve=>{release=resolve;});
+    return `image:${page}:revision:${await f.reader.revision(source)}`;
+  };
+  await assert.rejects(f.plugin.preview(source,1),/temporary preview failure/);
+  const first=f.plugin.preview(source,1),duplicate=f.plugin.preview(source,1);
+  await new Promise(resolve=>setImmediate(resolve));
+  assert.equal(calls,2);release();
+  assert.equal(await first,await duplicate);
+  assert.equal(calls,2);
+  assert.match(await f.plugin.preview(source,1),/^image:1:revision:1:100$/);
+  assert.equal(calls,2);
+  f.change([{id:"native:1",number:1,fingerprint:"edited"}]);
+  assert.match(await f.plugin.preview(source,1),/^image:1:revision:2:100$/);
+  assert.equal(calls,3);
+});
+
+test("original page preview retains the open/render fallback for older readers",async()=>{
+  const f=fixture(2);f.plugin.aiEnabled=false;await f.plugin.update();
+  let opens=0,closed=0;
+  f.reader.open=async()=>{opens++;return {descriptor:{pages:[{number:1},{number:2}]},render:async page=>`fallback:${page}`,close:()=>closed++};};
+  assert.equal(await f.plugin.preview(source,2),"fallback:2");
+  assert.equal(opens,1);assert.equal(closed,1);
+  await assert.rejects(f.plugin.preview(source,3),/page|range/i);
+  assert.equal(opens,1);
+});
+
+test("original page image cache stays bounded",async()=>{
+  const f=fixture(4);f.plugin.aiEnabled=false;await f.plugin.update();
+  const rendered=[];f.reader.preview=async(_path,page)=>{rendered.push(page);return `image:${page}`;};
+  for(const page of [1,2,3,1])await f.plugin.preview(source,page);
+  assert.deepEqual(rendered,[1,2,3,1]);
+});
+
+test("original page preview permits an appended page when the saved inventory is stale",async()=>{
+  const f=fixture(2);f.plugin.aiEnabled=false;await f.plugin.update();
+  f.change([
+    {id:"native:1",number:1,fingerprint:"f1"},
+    {id:"native:2",number:2,fingerprint:"f2"},
+    {id:"native:3",number:3,fingerprint:"appended"},
+  ]);
+  const calls=[];f.reader.preview=async(_path,page)=>{calls.push(page);return `image:${page}`;};
+  assert.equal(await f.plugin.preview(source,3),"image:3");
+  assert.deepEqual(calls,[3]);
 });

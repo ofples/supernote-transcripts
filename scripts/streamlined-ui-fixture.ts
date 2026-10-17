@@ -217,7 +217,26 @@ export default class StreamlinedUIFixture {
       async list(path: string) { return copy(mockFolders[path.replace(/^\//, "")] ?? { folders: [], files: [] }); },
       fs: { async readdir(path: string) { return mockEntries(path); }, async stat(path: string) { return { type: path.toLowerCase().endsWith(".note") ? "file" : "directory" }; } },
     };
-    const app: any = { vault: { adapter, getName: () => "Streamlined UI Fixture" }, commands: { executeCommandById: () => false } };
+    const app: any = {
+      vault: {
+        adapter,
+        getName: () => "Streamlined UI Fixture",
+        getAbstractFileByPath(path: string) {
+          const normalized = path.replace(/\\/g, "/").replace(/^\/+|\/+$/g, "");
+          return Object.prototype.hasOwnProperty.call(mockFolders, normalized) ? { path: normalized, type: "folder" } : null;
+        },
+        async createFolder(path: string) {
+          const normalized = path.replace(/\\/g, "/").replace(/^\/+|\/+$/g, "");
+          if (!normalized || Object.prototype.hasOwnProperty.call(mockFolders, normalized)) throw new Error("A file or folder with that name already exists here.");
+          const slash = normalized.lastIndexOf("/"), parent = slash < 0 ? "" : normalized.slice(0, slash), name = normalized.slice(slash + 1);
+          const parentEntry = mockFolders[parent];
+          if (!parentEntry) throw new Error("Parent folder is unavailable in the synthetic fixture.");
+          parentEntry.folders.push(name);
+          mockFolders[normalized] = { folders: [], files: [] };
+        },
+      },
+      commands: { executeCommandById: () => false },
+    };
     const commands = new Map<string, { callback: () => void }>();
     const registered: Array<() => void> = [];
     const plugin: any = {
@@ -230,7 +249,7 @@ export default class StreamlinedUIFixture {
     (window as any).__bootStreamlinedFixture = async () => {
       installUI(plugin as Plugin, controller);
       commands.get("open")?.callback();
-      (window as any).__streamlinedFixture = { controller, commands, paths, registered, platform: FIXTURE_PLATFORM };
+      (window as any).__streamlinedFixture = { controller, commands, paths, registered, platform: FIXTURE_PLATFORM, app };
       return (window as any).__streamlinedFixture;
     };
     (window as any).__streamlinedFixtureNotices = [];

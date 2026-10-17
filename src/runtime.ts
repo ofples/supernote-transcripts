@@ -121,6 +121,8 @@ export default class SupernoteTranscripts extends Plugin implements Controller {
   private writes: Promise<void> = Promise.resolve();
   private task: Promise<unknown> | null = null;
   private pageNavigation?: Promise<void>;
+  private previewImages = new Map<string,string>();
+  private previewReads = new Map<string,Promise<string>>();
   private stop = false;
   private disposed = false;
   private scanSources = new Set<string>();
@@ -298,6 +300,12 @@ export default class SupernoteTranscripts extends Plugin implements Controller {
     let previews=makePreviews(snapshot);
     if(this.task)return previews;
     const reader=this.reader(false);
+    // Current embedded OCR was already read during the source scan. Avoid
+    // reopening/indexing the notebook just to display the same text grid.
+    if(previews.length&&previews.every(p=>p.origin==="device-ocr")){
+      try {if(await reader.revision(source)===snapshot.revision)return previews;}
+      catch {return previews;}
+    }
     let opened;
     try {opened=await reader.open(source);}catch{return previews;} // Offline/missing originals can still show saved text.
     try {
@@ -663,6 +671,7 @@ export default class SupernoteTranscripts extends Plugin implements Controller {
   }
   onunload() {
     this.disposed = true;
+    this.previewImages.clear();
     this.stop = true;
     this.listeners.clear();
     this.chatGPT?.closeCallback();
@@ -2477,17 +2486,44 @@ export default class SupernoteTranscripts extends Plugin implements Controller {
     finally { if (this.pageNavigation === operation) this.pageNavigation = undefined; }
   }
   async preview(path: string, page: number) {
+    if (!Number.isSafeInteger(page) || page < 1)
+      throw new Error("Choose a page number within the notebook's available range.");
     if (this.task)
       throw new Error(
         "Pause and wait for the current update before previewing.",
       );
-    const opened = await this.reader().open(path);
-    try {
-      pagesFromRange(String(page), opened.descriptor.pages.length);
-      return await opened.render(page);
-    } finally {
-      opened.close();
-    }
+    if(this.disposed)throw new Error("The plugin was closed. Open it again to preview a page.");
+    const reader=this.reader(false),revision=await reader.revision(path);
+    const known=this.displayStore.notebooks[path];
+    if(known?.revision===revision&&!known.desired.some(p=>p.number===page))
+      throw new Error("Page number is outside this notebook's available range.");
+    const key=JSON.stringify([path,revision,page]);
+    const cached=this.previewImages.get(key);
+    if(cached!==undefined){this.previewImages.delete(key);this.previewImages.set(key,cached);return cached;}
+    const active=this.previewReads.get(key);if(active)return active;
+    if(this.previewReads.size>=2)throw new Error("A page preview is already loading. Wait for it to finish, then try again.");
+    const operation=(async()=>{
+      let image:string;
+      if(reader.preview)image=await reader.preview(path,page);
+      else {
+        const opened=await reader.open(path);
+        try {pagesFromRange(String(page),opened.descriptor.pages.length);image=await opened.render(page);}
+        finally {opened.close();}
+      }
+      if(await reader.revision(path)!==revision)throw new Error("Notebook changed while loading the preview. Try again.");
+      if(this.disposed)throw new Error("The plugin was closed. Open it again to preview a page.");
+      // A tiny memory-only cache: no new vault files and no stale images after edits.
+      for(const entry of this.previewImages.keys())if(JSON.parse(entry)[0]===path&&JSON.parse(entry)[1]!==revision)this.previewImages.delete(entry);
+      const maxChars=12*1024*1024;
+      if(image.length<=maxChars){
+        this.previewImages.set(key,image);
+        while(this.previewImages.size>2||[...this.previewImages.values()].reduce((n,v)=>n+v.length,0)>maxChars)
+          this.previewImages.delete(this.previewImages.keys().next().value!);
+      }
+      return image;
+    })();
+    this.previewReads.set(key,operation);
+    try {return await operation;} finally {if(this.previewReads.get(key)===operation)this.previewReads.delete(key);}
   }
   forceUpdateEstimate(source:string,reRecognizeAll=false) {
     const state=this.displayStore.notebooks[source];if(!state)throw Error("Notebook is unavailable.");

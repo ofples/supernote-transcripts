@@ -107,7 +107,7 @@ async function seedReviewCases(page, root, platform) {
     c.progress.paused = false;
     c.actionCounters.cleanupDocument = 0;
     c.actionCounters.reprocessPages = 0;
-    c.workflowCapture = { cleanupEstimateModels: [], cleanupEstimateOptions: [], cleanupCalls: [], reprocessEstimates: [], reprocessCalls: [], previewCalls: [], restoreCalls: [], storageCalls: [], pruneCalls: [], deferCleanup: false, cleanupResolved: false };
+    c.workflowCapture = { cleanupEstimateModels: [], cleanupEstimateOptions: [], cleanupCalls: [], reprocessEstimates: [], reprocessCalls: [], previewCalls: [], imagePreviewCalls: [], excludeCalls: [], restoreCalls: [], storageCalls: [], pruneCalls: [], deferCleanup: false, cleanupResolved: false, deferImagePreview: false, rejectImagePreview: false, resolveImagePreview: undefined };
     c.cleanupEstimate = (source, options = {}) => {
       c.workflowCapture.cleanupEstimateModels.push(options.model ?? "");
       c.workflowCapture.cleanupEstimateOptions.push({ source, ...options });
@@ -125,6 +125,23 @@ async function seedReviewCases(page, root, platform) {
       });
     };
     c.reprocessPages = async (source, range, outdatedOnly) => { c.workflowCapture.reprocessCalls.push({ source, range, outdatedOnly }); };
+    c.preview = async (source, number) => {
+      c.workflowCapture.imagePreviewCalls.push({ source, number });
+      if (c.workflowCapture.deferImagePreview) await new Promise((resolve, reject) => {
+        c.workflowCapture.resolveImagePreview = () => resolve();
+        c.workflowCapture.rejectImagePreviewNow = () => reject(new Error("Synthetic page preview failed."));
+      });
+      if (c.workflowCapture.rejectImagePreview) throw new Error("Synthetic page preview failed.");
+      const imageSvg = `<svg xmlns="http://www.w3.org/2000/svg" width="800" height="1000" viewBox="0 0 800 1000"><rect width="800" height="1000" fill="#f7f4ec"/><path d="M80 110H720M80 180H660M80 250H700M80 320H620M80 390H700M80 460H650M80 530H710M80 600H600M80 670H700M80 740H660M80 810H700" stroke="#333" stroke-width="8" stroke-linecap="round"/><text x="80" y="930" font-family="sans-serif" font-size="30" fill="#666">Synthetic original page ${number}</text></svg>`;
+      return `data:image/svg+xml,${encodeURIComponent(imageSvg)}`;
+    };
+    c.excludeNotebook = async (source) => {
+      c.workflowCapture.excludeCalls.push(source);
+      const rule = c.config.rules.find((item) => item.source === source && !item.recursive);
+      const relativeNotebook = source.split("/").at(-1);
+      if (rule && !rule.exclude.includes(relativeNotebook)) rule.exclude.push(relativeNotebook);
+      c.notify();
+    };
     c.pageSelectionPreview = async (source, start = 1, count = 12) => {
       c.workflowCapture.previewCalls.push({ source, start, count });
       const state = c.store.notebooks[source];
@@ -282,6 +299,7 @@ async function inspectViewport(platform, viewport, label) {
     return m;
   };
   const screenshot = async (name) => page.screenshot({ path: join(evidenceDir, `${prefix}-${name}.png`), fullPage: false });
+  const previewHitAreas = [];
 
   // Sources: compact modal, visible desktop action labels, and expanded Satsang child actions.
   await screenshot("sources");
@@ -344,12 +362,15 @@ async function inspectViewport(platform, viewport, label) {
   const childDetails = child.getByRole("button", { name: "Notebook details: Reflection", exact: true });
   check(await childDetails.isVisible(), `${label}: Satsang child notebook detail icon action missing`);
   check(await childDetails.getAttribute("title") === "Notebook details: Reflection", `${label}: Satsang child detail action lacks its accessible tooltip`);
-  check(await child.locator(".st-document-actions, .st-cleanup-task, .st-reprocess-task, .st-cleanup-previous").count() === 0, `${label}: expanded home child renders full actions or cleanup metadata`);
+  check(await child.locator(".st-document-action-toolbar, .st-cleanup-task, .st-reprocess-task, .st-cleanup-previous").count() === 0, `${label}: expanded home child renders full actions or cleanup metadata`);
   await screenshot("satsang-expanded-child-actions");
   await childDetails.click();
   await root.locator(".st-detail-controls").waitFor();
   check(await root.locator(".st-detail-controls").getByRole("button", { name: "Clean up document", exact: true }).isVisible(), `${label}: child notebook detail does not expose the cleanup workflow launch`);
-  check(await root.locator(".st-restore-last-version").isVisible(), `${label}: notebook detail does not offer its available restore point`);
+  const childHistory = root.locator(".st-history-details");
+  check(await childHistory.isVisible() && await childHistory.getAttribute("aria-expanded") === "false", `${label}: notebook History is not collapsed by default`);
+  await childHistory.click();
+  check(await root.locator(".st-restore-last-version").isVisible(), `${label}: notebook History does not offer its available restore point`);
   await root.locator(".st-restore-last-version").click();
   check(await page.evaluate(() => window.__streamlinedFixture.controller.workflowCapture.restoreCalls.length) === 1, `${label}: restore-last-version action did not call the controller`);
   await root.getByRole("button", { name: "Back", exact: true }).click();
@@ -535,6 +556,7 @@ async function inspectViewport(platform, viewport, label) {
   // Subscription connection actions are direct siblings with a visible gap.
   await root.locator(".st-settings-connection select").selectOption("subscription");
   await assertOneSettingsLabel("changing provider");
+  check(await root.getByText("Manage subscription usage", { exact: true }).count() === 0, `${label}: subscription settings still expose the removed Manage subscription usage link`);
   const connection = root.locator(".st-settings-connection");
   if (platform === "desktop") {
     const connectNomad = connection.getByRole("button", { name: "Connect a Nomad", exact: true });
@@ -672,8 +694,34 @@ async function inspectViewport(platform, viewport, label) {
   await chooseFolder.click();
   await root.locator(".st-output-browser").waitFor();
   await root.getByRole("button", { name: "Choose this folder", exact: true }).waitFor();
+  check(await root.getByText("Vault", { exact: true }).count() === 0 && await root.locator(".st-browser-root").count() === 0, `${label}: output picker adds a redundant root heading`);
+  check(await root.getByRole("searchbox", { name: "Find", exact: true }).isVisible(), `${label}: output folder search is not labeled Find`);
   await assertLayout("Output folder picker");
   await screenshot("output-folder-picker");
+  await root.locator(".st-create-folder-open").click();
+  const createFolder = root.locator(".st-output-folder-create");
+  await createFolder.waitFor();
+  const folderName = createFolder.getByLabel("Folder name", { exact: true });
+  const createConfirm = root.locator(".st-create-folder-confirm");
+  await screenshot("output-folder-create");
+  check(await createConfirm.isDisabled(), `${label}: blank folder name can be submitted`);
+  await folderName.fill("bad/name");
+  await createConfirm.click();
+  check(await createFolder.locator(".st-create-folder-error").isVisible(), `${label}: invalid folder name has no inline validation error`);
+  await root.locator(".st-create-folder-cancel").click();
+  await root.locator(".st-output-browser").waitFor();
+  check(await root.locator(".st-browser-entry-name").filter({ hasText: "bad" }).count() === 0, `${label}: cancelling the invalid folder draft changed the vault picker`);
+  await root.locator(".st-create-folder-open").click();
+  await createFolder.waitFor();
+  check(await folderName.inputValue() === "", `${label}: cancelling folder creation retained the draft name`);
+  await root.locator(".st-create-folder-cancel").click();
+  await root.locator(".st-output-browser").waitFor();
+  await root.locator(".st-create-folder-open").click();
+  await createFolder.waitFor();
+  await folderName.fill("Synthetic verified folder");
+  await createConfirm.click();
+  await root.locator(".st-output-browser").waitFor();
+  check(await page.evaluate(() => !!window.__streamlinedFixture.app.vault.getAbstractFileByPath("Synthetic verified folder")), `${label}: valid output folder creation did not create the requested synthetic folder`);
   await root.getByRole("button", { name: "Cancel", exact: true }).click();
   await root.getByRole("button", { name: "Cancel", exact: true }).waitFor();
   await root.getByRole("button", { name: "Cancel", exact: true }).click();
@@ -685,6 +733,12 @@ async function inspectViewport(platform, viewport, label) {
   await root.locator(".st-detail-controls").waitFor();
   const detail = root.locator(".st-detail-controls");
   check(await detail.locator(".st-notebook-advanced").count() === 0, `${label}: single-note detail still has a separate Advanced disclosure`);
+  const documentToolbar = detail.locator(".st-document-action-toolbar");
+  check(await documentToolbar.count() === 1 && await documentToolbar.locator(".st-cleanup-open, .st-reprocess-open, .st-history-details, .st-exclude-open").count() === 4 && await documentToolbar.locator(".st-history-details").getAttribute("aria-expanded") === "false", `${label}: compact notebook toolbar is missing Cleanup, Re-recognize, History, or Exclude`);
+  const toolbarButtonTops = await documentToolbar.locator(".st-cleanup-open, .st-reprocess-open, .st-history-details, .st-exclude-open").evaluateAll((buttons) => buttons.map((button) => ({ label: (button.textContent || "").trim(), top: button.getBoundingClientRect().top })));
+  if (platform === "desktop" && viewport.width > 700)
+    check(toolbarButtonTops.length === 4 && Math.max(...toolbarButtonTops.map((button) => button.top)) - Math.min(...toolbarButtonTops.map((button) => button.top)) <= 1, `${label}: notebook action toolbar buttons are vertically misaligned: ${JSON.stringify(toolbarButtonTops)}`);
+  check(!(await detail.locator(".st-notebook-details").evaluate((details) => details.open)), `${label}: technical notebook details are expanded by default`);
   const cleanup = detail.getByRole("button", { name: "Clean up document", exact: true });
   const reprocess = detail.getByRole("button", { name: "Re-recognize pages", exact: true });
   check(await cleanup.isVisible() && await reprocess.isVisible(), `${label}: detail action launch buttons are missing`);
@@ -751,9 +805,9 @@ async function inspectViewport(platform, viewport, label) {
   const previewHelp = reprocessFlow.getByRole("button", { name: "Help: Page text preview", exact: true });
   check(await previewHelp.getAttribute("aria-expanded") === "false", `${label}: page preview explanation is not collapsed behind its help icon`);
   await previewHelp.click();
-  check(await reprocessFlow.getByText(/Read-only OCR text\. No images are rendered and no recognition request is sent\./i).isVisible(), `${label}: page preview help does not explain its read-only OCR behavior`);
+  check(await reprocessFlow.getByText(/cards show read-only OCR text\. Preview opens the original page image locally; no recognition request or AI is used\./i).isVisible(), `${label}: page preview help does not explain text and original-image preview behavior`);
   await previewHelp.click();
-  await reprocessFlow.locator(".st-page-preview-card").first().click();
+  await reprocessFlow.locator(".st-page-preview-card .st-page-preview-select").first().click();
   if (platform === "nomad") {
     const visibleTextLines = await reprocessFlow.locator(".st-page-preview-card").first().locator(".st-page-preview-text").evaluate((text) => {
       const lineHeight = Number.parseFloat(getComputedStyle(text).lineHeight);
@@ -762,10 +816,10 @@ async function inspectViewport(platform, viewport, label) {
     check(visibleTextLines.visible >= visibleTextLines.lineHeight * 3 - 1, `${label}: Nomad OCR excerpt shows fewer than 3 full lines: ${JSON.stringify(visibleTextLines)}`);
   }
   check(await pageRange.inputValue() === "1", `${label}: selecting a page card did not update the page range`);
-  check(await reprocessFlow.locator(".st-page-preview-card").first().getAttribute("aria-pressed") === "true", `${label}: selected page card does not expose its selected state accessibly`);
+  check(await reprocessFlow.locator(".st-page-preview-select").first().getAttribute("aria-pressed") === "true", `${label}: selected page button does not expose its selected state accessibly`);
   check(await reprocessFlow.getByText(/1 selected page · 1 request/).isVisible(), `${label}: singular selected page/request estimate is not grammatically correct`);
   await pageRange.fill("1-2");
-  check(await reprocessFlow.locator(".st-page-preview-card").evaluateAll((cards) => cards.slice(0, 2).every((card) => card.getAttribute("aria-pressed") === "true") && cards.slice(2).every((card) => card.getAttribute("aria-pressed") === "false")), `${label}: typing a page range did not synchronize the visible selected cards`);
+  check(await reprocessFlow.locator(".st-page-preview-select").evaluateAll((cards) => cards.slice(0, 2).every((card) => card.getAttribute("aria-pressed") === "true") && cards.slice(2).every((card) => card.getAttribute("aria-pressed") === "false")), `${label}: typing a page range did not synchronize visible page selection`);
   const previewPageSize = platform === "nomad" || viewport.width <= 700 ? 6 : 9;
   check(await reprocessFlow.locator(".st-page-preview-card").count() === previewPageSize, `${label}: page preview renders more than one bounded page of cards`);
   await reprocessFlow.getByRole("button", { name: "Next", exact: true }).click();
@@ -775,7 +829,40 @@ async function inspectViewport(platform, viewport, label) {
   await reprocessFlow.getByRole("button", { name: "Previous", exact: true }).click();
   await reprocessFlow.getByText("Synthetic OCR page 1.", { exact: false }).waitFor();
   check(await reprocessFlow.getByText(/2 selected pages · 1 request/).isVisible() && await root.getByRole("button", { name: "Re-recognize selected pages", exact: true }).isEnabled(), `${label}: valid reprocess range did not refresh estimate or enable Run`);
+  const previewImage = reprocessFlow.getByRole("button", { name: "Preview page 1", exact: true });
+  check(await previewImage.isVisible(), `${label}: page card lacks its separate original-image Preview action`);
+  const previewHitArea = await previewImage.boundingBox();
+  const minimumPreviewHitArea = platform === "nomad" ? 44 : 28;
+  if (previewHitArea) previewHitAreas.push({ page: 1, width: previewHitArea.width, height: previewHitArea.height });
+  check(!!previewHitArea && previewHitArea.width >= minimumPreviewHitArea && previewHitArea.height >= minimumPreviewHitArea, `${label}: original-page Preview hit area is smaller than ${minimumPreviewHitArea}px: ${JSON.stringify(previewHitArea)}`);
+  await page.evaluate(() => { window.__streamlinedFixture.controller.workflowCapture.deferImagePreview = true; });
+  await previewImage.click();
+  await page.waitForFunction(() => document.querySelector(".st-page-preview-image")?.disabled === true);
+  const pendingPreviewImage = reprocessFlow.locator(".st-page-preview-image").first();
+  check(await pendingPreviewImage.isDisabled() && await reprocessFlow.getByText("Loading page preview…", { exact: true }).isVisible(), `${label}: original-page preview does not expose its pending state`);
+  const pendingCardState = await pendingPreviewImage.locator("xpath=ancestor::*[contains(concat(' ', normalize-space(@class), ' '), ' st-page-preview-card ')]").getAttribute("aria-busy");
+  check(pendingCardState === "true", `${label}: pending image preview card lacks its busy state (${pendingCardState}; ${await pendingPreviewImage.locator("xpath=ancestor::*[contains(concat(' ', normalize-space(@class), ' '), ' st-page-preview-card ')]").evaluate((card) => card.outerHTML)})`);
+  await page.evaluate(() => window.dispatchEvent(new Event("resize")));
+  await page.waitForFunction(() => document.querySelector(".st-page-preview-card")?.getAttribute("aria-busy") === "true");
+  check(await reprocessFlow.locator(".st-page-preview-image").first().isDisabled() && await reprocessFlow.getByText("Loading page preview…", { exact: true }).isVisible(), `${label}: resize rerender lost the pending preview state`);
+  await reprocessFlow.locator(".st-page-preview-image").first().evaluate((button) => button.click());
+  check(await page.evaluate(() => window.__streamlinedFixture.controller.workflowCapture.imagePreviewCalls.length) === 1, `${label}: clicking a pending preview issued a duplicate render`);
+  await page.evaluate(() => window.__streamlinedFixture.controller.workflowCapture.resolveImagePreview?.());
+  await page.waitForFunction(() => document.querySelectorAll(".st-preview-modal").length === 1);
+  await page.waitForFunction(() => {
+    const image = document.querySelector(".st-preview-image");
+    return image instanceof HTMLImageElement && image.complete && image.naturalWidth > 0;
+  });
+  await page.waitForFunction(() => !document.querySelector(".st-page-preview-image")?.disabled && document.querySelector(".st-page-preview-image-status")?.hidden === true);
+  check(await pageRange.inputValue() === "1-2" && await reprocessFlow.getByRole("button", { name: "Select page 1", exact: true }).getAttribute("aria-pressed") === "true", `${label}: original-image Preview changed page selection`);
+  await screenshot("original-page-preview");
+  await page.evaluate(() => document.querySelector(".st-preview-modal")?.remove());
   await screenshot("reprocess-workflow");
+  await page.evaluate(() => { const capture = window.__streamlinedFixture.controller.workflowCapture; capture.deferImagePreview = false; capture.rejectImagePreview = true; });
+  await reprocessFlow.getByRole("button", { name: "Preview page 2", exact: true }).click();
+  await reprocessFlow.locator(".st-page-preview-image-error.is-error").waitFor({ state: "visible" });
+  check(await page.locator(".st-preview-modal").count() === 0, `${label}: failed original-page Preview opened a modal`);
+  await page.evaluate(() => { window.__streamlinedFixture.controller.workflowCapture.rejectImagePreview = false; });
   await assertLayout("Reprocess workflow");
   await root.getByRole("button", { name: "Cancel", exact: true }).click();
   check(await root.locator(".st-detail-controls").isVisible(), `${label}: reprocess Cancel did not return to notebook detail`);
@@ -851,11 +938,20 @@ async function inspectViewport(platform, viewport, label) {
   check(await root.locator(".st-reprocess-workflow").count() === 0, `${label}: successful reprocess did not redraw the returned detail screen`);
   await detail.getByRole("button", { name: "Re-recognize pages", exact: true }).click();
   check(await root.getByRole("button", { name: "Re-recognize selected pages", exact: true }).isVisible(), `${label}: successful reprocess left its workflow busy`);
+  const stalePreview = root.locator(".st-reprocess-workflow").getByRole("button", { name: "Preview page 1", exact: true });
+  await page.evaluate(() => { window.__streamlinedFixture.controller.workflowCapture.deferImagePreview = true; });
+  await stalePreview.click();
+  await page.waitForFunction(() => document.querySelector(".st-page-preview-image")?.disabled === true);
+  const modalCountBeforeNavigation = await page.locator(".st-preview-modal").count();
   await root.getByRole("button", { name: "Cancel", exact: true }).click();
+  await page.evaluate(() => window.__streamlinedFixture.controller.workflowCapture.resolveImagePreview?.());
+  await page.waitForTimeout(50);
+  check(await page.locator(".st-preview-modal").count() === modalCountBeforeNavigation, `${label}: a page image opened after navigating away from its pending preview`);
+  await page.evaluate(() => { window.__streamlinedFixture.controller.workflowCapture.deferImagePreview = false; });
   const stubCompletionCalls = await page.evaluate(() => ({ ...window.__streamlinedFixture.controller.workflowCapture }));
   check(stubCompletionCalls.cleanupCalls.length === 1 && stubCompletionCalls.reprocessCalls.length === 1, `${label}: expected only the explicitly controlled workflow success stubs to run: ${JSON.stringify(stubCompletionCalls)}`);
   check(stubCompletionCalls.cleanupCalls[0].extraInstructions === "Keep Sanskrit diacritics and page order." && stubCompletionCalls.cleanupCalls[0].removePageComments === true && stubCompletionCalls.cleanupCalls[0].saveCopy === true, `${label}: cleanup did not pass per-run instructions and copy-only comment removal options to the controller: ${JSON.stringify(stubCompletionCalls.cleanupCalls[0])}`);
-  check(stubCompletionCalls.previewCalls.length >= 1 && stubCompletionCalls.restoreCalls.length === 1, `${label}: page preview or restore UI did not call its read-only/action controller method as expected: ${JSON.stringify({ previews: stubCompletionCalls.previewCalls, restores: stubCompletionCalls.restoreCalls })}`);
+  check(stubCompletionCalls.previewCalls.length >= 1 && stubCompletionCalls.imagePreviewCalls.length >= 2 && stubCompletionCalls.restoreCalls.length === 1, `${label}: text/image preview or restore UI did not call its controller method as expected: ${JSON.stringify({ previews: stubCompletionCalls.previewCalls, images: stubCompletionCalls.imagePreviewCalls, restores: stubCompletionCalls.restoreCalls })}`);
   await assertLayout("Reflection detail");
   await screenshot("reflection-detail-actions");
   const actionCounts = await page.evaluate(() => ({ ...window.__streamlinedFixture.controller.actionCounters }));
@@ -900,13 +996,44 @@ async function inspectViewport(platform, viewport, label) {
   check(await root.locator(".st-source-title").innerText() === "Satsang", `${label}: Satsang folder editor did not open`);
   await assertLayout("Satsang folder editor");
   await screenshot("satsang-folder-editor");
+  await root.getByRole("button", { name: "Cancel", exact: true }).click();
+  const finalStandalone = root.locator('article.st-rule-row .st-notebook-details-action[aria-label="Notebook details: Reflection"]').last();
+  await finalStandalone.click();
+  const finalDetail = root.locator(".st-detail-controls");
+  const excludeButton = finalDetail.locator(".st-exclude-open");
+  const beforeExclude = await page.evaluate(() => JSON.stringify(window.__streamlinedFixture.controller.config));
+  await excludeButton.click();
+  const excludeConfirmation = root.locator(".st-exclude-confirmation");
+  await excludeConfirmation.waitFor();
+  await screenshot("exclude-confirmation");
+  check(await root.locator(".st-exclude-confirm").isVisible(), `${label}: exclusion confirmation lacks its explicit confirm action`);
+  check(await excludeConfirmation.getByText(/original notebook and existing transcript are kept\. You can include it again in Source settings/i).isVisible(), `${label}: exclusion confirmation does not explain transcript retention or how to re-include the notebook`);
+  await root.locator(".st-exclude-cancel").click();
+  check(await finalDetail.isVisible() && await page.evaluate(() => JSON.stringify(window.__streamlinedFixture.controller.config)) === beforeExclude, `${label}: cancelling exclusion changed configuration or left notebook details`);
+  check(await page.evaluate(() => window.__streamlinedFixture.controller.workflowCapture.excludeCalls.length) === 0, `${label}: cancelling exclusion called the controller`);
+  await excludeButton.click();
+  await excludeConfirmation.waitFor();
+  await root.locator(".st-exclude-confirm").click();
+  await root.getByRole("button", { name: "Sources", exact: true }).waitFor();
+  check(await page.evaluate(() => window.__streamlinedFixture.controller.workflowCapture.excludeCalls.length) === 1, `${label}: confirming exclusion did not call the controller exactly once`);
+  const excludedRule = root.locator('button.st-edit[data-config-id="reflection-single"]');
+  await excludedRule.click();
+  await root.locator(".st-form").waitFor();
+  const mirrorToggle = root.locator(".st-source-header").getByLabel("Mirror this source", { exact: true });
+  const mirrorExcludedState = { count: await mirrorToggle.count(), checked: await mirrorToggle.isChecked(), savedRule: await page.evaluate(() => window.__streamlinedFixture.controller.config.rules.find((item) => item.id === "reflection-single")) };
+  check(mirrorExcludedState.count === 1 && !mirrorExcludedState.checked, `${label}: excluded standalone notebook does not show Mirror this source as off in Source settings (${JSON.stringify(mirrorExcludedState)})`);
+  const excludedConfig = await page.evaluate(() => JSON.stringify(window.__streamlinedFixture.controller.config));
+  await mirrorToggle.check();
+  check(await mirrorToggle.isChecked(), `${label}: enabling an excluded standalone notebook did not draft it as included`);
+  await root.getByRole("button", { name: "Cancel", exact: true }).click();
+  check(await page.evaluate(() => JSON.stringify(window.__streamlinedFixture.controller.config)) === excludedConfig, `${label}: cancelling the re-include draft changed the saved exclusion`);
 
   const finalCounters = await page.evaluate(() => ({ ...window.__streamlinedFixture.controller.actionCounters }));
   check(finalCounters.cleanupDocument === 0 && finalCounters.reprocessPages === 0 && finalCounters.update === 0, `${label}: fixture action counters changed unexpectedly: ${JSON.stringify(finalCounters)}`);
   check(errors.length === 0, `${label}: browser errors: ${errors.join("; ")}`);
   check(externalRequests.length === 0, `${label}: fixture attempted external requests: ${externalRequests.join(", ")}`);
   const successfulWorkflowStubs = await page.evaluate(() => ({ cleanup: window.__streamlinedFixture.controller.workflowCapture.cleanupCalls.length, reprocess: window.__streamlinedFixture.controller.workflowCapture.reprocessCalls.length }));
-  reports.push({ label, viewport, browserErrors: errors, externalRequests, syntheticActionCounts: finalCounters, successfulWorkflowStubs });
+  reports.push({ label, viewport, browserErrors: errors, externalRequests, previewHitAreas, syntheticActionCounts: finalCounters, successfulWorkflowStubs });
   await browser.close();
 }
 

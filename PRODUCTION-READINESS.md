@@ -1,5 +1,12 @@
 # Production readiness review
 
+## 0.13.1 findings
+
+- Original-image preview reused the full recognition index, hashing every page before rendering one image and giving no local loading feedback. A dedicated selected-page reader now requests only that page's metadata/layers/bitmaps, with unchanged full indexing for recognition. The runtime deduplicates pending requests, caches at most two images and about 12.6 million characters, invalidates by source revision and avoids storing preview files in the vault.
+- Preview belongs beside the re-recognition page selector. Local image rendering remains separate from selection and paid recognition; loading, failure and late completion after navigation are handled explicitly.
+- Exclusion needs a consequence and confirmation. Folder creation needs its own name prompt and mutation guard. Notebook controls and History are kept in the action area while technical details stay collapsed. Build, fixture and installation evidence is recorded in [Validation](VALIDATION.md).
+
+
 ## 0.13.0 candidate findings
 
 The following user-facing behavior is documented against the current source candidate. This section records scope and safety boundaries; it does not establish a built artifact, installed version, live-device result, release, or public distribution.

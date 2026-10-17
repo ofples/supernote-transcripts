@@ -74,6 +74,7 @@ export interface ReadOnlySource {
   ): Promise<{ path: string; size: number; mtime: number }[]>;
   revision(path: string): Promise<string>;
   open(path: string): Promise<OpenNotebook>;
+  preview?(path: string, pageNumber: number): Promise<string>;
 }
 export type ItemStatus =
   | "queued"

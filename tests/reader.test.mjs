@@ -8,7 +8,7 @@ const bundle = await build({
   format: "esm",
   write: false,
 });
-const { indexNotebook, openByteNotebook, AndroidReadOnlySource } = await import(
+const { indexNotebook, openByteNotebook, previewByteNotebook, AndroidReadOnlySource } = await import(
   "data:text/javascript;base64," +
     Buffer.from(bundle.outputFiles[0].text).toString("base64")
 );
@@ -38,6 +38,7 @@ function notebook({
   const signature = new Uint8Array(24);
   signature.set(new TextEncoder().encode("noteSN_FILE_VER_20260016"));
   const chunks = [signature];
+  const addresses = { pages: [] };
   let offset = 24;
   const block = (s) => {
     const b = typeof s === "string" ? new TextEncoder().encode(s) : s;
@@ -50,13 +51,16 @@ function notebook({
     return a;
   };
   const h = block(`<APPLY_EQUIPMENT:N6><FINAL_OPERATION_PAGE:${last}>`);
+  addresses.header = h;
   const pages = ids.map((id, i) => {
     const bitmap = block(ink[i]);
     const layer = block(`<LAYERNAME:MAINLAYER><LAYERBITMAP:${bitmap}>`);
     const recogn = recognition === undefined ? 0 : block(new TextEncoder().encode(btoa(JSON.stringify(recognition))));
-    return block(
+    const page = block(
       `<PAGEID:${id}><MAINLAYER:${layer}><LAYERSEQ:MAINLAYER><PAGESTYLE:${style}><RECOGNSTATUS:${status}>${recogn ? `<RECOGNTEXT:${recogn}>` : recognitionAddress ? `<RECOGNTEXT:${recognitionAddress}>` : ""}${layerInfo === undefined ? "" : `<LAYERINFO:${layerInfo}>`}`,
     );
+    addresses.pages.push({ page, layer, bitmap });
+    return page;
   });
   const f = block(
     `<FILE_FEATURE:${h}>` +
@@ -64,6 +68,7 @@ function notebook({
         .map((p, i) => `<${footerKeys?.[i] || `PAGE${i + 1}`}:${pages[p]}>`)
         .join(""),
   );
+  addresses.footer = f;
   const tail = new Uint8Array(4);
   new DataView(tail.buffer).setUint32(0, f, true);
   chunks.push(tail);
@@ -73,7 +78,28 @@ function notebook({
     data.set(b, p);
     p += b.length;
   }
+  data.blockAddresses = addresses;
   return data;
+}
+function uniformRle(color) {
+  const pixels = 1404 * 1872;
+  const fullRuns = Math.floor(pixels / 16384);
+  const remainder = pixels % 16384;
+  const encoded = new Uint8Array(fullRuns * 2 + (remainder ? 4 : 0));
+  for (let i = 0; i < fullRuns; i++) {
+    encoded[i * 2] = color;
+    encoded[i * 2 + 1] = 0xff;
+  }
+  if (remainder) {
+    const priorLength = Math.floor(remainder / 128);
+    const tailLength = remainder % 128;
+    const start = fullRuns * 2;
+    encoded[start] = color;
+    encoded[start + 1] = 0x80 + priorLength - 1;
+    encoded[start + 2] = color;
+    encoded[start + 3] = tailLength - 1;
+  }
+  return encoded;
 }
 function streamed(bytes, chunkSize = 7) {
   let max = 0;
@@ -382,4 +408,40 @@ test("folder inventory shares glob semantics and prunes excluded directories bef
     [root + "/26 - New.note", root + "/Branch/26 - Nested.note"],
   );
   assert.equal(walked.includes(root + "/Archive"), false);
+});
+
+test("selective preview reads and renders only the requested page ordinal",async()=>{
+  const bytes=notebook({ids:["first","second"],ink:[uniformRle(0x65),uniformRle(0x61)]});
+  const revision="1:100",readAddresses=[];
+  const source=streamed(bytes,65536),scan=source.scan.bind(source);
+  source.scan=async(addresses,callback)=>{readAddresses.push(...addresses);return scan(addresses,callback);};
+  const image=await previewByteNotebook("fixture.note",2,revision,source,async()=>revision);
+  const ordinary=await openByteNotebook("fixture.note",revision,streamed(bytes,65536),async()=>revision);
+  try {
+    assert.equal(image,await ordinary.render(2));
+  } finally { ordinary.close(); }
+  const blocks=bytes.blockAddresses;
+  for(const address of Object.values(blocks.pages[0]))assert.equal(readAddresses.includes(address),false,`unselected block ${address} was read`);
+  for(const address of Object.values(blocks.pages[1]))assert.equal(readAddresses.includes(address),true,`selected block ${address} was not read`);
+});
+
+test("selective preview rejects an invalid ordinal without reading any page payload blocks",async()=>{
+  const bytes=notebook({ids:["first","second"],ink:[uniformRle(0x65),uniformRle(0x61)]});
+  const revision="1:100",readAddresses=[];
+  const source=streamed(bytes,65536),scan=source.scan.bind(source);
+  source.scan=async(addresses,callback)=>{readAddresses.push(...addresses);return scan(addresses,callback);};
+  await assert.rejects(previewByteNotebook("fixture.note",3,revision,source,async()=>revision),/page|ordinal|outside/i);
+  for(const page of bytes.blockAddresses.pages)
+    for(const address of Object.values(page))assert.equal(readAddresses.includes(address),false,`page payload ${address} was read before range rejection`);
+});
+
+test("selective preview rejects a source revision change during its read",async()=>{
+  const bytes=notebook({ids:["first","second"],ink:[uniformRle(0x65),uniformRle(0x61)]});
+  let revision="1:100";
+  const source=streamed(bytes,65536),scan=source.scan.bind(source);
+  source.scan=async(addresses,callback)=>{
+    await scan(addresses,callback);
+    if(addresses.includes(bytes.blockAddresses.pages[1].bitmap))revision="2:100";
+  };
+  await assert.rejects(previewByteNotebook("fixture.note",2,"1:100",source,async()=>revision),/changed|revision/i);
 });

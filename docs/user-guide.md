@@ -6,7 +6,7 @@ Supernote Transcripts turns selected Supernote notebooks into Markdown using a p
 
 1. Run **Supernote Transcripts: Open mirrors** from Obsidian’s command palette.
 2. Choose **Add source** and select a `.note` file or folder. A **Mirror** shortcut saves a source with defaults; open its settings afterward to review them.
-3. Choose the Markdown destination. For folders, select which notebooks to include and check exclusions.
+3. Choose the Markdown destination. In the folder picker, use **Find** to narrow the folder list. **Create** opens a name prompt; confirm a valid name to create it, or cancel to return to the picker. For folder sources, select which notebooks to include and review exclusions before saving.
 4. Review the recognition model, quality, prompt and optional glossary. Save the source.
 5. Leave automatic catch-up off while learning the workflow. When ready, select **Update** to start an explicit run.
 
@@ -15,6 +15,10 @@ For notebook folders, narrower rules can select a single `.note` file. If multip
 ![Synthetic source form showing the local notebook and Markdown output folder](screenshots/source-editor-desktop.png)
 
 *Example source settings rendered from a synthetic fixture.*
+
+The output folder picker can filter existing folders. Choose **Create** to name a new folder; invalid names are shown in the prompt and cancelling leaves the vault unchanged.
+
+![Synthetic output folder creation prompt with a folder name field](screenshots/output-folder-create-desktop.png)
 
 ## Connect a provider
 
@@ -98,11 +102,15 @@ Failed pages remain visible for review and are not retried automatically. Use **
 
 ## Maintain a transcript
 
-Open a notebook’s details to see its progress and saved transcript. For a notebook inside a folder source, use the child row’s **Details** action to open the same view. Choose **Clean up document** or **Re-recognize pages** there to open the corresponding workflow.
+Open a notebook’s details to see its progress and saved transcript. For a notebook inside a folder source, use the child row’s **Details** action to open the same view. The compact action toolbar opens **Clean up document** and **Re-recognize pages**. **History** is collapsed until you need the previous-version restore action. Excluding a notebook asks for confirmation and explains that its saved results remain available if you include it again later.
 
 ![Synthetic expanded notebook children showing progress and the Details action](screenshots/notebook-child-actions-desktop.png)
 
-![Synthetic notebook Details view with separate Cleanup and Re-recognize actions](screenshots/notebook-details-actions-desktop.png)
+![Synthetic notebook Details view with a compact action toolbar and collapsed History](screenshots/notebook-details-actions-desktop.png)
+
+**Exclude notebook** asks for confirmation and explains that the existing transcript is kept. Cancel returns to notebook details without changing the source.
+
+![Synthetic notebook exclusion confirmation explaining transcript retention](screenshots/exclude-confirmation-desktop.png)
 
 ### Restore the previous transcript version
 
@@ -136,9 +144,13 @@ When the separate-copy option is on, the form shows the new path field and confi
 
 ### Re-recognize selected pages
 
-Choose **Re-recognize pages**, enter page numbers or ranges, and review the selection estimate. Available pages are numbered 1 through the notebook's current page count. You can select page cards in the grid; the read-only preview uses device OCR first and a matching cached AI result as a fallback. It does not render page images or send an AI request. The option to limit the action to pages with outdated recognition helps avoid resending pages that already match the current settings. Re-recognition sends selected page images again, may use provider credit, and can replace transcript text for those pages. Save important manual edits before running it. Changing a prompt or model does not start re-recognition automatically.
+Choose **Re-recognize pages**, enter page numbers or ranges, and review the selection estimate. Available pages are numbered 1 through the notebook's current page count. Page cards show read-only OCR text first and matching saved recognition as a fallback; loading the text does not render page images or send an AI request. Use a card's separate **Preview page N** action to open the original page image. Opening that image does not select the page; use **Select page N** or the page range to choose recognition work. The option to limit the action to pages with outdated recognition helps avoid resending pages that already match the current settings. Re-recognition sends selected page images again, may use provider credit, and can replace transcript text for those pages. Save important manual edits before running it. Changing a prompt or model does not start re-recognition automatically.
 
 ![Synthetic Re-recognize pages workflow with page range and selection estimate](screenshots/reprocess-workflow-desktop.png)
+
+Use **Preview page N** to open the original image separately from **Select page N**. Previewing does not select the page for re-recognition.
+
+![Synthetic original notebook page image preview](screenshots/original-page-preview-desktop.png)
 
 When source pages change, use **Update** to detect and process the changes. Keep original notebooks and transcript backups until the new output is checked. Concurrent edits or delayed Sync can create conflicts; resolve conflicts after both devices finish syncing and preserve the copy you want.
 

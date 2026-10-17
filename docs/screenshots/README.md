@@ -1,6 +1,6 @@
 # Interface examples
 
-These are captures of the plugin UI rendered from synthetic fixtures. The updated workflow examples use 0.13.0; unchanged examples are retained from the earlier pass. The current fixture run reported 767 assertions across desktop, narrow desktop, and Nomad-sized layouts, with no production Obsidian/config use, external requests, or real recognition calls. Controlled success stubs exercised the workflows without contacting a provider. The notebook labels, paths and OCR excerpts are synthetic; no notebook contents, account data, tokens, settings profiles, or reading positions are included. Screenshots establish layout only, not live-device or provider acceptance.
+These are captures of the plugin UI rendered from synthetic fixtures. The notebook labels, paths and OCR excerpts are synthetic; no notebook contents, account data, tokens, settings profiles, or reading positions are included. Screenshots establish layout only, not live-device or provider acceptance.
 
 ## Sources overview
 
@@ -10,7 +10,7 @@ The desktop Sources screen shows page progress, attention notices, source contro
 
 ## Source settings
 
-The source editor shows a single-notebook source and the aligned Markdown output folder picker.
+The source editor shows a single-notebook source and the aligned Markdown output folder picker. The picker can find existing folders or open a separate prompt to create one.
 
 ![Synthetic single-notebook source editor with output folder controls](source-editor-desktop.png)
 
@@ -18,15 +18,23 @@ The narrow layout stacks the output path and folder button while keeping both al
 
 ![Synthetic narrow desktop source editor showing the aligned output-folder control](source-editor-narrow.png)
 
+The picker uses **Find** to filter folders and a separate prompt to validate and create a new folder.
+
+![Synthetic output folder creation prompt](output-folder-create-desktop.png)
+
 ## Notebook actions
 
 Expanded notebook children keep their row focused on the notebook name, progress and available actions. Open **Details** to reach document workflows.
 
 ![Synthetic Sources view with compact expanded notebook children and Details actions](notebook-child-actions-desktop.png)
 
-The notebook Details view opens the separate cleanup and page re-recognition workflows.
+The notebook Details view keeps cleanup and page re-recognition in a compact action toolbar, with restore controls under a collapsed History disclosure.
 
 ![Synthetic notebook Details view with separate Cleanup and Re-recognize actions](notebook-details-actions-desktop.png)
+
+Exclusion is confirmed explicitly and keeps the existing transcript.
+
+![Synthetic notebook exclusion confirmation](exclude-confirmation-desktop.png)
 
 ## Transcript workflows
 
@@ -36,11 +44,15 @@ Cleanup is a text-only operation with a per-run model and estimate. **Save clean
 
 ![Synthetic Cleanup workflow with the separate-copy path enabled](cleanup-save-copy-desktop.png)
 
-Re-recognition accepts selected page numbers or ranges, shows the available range, and previews a bounded window of device OCR or saved recognition before a request.
+Re-recognition accepts selected page numbers or ranges and shows a bounded window of device OCR or saved recognition. Each page offers a separate action to preview the original image without selecting it for recognition.
 
 ![Synthetic Re-recognize pages workflow with range and estimate](reprocess-workflow-desktop.png)
 
 ![Synthetic Nomad page cards with readable OCR excerpts](reprocess-workflow-nomad.png)
+
+The image Preview action is separate from selecting a page for re-recognition.
+
+![Synthetic original notebook page image preview](original-page-preview-desktop.png)
 
 ## Cleanup defaults and saved data
 
@@ -85,3 +97,7 @@ The **Shared mirror** help text summarizes the difference between per-device con
 ![Synthetic Shared mirror help text explaining per-device configuration and shared vault content](shared-mirror-help-desktop.png)
 
 For task instructions see the [user guide](../user-guide.md); for setup see [installation](../installation.md).
+
+## Verification
+
+`node scripts/check-current-ui.mjs` passed 855 assertions for plugin version 0.13.1 at 1280×800 desktop, 470×799 narrow desktop, and 749×999 Nomad-sized viewports. The Nomad-sized Preview action measures 48×44 pixels. The checker used synthetic fixtures only: zero external requests, recognition calls, production Obsidian sessions, or production configuration changes. Browser errors: none.

@@ -234,7 +234,9 @@ type Screen =
   | "reprocess"
   | "glossaries"
   | "costs"
-  | "output-folders";
+  | "output-folders"
+  | "output-folder-create"
+  | "exclude-confirm";
 class MirrorsModal extends Modal {
   private readonly actionGate = new AsyncActionGate();
   private configSaveQueue: Promise<void> = Promise.resolve();
@@ -344,6 +346,14 @@ class MirrorsModal extends Modal {
   private reprocessPreviewPage = 0;
   private reprocessPreviewLoading = false;
   private reprocessPreviewError = "";
+  private reprocessImageGeneration = 0;
+  private reprocessImageSequence = 0;
+  private reprocessImageRequests = new Map<string, number>();
+  private reprocessImageErrors = new Map<string, string>();
+  private excludeSource = "";
+  private excludeBusy = false;
+  private excludeError = "";
+  private outputFolderCreateBusy = false;
   private storageSummary?: { historyFiles: number; cacheFiles: number; bytes: number; removableFiles: number; removableBytes: number };
   private storageBusy = false;
   private storageLoading = false;
@@ -423,6 +433,7 @@ class MirrorsModal extends Modal {
     this.keyboardObserver.observe(viewDocument.documentElement, { attributes: true, attributeFilter: ["style"] });
   }
   onClose() {
+    this.invalidateReprocessImagePreviews();
     if (this.viewportResize) {
       this.visualViewport?.removeEventListener("resize", this.viewportResize);
       this.viewWindow?.removeEventListener("resize", this.viewportResize);
@@ -432,6 +443,7 @@ class MirrorsModal extends Modal {
     this.contentEl.empty();
   }
   close() {
+    if (this.excludeBusy || this.outputFolderCreateBusy) return;
     if (this.pendingConfigSaves) {
       new Notice("Wait for the configuration save to finish before closing.");
       return;
@@ -439,7 +451,7 @@ class MirrorsModal extends Modal {
     super.close();
   }
   private goHome() {
-    if (this.pendingConfigSaves) return;
+    if (this.pendingConfigSaves || this.excludeBusy || this.outputFolderCreateBusy) return;
     this.screen = "home";
     this.render();
   }
@@ -475,11 +487,16 @@ class MirrorsModal extends Modal {
   }
   private goBack() {
     if (this.pendingConfigSaves) return;
+    if (this.excludeBusy || this.outputFolderCreateBusy) return;
+    if (this.screen === "reprocess") this.invalidateReprocessImagePreviews();
     if (this.screen === "costs") {
       this.costDraft = JSON.parse(JSON.stringify(this.c.costs.settings));
       this.screen = this.costReturnScreen;
     } else if (this.screen === "output-folders") {
       this.screen = "editor";
+    } else if (this.screen === "output-folder-create") {
+      this.outputFolderName = "";
+      this.screen = "output-folders";
     } else if (this.screen === "notebook-selection") {
       if (this.notebookSelectionRule)
         this.notebookSelectionRule.exclude = [...this.selectionExcludeBefore];
@@ -490,6 +507,12 @@ class MirrorsModal extends Modal {
     } else if (this.screen === "browser" && this.browserFrom === "edit")
       this.screen = "editor";
     else if (this.screen === "recovery") this.screen = "detail";
+    else if (this.screen === "exclude-confirm") {
+      this.excludeSource = "";
+      this.excludeError = "";
+      this.excludeBusy = false;
+      this.screen = "detail";
+    }
     else if (this.screen === "cleanup" || this.screen === "reprocess") this.screen = this.actionReturnScreen;
     else if (this.screen === "storage") this.screen = "settings";
     else if (this.screen === "detail") this.screen = this.detailReturnScreen;
@@ -501,6 +524,8 @@ class MirrorsModal extends Modal {
     this.render();
   }
   private showSettings() {
+    if (this.excludeBusy || this.outputFolderCreateBusy) return;
+    if (this.screen === "reprocess") this.invalidateReprocessImagePreviews();
     this.settingsReturnScreen = this.screen === "settings" ? "home" : this.screen;
     const controller = this.c as Controller & {
       provider?: "api" | "subscription";
@@ -534,7 +559,10 @@ class MirrorsModal extends Modal {
     this.render();
   }
   private render() {
+    const mutationBusy = this.excludeBusy || this.outputFolderCreateBusy;
     this.back.hidden = this.screen === "home";
+    this.back.disabled = mutationBusy;
+    this.headAction.disabled = mutationBusy;
     this.headAction.hidden = false;
     const inSettings = this.screen === "settings";
     this.headAction.classList.toggle("is-active", inSettings);
@@ -548,6 +576,9 @@ class MirrorsModal extends Modal {
       this.modalEl.querySelector<HTMLButtonElement>(".st-cost-head");
     if (costHead)
       costHead.hidden = !["home", "queue", "settings"].includes(this.screen);
+    if (costHead) costHead.disabled = mutationBusy;
+    const closeButton = this.modalEl.querySelector<HTMLButtonElement>(".st-close");
+    if (closeButton) closeButton.disabled = mutationBusy;
     this.modalEl.classList.toggle(
       "st-home",
       ["home", "queue"].includes(this.screen),
@@ -580,6 +611,10 @@ class MirrorsModal extends Modal {
                       ? "Costs"
                       : this.screen === "output-folders"
                         ? "Choose output folder"
+                        : this.screen === "output-folder-create"
+                          ? "Create output folder"
+                        : this.screen === "exclude-confirm"
+                          ? "Exclude notebook"
                         : this.screen === "recovery"
                           ? "Edited transcript"
                         : "Notebook",
@@ -606,6 +641,8 @@ class MirrorsModal extends Modal {
     else if (this.screen === "glossaries") void this.renderGlossaryPicker();
     else if (this.screen === "costs") this.renderCosts();
     else if (this.screen === "output-folders") void this.renderOutputFolders();
+    else if (this.screen === "output-folder-create") this.renderOutputFolderCreate();
+    else if (this.screen === "exclude-confirm") this.renderExcludeConfirmation();
     else if (this.screen === "editor") this.renderEditor();
     else if (this.screen === "recovery") this.renderRecovery();
     else this.renderDetail();
@@ -710,6 +747,8 @@ class MirrorsModal extends Modal {
     else safe(this.c.update());
   }
   private openCosts() {
+    if (this.excludeBusy || this.outputFolderCreateBusy) return;
+    if (this.screen === "reprocess") this.invalidateReprocessImagePreviews();
     this.costReturnScreen =
       this.screen === "settings"
         ? "settings"
@@ -1922,7 +1961,20 @@ class MirrorsModal extends Modal {
       },
       "st-button st-text-button",
     );
-    this.toggle(sourceHeader, "Mirror this source", r.enabled, (v) => (r.enabled = v), "Turn off to keep saved transcripts but stop future updates.");
+    const singleNotebookSource = r.source.toLowerCase().endsWith(".note");
+    const sourceIncluded = r.enabled && !(singleNotebookSource && excluded(r.source, r.source, r.exclude));
+    this.toggle(
+      sourceHeader,
+      "Mirror this source",
+      sourceIncluded,
+      (enabled) => {
+        r.enabled = enabled;
+        if (enabled && singleNotebookSource) r.exclude = [];
+      },
+      singleNotebookSource
+        ? "Turn off to keep the transcript but stop future updates. Turn on to include this notebook again."
+        : "Turn off to keep saved transcripts but stop future updates.",
+    );
 
     if (!r.source.toLowerCase().endsWith(".note")) {
       const whatToMirror = el(sourceSection, "div", undefined, "st-source-scope");
@@ -2746,29 +2798,32 @@ class MirrorsModal extends Modal {
       undefined,
       "st-browser st-output-browser",
     );
-    const breadcrumbs = el(root, "nav", undefined, "st-browser-breadcrumbs");
-    breadcrumbs.setAttribute("aria-label", "Output folder path");
     const parts = this.outputPickerPath.split("/").filter(Boolean);
-    const crumb = btn(breadcrumbs, "Vault", () => {
-      this.outputPickerPath = "";
-      this.render();
-    }, "st-browser-crumb");
-    crumb.setAttribute("aria-current", parts.length ? "false" : "location");
-    for (let index = 0; index < parts.length; index++) {
-      el(breadcrumbs, "span", "›", "st-browser-separator");
-      const path = parts.slice(0, index + 1).join("/");
-      const item = index === parts.length - 1
-        ? el(breadcrumbs, "span", parts[index], "st-browser-current")
-        : btn(breadcrumbs, parts[index], () => { this.outputPickerPath = path; this.render(); }, "st-browser-crumb");
-      if (index === parts.length - 1) item.setAttribute("aria-current", "location");
+    if (parts.length) {
+      const breadcrumbs = el(root, "nav", undefined, "st-browser-breadcrumbs");
+      breadcrumbs.setAttribute("aria-label", "Output folder path");
+      const up = btn(breadcrumbs, "Up", () => {
+        this.outputPickerPath = parts.slice(0, -1).join("/");
+        this.render();
+      }, "st-browser-crumb st-browser-up");
+      up.setAttribute("aria-label", `Up to ${parts.length > 1 ? parts.slice(0, -1).join("/") : "output root"}`);
+      const rootCrumb = btn(breadcrumbs, "Output root", () => {
+        this.outputPickerPath = "";
+        this.render();
+      }, "st-browser-crumb st-browser-root");
+      rootCrumb.setAttribute("aria-label", "Choose output folder root");
+      rootCrumb.setAttribute("title", "Return to the output folder root");
+      for (let index = 0; index < parts.length; index++) {
+        el(breadcrumbs, "span", "›", "st-browser-separator");
+        const path = parts.slice(0, index + 1).join("/");
+        const item = index === parts.length - 1
+          ? el(breadcrumbs, "span", parts[index], "st-browser-current")
+          : btn(breadcrumbs, parts[index], () => { this.outputPickerPath = path; this.render(); }, "st-browser-crumb");
+        if (index === parts.length - 1) item.setAttribute("aria-current", "location");
+      }
     }
-    const search = this.input(root, "Find a folder", this.outputFolderSearch, "search", (value) => { this.outputFolderSearch = value; });
+    const search = this.input(root, "Find", this.outputFolderSearch, "search", (value) => { this.outputFolderSearch = value; });
     search.placeholder = "Filter folders in this location";
-    const newFolder = el(root, "div", undefined, "st-new-folder");
-    const newFolderInput = this.input(newFolder, "New folder name", this.outputFolderName, "text", (value) => { this.outputFolderName = value; });
-    newFolderInput.placeholder = "Create in the current location";
-    btn(newFolder, "Create folder", () => { void this.createOutputFolder(); }, "st-button st-text-button");
-    el(newFolder, "small", "Creating a folder writes it to this vault immediately.", "st-caption");
     const error = el(root, "p", this.browserError, "st-error");
     const list = el(root, "div", undefined, "st-browser-list");
     const actions = el(this.footer, "div", undefined, "st-actions");
@@ -2781,6 +2836,7 @@ class MirrorsModal extends Modal {
       },
       "st-button st-text-button",
     );
+    btn(actions, "Create", () => this.openOutputFolderCreate(), "st-button st-text-button st-create-folder-open");
     const choose = btn(
       actions,
       "Choose this folder",
@@ -2827,7 +2883,7 @@ class MirrorsModal extends Modal {
         setIcon(arrow, "chevron-right");
       }
       if (!visibleFolders.length)
-        el(list, "p", query ? "No matching folders here." : "No existing subfolders here. You can create one above.", "st-empty");
+        el(list, "p", query ? "No matching folders here." : "No existing subfolders here. Create one to add it.", "st-empty");
     };
     search.addEventListener("input", () => drawFolders(allFolders));
     try {
@@ -2847,29 +2903,67 @@ class MirrorsModal extends Modal {
   }
   private async createOutputFolder() {
     const name = this.outputFolderName.trim();
+    if (this.outputFolderCreateBusy || this.screen !== "output-folder-create") return;
+    const parentPath = this.outputPickerPath;
     const windowsReserved = /^(con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\..*)?$/i.test(name);
     if (!name || name === "." || name === ".." || /[<>:"|?*\\/\u0000-\u001f]/.test(name) || /[. ]$/.test(name) || name.startsWith(".") || windowsReserved) {
       this.browserError = "Enter a normal folder name without slashes, hidden-folder prefixes, or reserved path characters.";
       this.render();
       return;
     }
-    const path = [this.outputPickerPath, name].filter(Boolean).join("/");
+    const path = [parentPath, name].filter(Boolean).join("/");
     try {
       validateDestination(path);
       if (this.app.vault.getAbstractFileByPath(path))
         throw new Error("A file or folder with that name already exists here.");
+      this.outputFolderCreateBusy = true;
+      this.render();
       await this.app.vault.createFolder(path);
-      if (this.screen !== "output-folders") return;
+      if (this.screen !== "output-folder-create") return;
+      this.outputFolderCreateBusy = false;
       this.outputPickerPath = path;
       this.outputFolderName = "";
       this.outputFolderSearch = "";
       this.browserError = "";
+      this.screen = "output-folders";
       this.render();
     } catch (error) {
-      if (this.screen !== "output-folders") return;
+      if (this.screen !== "output-folder-create") return;
+      this.outputFolderCreateBusy = false;
       this.browserError = `Could not create folder: ${err(error)}`;
       this.render();
     }
+  }
+  private openOutputFolderCreate() {
+    this.outputFolderName = "";
+    this.browserError = "";
+    this.screen = "output-folder-create";
+    this.render();
+  }
+  private renderOutputFolderCreate() {
+    const root = el(this.body, "section", undefined, "st-form st-output-folder-create");
+    const location = this.outputPickerPath || "Output root";
+    el(root, "p", `Create this folder inside ${location}.`, "st-caption st-create-folder-location");
+    let create: HTMLButtonElement | undefined;
+    const name = this.input(root, "Folder name", this.outputFolderName, "text", (value) => {
+      this.outputFolderName = value;
+      if (create) create.disabled = !value.trim();
+    }, "Use a folder name without path separators.");
+    name.placeholder = "New folder name";
+    name.autocomplete = "off";
+    name.disabled = this.outputFolderCreateBusy;
+    el(root, "p", this.browserError, "st-error st-create-folder-error");
+    const actions = el(this.footer, "div", undefined, "st-actions");
+    btn(actions, "Cancel", () => {
+      if (this.outputFolderCreateBusy) return;
+      this.outputFolderName = "";
+      this.browserError = "";
+      this.screen = "output-folders";
+      this.render();
+    }, "st-button st-text-button st-create-folder-cancel").disabled = this.outputFolderCreateBusy;
+    create = btn(actions, this.outputFolderCreateBusy ? "Creating…" : "Create folder", () => void this.createOutputFolder(), "st-button st-primary st-create-folder-confirm");
+    create.disabled = this.outputFolderCreateBusy || !this.outputFolderName.trim();
+    name.focus();
   }
   private chooseFolder() {
     if (this.browserFrom === "add") this.addSource(this.browserPath);
@@ -3077,7 +3171,9 @@ class MirrorsModal extends Modal {
         d.provider = value as "api" | "subscription";
         this.render();
       },
-      "Choose which account or key handles recognition.",
+      d.provider === "subscription"
+        ? "Choose which account or key handles recognition. ChatGPT manages plan allowance; this plugin tracks local attempts and cannot show remaining quota."
+        : "Choose which account or key handles recognition.",
     );
     if (d.provider === "api") {
       this.input(
@@ -3292,13 +3388,6 @@ class MirrorsModal extends Modal {
           );
         }
       }
-      const information = el(connection, "div", undefined, "st-connection-details");
-      this.help(information, "ChatGPT manages plan allowance; this plugin tracks local attempts and cannot show remaining quota.", "Subscription allowance details");
-      const manage = el(information, "a", "Manage subscription usage") as HTMLAnchorElement;
-      manage.href = "https://chatgpt.com/#settings/Subscription";
-      manage.target = "_blank";
-      manage.rel = "noopener noreferrer";
-      manage.addClass("st-manage-usage");
     }
     btn(
       connection,
@@ -3576,11 +3665,6 @@ class MirrorsModal extends Modal {
         el(root, "p", "No subscription request activity has been reported yet.", "st-caption");
       }
       el(root, "p", "Request counts are tracked locally; token totals come from provider-reported responses. ChatGPT manages plan allowance. This plugin does not show remaining quota or dollar charges.", "st-caption");
-      const manage = el(root, "a", "Manage subscription usage") as HTMLAnchorElement;
-      manage.href = "https://chatgpt.com/#settings/Subscription";
-      manage.target = "_blank";
-      manage.rel = "noopener noreferrer";
-      manage.addClass("st-manage-usage");
       const settings: CostSettings = this.costDraft ?? JSON.parse(JSON.stringify(this.c.costs.settings));
       this.costDraft = settings;
       this.number(root, "Daily request limit", settings.dailyRequests, 0, 100000, (value) => (settings.dailyRequests = value));
@@ -4047,37 +4131,9 @@ class MirrorsModal extends Modal {
       "st-button st-primary",
     );
     this.renderDocumentActions(controls, state);
-    this.renderLastVersion(controls, state.source);
-    const previewDetails = el(controls, "details", undefined, "st-detail-preview");
-    el(previewDetails, "summary", "Preview a page");
-    const previewRange = this.input(
-      previewDetails,
-      "Page number",
-      this.range.split(/[,-]/)[0] ?? "",
-      "number",
-      () => {},
-      "Page to preview",
-    );
-    btn(previewDetails, "Preview", () => {
-      const n = Number(previewRange.value);
-      if (!Number.isInteger(n) || n < 1)
-        return new Notice("Enter a page number or range.");
-      safe(
-        this.c
-          .preview(state.source, n)
-          .then((image) => new ImageModal(this.app, image).open()),
-      );
-    });
-    btn(
-      controls,
-      "Exclude notebook from this source",
-      () => {
-        safe(this.c.excludeNotebook(state.source).then(() => this.goHome()));
-      },
-      "st-button st-text-button",
-    );
-    const technical = el(controls, "details", undefined, "st-notebook-technical");
-    el(technical, "summary", "Technical details");
+    const details = el(controls, "details", undefined, "st-notebook-details");
+    el(details, "summary", "Details");
+    const technical = el(details, "section", undefined, "st-notebook-technical");
     el(technical, "p", `Source: ${state.source}`, "st-caption");
     el(technical, "p", `Output: ${state.output}`, "st-caption");
     el(
@@ -4086,7 +4142,7 @@ class MirrorsModal extends Modal {
       `Revision ${state.revision || "not indexed"} · saved ${state.lastSaved || "never"}`,
       "st-caption",
     );
-    const recognitionHistory = el(technical, "details", undefined, "st-recognition-history");
+    const recognitionHistory = el(details, "details", undefined, "st-recognition-history");
     el(recognitionHistory, "summary", "Page recognition history");
     const recognizedPages = state.desired.filter((page) => {
       const saved = state.pages[page.id];
@@ -4116,6 +4172,59 @@ class MirrorsModal extends Modal {
       el(technical, "p", `Device OCR is available for ${deviceOcrPages} page${deviceOcrPages === 1 ? "" : "s"}; it is separate from saved AI recognition.`, "st-caption");
     }
   }
+  private openExcludeConfirmation(source: string) {
+    if (!this.displayStore.notebooks[source]) return;
+    this.excludeSource = source;
+    this.excludeBusy = false;
+    this.excludeError = "";
+    this.screen = "exclude-confirm";
+    this.render();
+  }
+  private renderExcludeConfirmation() {
+    const root = el(this.body, "section", undefined, "st-form st-exclude-confirmation");
+    const state = this.displayStore.notebooks[this.excludeSource];
+    el(root, "h2", "Exclude this notebook?", "st-section-heading");
+    el(root, "p", state ? shortPath(state.source) : "This notebook is no longer available.", "st-caption st-exclude-source");
+    const consequence = el(
+      root,
+      "p",
+      "This stops mirroring the notebook from this source. The original notebook and existing transcript are kept. You can include it again in Source settings.",
+      "st-caption st-exclude-consequence",
+    );
+    consequence.id = `st-exclude-consequence-${crypto.randomUUID()}`;
+    const error = el(root, "p", this.excludeError, "st-error st-exclude-error");
+    error.hidden = !this.excludeError;
+    const actions = el(this.footer, "div", undefined, "st-actions");
+    const cancel = btn(actions, "Cancel", () => this.goBack(), "st-button st-text-button st-exclude-cancel");
+    cancel.disabled = this.excludeBusy;
+    if (this.c.progress.running)
+      el(root, "p", "Requests already sent may finish.", "st-caption st-exclude-active-help");
+    const confirm = btn(actions, this.excludeBusy ? "Excluding…" : "Exclude notebook", () => {
+      if (this.excludeBusy || !state) return;
+      this.excludeBusy = true;
+      this.back.disabled = true;
+      this.headAction.disabled = true;
+      this.modalEl.querySelector<HTMLButtonElement>(".st-cost-head")?.setAttribute("disabled", "true");
+      const closeButton = this.modalEl.querySelector<HTMLButtonElement>(".st-close");
+      if (closeButton) closeButton.disabled = true;
+      confirm.disabled = true;
+      cancel.disabled = true;
+      setText(confirm, "Excluding…");
+      void this.c.excludeNotebook(state.source).then(() => {
+        if (this.screen !== "exclude-confirm" || this.excludeSource !== state.source) return;
+        this.excludeSource = "";
+        this.excludeBusy = false;
+        this.goHome();
+      }).catch((failure) => {
+        if (this.screen !== "exclude-confirm" || this.excludeSource !== state.source) return;
+        this.excludeBusy = false;
+        this.excludeError = `Could not exclude notebook: ${err(failure)}`;
+        this.render();
+      });
+    }, "st-button st-danger st-exclude-confirm");
+    confirm.disabled = this.excludeBusy || !state;
+    confirm.setAttribute("aria-describedby", consequence.id);
+  }
   private renderLastVersion(parent: HTMLElement, source: string) {
     const controller = this.c as Controller & {
       lastVersion?: (source: string) => Promise<{ path: string; createdAt: string } | undefined>;
@@ -4123,7 +4232,6 @@ class MirrorsModal extends Modal {
     };
     if (!controller.lastVersion || !controller.restoreLastVersion) return;
     const section = el(parent, "section", undefined, "st-last-version");
-    el(section, "h2", "Transcript history", "st-section-heading");
     const status = el(section, "p", "Checking saved versions…", "st-caption st-last-version-status");
     const restore = btn(section, "Restore last version", () => {}, "st-button st-text-button st-restore-last-version");
     restore.disabled = true;
@@ -4164,7 +4272,7 @@ class MirrorsModal extends Modal {
   }
   private renderDocumentActions(parent: HTMLElement, state: Controller["store"]["notebooks"][string]) {
     const controls = el(parent, "section", undefined, "st-document-actions");
-    const actions = el(controls, "div", undefined, "st-document-action-buttons");
+    const actions = el(controls, "div", undefined, "st-document-action-toolbar st-document-action-buttons");
     if (this.canForceUpdate(state)) {
       const reason = this.forceUpdateReason(state, "This notebook needs attention before its next update.");
       el(controls, "p", reason, "st-caption st-attention-reason");
@@ -4172,6 +4280,23 @@ class MirrorsModal extends Modal {
     }
     btn(actions, "Clean up document", () => this.openDocumentWorkflow("cleanup", state.source), "st-button st-text-button st-cleanup-open");
     btn(actions, "Re-recognize pages", () => this.openDocumentWorkflow("reprocess", state.source), "st-button st-text-button st-reprocess-open");
+    btn(actions, "Exclude notebook", () => this.openExcludeConfirmation(state.source), "st-button st-danger st-exclude-open");
+    const history = el(controls, "section", undefined, "st-history-panel");
+    history.hidden = true;
+    history.id = `st-history-${crypto.randomUUID()}`;
+    const historyToggle = btn(actions, "History", () => {
+      const open = history.hidden;
+      history.hidden = !open;
+      historyToggle.setAttribute("aria-expanded", String(open));
+    }, "st-button st-text-button st-history-details");
+    historyToggle.setAttribute("aria-expanded", "false");
+    historyToggle.setAttribute("aria-controls", history.id);
+    const controller = this.c as Controller & {
+      lastVersion?: (source: string) => Promise<{ path: string; createdAt: string } | undefined>;
+      restoreLastVersion?: (source: string) => Promise<void>;
+    };
+    if (controller.lastVersion && controller.restoreLastVersion) this.renderLastVersion(history, state.source);
+    else el(history, "p", "Saved transcript history is not available in this runtime.", "st-caption");
   }
   private savedModelFor(source: string) {
     const state = this.displayStore.notebooks[source];
@@ -4207,6 +4332,8 @@ class MirrorsModal extends Modal {
       this.reprocessPreview = [];
       this.reprocessPreviewPage = 0;
       this.reprocessPreviewError = "";
+      this.invalidateReprocessImagePreviews();
+      this.reprocessImageErrors.clear();
       this.reprocessPreviewLoading = true;
     }
     this.screen = screen;
@@ -4362,6 +4489,62 @@ class MirrorsModal extends Modal {
     }
     if (request === this.reprocessPreviewRequest && this.screen === "reprocess" && this.actionSource === source) this.render();
   }
+  private invalidateReprocessImagePreviews() {
+    this.reprocessImageGeneration++;
+    this.reprocessImageRequests.clear();
+  }
+  private async previewReprocessPageImage(
+    source: string,
+    page: number,
+    button: HTMLButtonElement,
+    status: HTMLElement,
+  ) {
+    const key = `${source}\0${page}`;
+    if (this.reprocessImageRequests.has(key) || this.reprocessBusy) return;
+    const generation = this.reprocessImageGeneration;
+    const request = ++this.reprocessImageSequence;
+    this.reprocessImageRequests.set(key, request);
+    this.reprocessImageErrors.delete(key);
+    button.disabled = true;
+    button.closest<HTMLElement>(".st-page-preview-card")?.setAttribute("aria-busy", "true");
+    button.setAttribute("aria-label", `Loading page ${page} preview`);
+    status.classList.remove("is-error");
+    status.hidden = false;
+    setText(status, "Loading page preview…");
+    const isCurrent = () =>
+      this.reprocessImageGeneration === generation &&
+      this.reprocessImageRequests.get(key) === request &&
+      this.screen === "reprocess" &&
+      this.actionSource === source;
+    try {
+      const image = await this.c.preview(source, page);
+      if (!isCurrent()) return;
+      new ImageModal(this.app, image).open();
+    } catch (failure) {
+      if (!isCurrent()) return;
+      const message = `Could not preview page ${page}: ${err(failure)}`;
+      this.reprocessImageErrors.set(key, message);
+      setText(status, message);
+      status.classList.add("is-error");
+      status.hidden = false;
+    } finally {
+      const stillCurrent = isCurrent();
+      if (this.reprocessImageRequests.get(key) === request) this.reprocessImageRequests.delete(key);
+      if (stillCurrent) {
+        if (button.isConnected) {
+          button.disabled = this.reprocessBusy;
+          button.setAttribute("aria-label", `Preview page ${page}`);
+          if (!this.reprocessImageErrors.has(key)) {
+            status.hidden = true;
+            setText(status, "");
+          }
+          status.closest<HTMLElement>(".st-page-preview-card")?.setAttribute("aria-busy", "false");
+        } else {
+          this.render();
+        }
+      }
+    }
+  }
   private renderReprocessWorkflow() {
     const state = this.displayStore.notebooks[this.actionSource];
     const root = el(this.body, "section", undefined, "st-form st-action-workflow st-reprocess-workflow") as HTMLElement;
@@ -4394,15 +4577,15 @@ class MirrorsModal extends Modal {
       const preview = el(root, "section", undefined, "st-page-selection-preview");
       const previewHeading = el(preview, "div", undefined, "st-page-preview-heading");
       el(previewHeading, "h2", "Page text preview", "st-section-heading");
-      this.help(previewHeading, "Read-only OCR text. No images are rendered and no recognition request is sent.", "Page text preview");
+      this.help(previewHeading, "The cards show read-only OCR text. Preview opens the original page image locally; no recognition request or AI is used.", "Page text preview");
       const grid = el(preview, "div", undefined, "st-page-preview-grid") as HTMLElement;
       const pagination = el(preview, "div", undefined, "st-page-preview-pagination") as HTMLElement;
       const syncCards = () => {
-        for (const card of Array.from(grid.querySelectorAll<HTMLButtonElement>("[data-page-number]"))) {
-          const page = Number(card.dataset.pageNumber);
+        for (const selectCard of Array.from(grid.querySelectorAll<HTMLButtonElement>(".st-page-preview-select[data-page-number]"))) {
+          const page = Number(selectCard.dataset.pageNumber);
           const selected = pageRangeContains(this.reprocessRange, page);
-          card.classList.toggle("is-selected", selected);
-          card.setAttribute("aria-pressed", String(selected));
+          selectCard.setAttribute("aria-pressed", String(selected));
+          selectCard.closest<HTMLElement>(".st-page-preview-card")?.classList.toggle("is-selected", selected);
         }
       };
       const renderPagePreview = () => {
@@ -4424,7 +4607,44 @@ class MirrorsModal extends Modal {
         this.reprocessPreviewPage = Math.max(0, Math.min(this.reprocessPreviewPage, pageCount - 1));
         for (const page of this.reprocessPreview) {
           const selected = pageRangeContains(this.reprocessRange, page.number);
-          const card = btn(grid, "", () => {
+          const card = el(grid, "section", undefined, `st-page-preview-card${selected ? " is-selected" : ""}`);
+          card.setAttribute("aria-label", `Page ${page.number} preview`);
+          card.setAttribute("role", "group");
+          card.dataset.pageNumber = String(page.number);
+          const heading = el(card, "div", undefined, "st-page-preview-card-heading");
+          el(heading, "strong", `Page ${page.number}`, "st-page-preview-title");
+          el(heading, "small", page.origin === "device-ocr" ? "Device OCR" : page.origin === "recognized" ? "Saved recognition" : "No text", "st-page-preview-origin");
+          const previewKey = `${state.source}\0${page.number}`;
+          const previewError = el(card, "small", this.reprocessImageErrors.get(previewKey) ?? "", "st-page-preview-image-error st-page-preview-image-status");
+          previewError.id = `st-page-preview-status-${crypto.randomUUID()}`;
+          previewError.setAttribute("role", "status");
+          previewError.setAttribute("aria-live", "polite");
+          previewError.setAttribute("aria-atomic", "true");
+          const previewPending = this.reprocessImageRequests.has(previewKey);
+          previewError.hidden = !previewPending && !this.reprocessImageErrors.has(previewKey);
+          if (previewPending) setText(previewError, "Loading page preview…");
+          if (this.reprocessImageErrors.has(previewKey)) previewError.classList.add("is-error");
+          card.setAttribute("aria-busy", String(previewPending));
+          const previewButton = btn(heading, "", () => {
+            void this.previewReprocessPageImage(state.source, page.number, previewButton, previewError);
+          }, "st-icon-button st-page-preview-image");
+          const eye = previewButton.ownerDocument.createElementNS("http://www.w3.org/2000/svg", "svg");
+          eye.setAttribute("viewBox", "0 0 24 24");
+          eye.setAttribute("aria-hidden", "true");
+          eye.setAttribute("focusable", "false");
+          const eyeOutline = previewButton.ownerDocument.createElementNS("http://www.w3.org/2000/svg", "path");
+          eyeOutline.setAttribute("d", "M2 12s3.6-7 10-7 10 7 10 7-3.6 7-10 7S2 12 2 12Z");
+          const eyePupil = previewButton.ownerDocument.createElementNS("http://www.w3.org/2000/svg", "circle");
+          eyePupil.setAttribute("cx", "12");
+          eyePupil.setAttribute("cy", "12");
+          eyePupil.setAttribute("r", "3");
+          eye.append(eyeOutline, eyePupil);
+          previewButton.append(eye);
+          previewButton.setAttribute("aria-label", previewPending ? `Loading page ${page.number} preview` : `Preview page ${page.number}`);
+          previewButton.setAttribute("aria-describedby", previewError.id);
+          previewButton.title = `Preview page ${page.number} image`;
+          previewButton.disabled = this.reprocessBusy || previewPending;
+          const selectCard = btn(card, "", () => {
             const current = pagesFromRange(this.reprocessRange, maxPage);
             const next = current.includes(page.number)
               ? current.filter((number) => number !== page.number)
@@ -4434,17 +4654,17 @@ class MirrorsModal extends Modal {
             syncCards();
             refreshEstimate();
             updateRunState();
-          }, `st-page-preview-card${selected ? " is-selected" : ""}`);
-          card.dataset.pageNumber = String(page.number);
-          card.setAttribute("aria-pressed", String(selected));
-          card.disabled = this.reprocessBusy;
-          el(card, "strong", `Page ${page.number}`, "st-page-preview-title");
-          el(card, "small", page.origin === "device-ocr" ? "Device OCR" : page.origin === "recognized" ? "Saved recognition" : "No text", "st-page-preview-origin");
+          }, "st-page-preview-select");
+          selectCard.dataset.pageNumber = String(page.number);
+          selectCard.setAttribute("aria-label", `Select page ${page.number}`);
+          selectCard.setAttribute("aria-pressed", String(selected));
+          selectCard.disabled = this.reprocessBusy;
           const text = page.text.trim();
-          el(card, "span", text ? `${text.slice(0, 480)}${text.length > 480 ? "…" : ""}` : "No OCR text available.", "st-page-preview-text");
+          el(selectCard, "span", text ? `${text.slice(0, 480)}${text.length > 480 ? "…" : ""}` : "No OCR text available.", "st-page-preview-text");
         }
         if (pageCount > 1) {
           const previous = btn(pagination, "Previous", () => {
+            this.invalidateReprocessImagePreviews();
             this.reprocessPreviewPage--;
             this.reprocessPreviewLoading = true;
             this.reprocessPreviewError = "";
@@ -4454,6 +4674,7 @@ class MirrorsModal extends Modal {
           previous.disabled = this.reprocessPreviewPage === 0 || this.reprocessBusy;
           el(pagination, "span", `Page ${this.reprocessPreviewPage + 1} of ${pageCount}`, "st-caption");
           const next = btn(pagination, "Next", () => {
+            this.invalidateReprocessImagePreviews();
             this.reprocessPreviewPage++;
             this.reprocessPreviewLoading = true;
             this.reprocessPreviewError = "";
@@ -4533,6 +4754,7 @@ class MirrorsModal extends Modal {
     const workflowScreen = this.screen;
     const returnScreen = this.actionReturnScreen;
     let completed = false;
+    this.invalidateReprocessImagePreviews();
     this.reprocessBusy = true;
     this.render();
     try {
