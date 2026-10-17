@@ -1,6 +1,6 @@
 # Interface examples
 
-These are captures of the plugin UI rendered from synthetic fixtures for the 0.12.3 working tree. The final fixture run reported 652 assertions across desktop, narrow desktop, and Nomad-sized layouts, with no production Obsidian/config use, external requests, or real recognition calls. Per viewport, controlled success stubs exercised three cleanup completions and one re-recognition completion; they did not contact a provider. The notebook labels and paths are fixture display values; no notebook contents, account data, tokens, settings profiles, or reading positions are included. These screenshots show layout and controls; they do not establish release status or live Nomad validation.
+These are captures of the plugin UI rendered from synthetic fixtures. The updated workflow examples use 0.13.0; unchanged examples are retained from the earlier pass. The current fixture run reported 767 assertions across desktop, narrow desktop, and Nomad-sized layouts, with no production Obsidian/config use, external requests, or real recognition calls. Controlled success stubs exercised the workflows without contacting a provider. The notebook labels, paths and OCR excerpts are synthetic; no notebook contents, account data, tokens, settings profiles, or reading positions are included. Screenshots establish layout only, not live-device or provider acceptance.
 
 ## Sources overview
 
@@ -36,9 +36,21 @@ Cleanup is a text-only operation with a per-run model and estimate. **Save clean
 
 ![Synthetic Cleanup workflow with the separate-copy path enabled](cleanup-save-copy-desktop.png)
 
-Re-recognition accepts selected page numbers or ranges and shows the expected work before the request.
+Re-recognition accepts selected page numbers or ranges, shows the available range, and previews a bounded window of device OCR or saved recognition before a request.
 
 ![Synthetic Re-recognize pages workflow with range and estimate](reprocess-workflow-desktop.png)
+
+![Synthetic Nomad page cards with readable OCR excerpts](reprocess-workflow-nomad.png)
+
+## Cleanup defaults and saved data
+
+Default cleanup instructions can be edited in Settings. Per-run additions are entered in the Cleanup workflow.
+
+![Synthetic default cleanup instructions setting](cleanup-defaults-desktop.png)
+
+Saved data shows history/cache counts and the amount eligible for conservative manual cleanup. Restoring a previous transcript is a separate notebook action.
+
+![Synthetic Saved data review](saved-data-desktop.png)
 
 ## Queue estimate
 

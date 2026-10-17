@@ -3,6 +3,19 @@
 This checklist is cumulative. Later feedback does not replace earlier requests.
 Source implementation, fixture checks, installed builds and live verification are separate states.
 
+## Restore, storage, cleanup and page-selection follow-up — 0.13.0 candidate
+
+- [x] Keep a single previous-version restore point per notebook containing exact Markdown and its matching recognition snapshot; expose **Restore last version**, pause the notebook after restoring, and use the current original on a later Update.
+- [x] Explain that Obsidian Sync file history complements the Transcripts restore point and recognition provenance.
+- [x] Add a conservative Saved data review and cleanup for older tracked transcript/recognition history and old unreferenced page results/publication receipts; preserve current and latest data, the restore point, unresolved/unknown/malformed/conflicting records, claims, mirrors, new files, local cost records, and plugin state recovery snapshots.
+- [x] Keep removed-source transcripts and cache as recoverable archive/unknown data.
+- [x] Add a read-only page-selection preview grid that prefers device OCR and falls back to matching cached recognition, supports page/range selection, shows the available range, and loads only the visible window without image renders or AI requests.
+- [x] Use the same notebook-details icon for standalone notebook sources and notebooks inside folders.
+- [x] Keep the overall progress summary compact and put additional status under **Details**; retain the notebook details/action entry point.
+- [x] Make the default cleanup prompt configurable, append per-run extra instructions, and allow page-comment removal only in a separate copy while preserving comments in-place.
+- [x] Record automated verification separately: 494 tests, TypeScript checking, production build and 767 synthetic visual assertions pass. See [Validation](VALIDATION.md) for live installation/UI evidence.
+- [x] Activate 0.13.0 on desktop and Nomad with exact artifact hashes and guarded preservation of configuration, transcripts, recognition state, account session and accounting. Leave recognition paused. Nomad preflight resumed seven requests from its existing automatic queue before Pause; preserve those completed results rather than restoring the earlier backup.
+
 ## Notebook actions workflow — 0.12.3
 
 - [x] Keep expanded folder notebook rows compact; move cleanup and page-recognition forms into dedicated workflows reached through details/configuration.

@@ -107,14 +107,16 @@ async function seedReviewCases(page, root, platform) {
     c.progress.paused = false;
     c.actionCounters.cleanupDocument = 0;
     c.actionCounters.reprocessPages = 0;
-    c.workflowCapture = { cleanupEstimateModels: [], cleanupCalls: [], reprocessEstimates: [], reprocessCalls: [], deferCleanup: false, cleanupResolved: false };
+    c.workflowCapture = { cleanupEstimateModels: [], cleanupEstimateOptions: [], cleanupCalls: [], reprocessEstimates: [], reprocessCalls: [], previewCalls: [], restoreCalls: [], storageCalls: [], pruneCalls: [], deferCleanup: false, cleanupResolved: false };
     c.cleanupEstimate = (source, options = {}) => {
       c.workflowCapture.cleanupEstimateModels.push(options.model ?? "");
+      c.workflowCapture.cleanupEstimateOptions.push({ source, ...options });
       return { pages: 2, requests: 1, usd: options.model === "custom-fixture-model" ? 0.0032 : 0.001 };
     };
     c.reprocessEstimate = (source, range, outdatedOnly) => {
       c.workflowCapture.reprocessEstimates.push({ source, range, outdatedOnly });
-      return { pages: range.trim() || outdatedOnly ? (range.trim() ? 2 : 1) : 0, requests: 1, usd: 0.001 };
+      const selectedPages = range.trim() === "1" ? 1 : range.trim() ? 2 : outdatedOnly ? 1 : 0;
+      return { pages: selectedPages, requests: selectedPages ? 1 : 0, usd: 0.001 };
     };
     c.cleanupDocument = async (source, options) => {
       c.workflowCapture.cleanupCalls.push({ source, ...options });
@@ -123,6 +125,23 @@ async function seedReviewCases(page, root, platform) {
       });
     };
     c.reprocessPages = async (source, range, outdatedOnly) => { c.workflowCapture.reprocessCalls.push({ source, range, outdatedOnly }); };
+    c.pageSelectionPreview = async (source, start = 1, count = 12) => {
+      c.workflowCapture.previewCalls.push({ source, start, count });
+      const state = c.store.notebooks[source];
+      return state.desired
+        .filter((page) => page.number >= start && page.number < start + count)
+        .map((page) => ({ number: page.number, text: `Synthetic OCR page ${page.number}. ${"Readable OCR excerpt with enough words to wrap across several visible lines. ".repeat(5)}`, origin: "device-ocr" }));
+    };
+    c.lastVersion = async (source) => ({ path: `History/${source.split("/").pop()}.previous.md`, createdAt: "2026-10-10T12:00:00.000Z" });
+    c.restoreLastVersion = async (source) => { c.workflowCapture.restoreCalls.push(source); };
+    c.storageSummary = async () => {
+      c.workflowCapture.storageCalls.push("summary");
+      return { historyFiles: 4, cacheFiles: 7, bytes: 2048, removableFiles: 3, removableBytes: 1024 };
+    };
+    c.pruneStorage = async () => {
+      c.workflowCapture.pruneCalls.push("prune");
+      return { removedFiles: 3, removedBytes: 1024 };
+    };
     const pendingPageCount = (state) => state.desired.filter((page) =>
       (state.forcePending?.includes(page.id) || state.pages[page.id]?.fingerprint !== page.fingerprint) &&
       state.pageIssues?.[page.id]?.fingerprint !== page.fingerprint,
@@ -175,6 +194,45 @@ async function seedReviewCases(page, root, platform) {
     element.style.cssText = "--st-visual-height: 100vh; position: fixed; inset: 0; width: 100vw; height: 100vh; max-width: none; max-height: none; margin: 0; transform: none";
   });
   await root.getByText("Satsang", { exact: true }).waitFor();
+  const activeSource = await page.evaluate(() => {
+    const c = window.__streamlinedFixture.controller;
+    const state = Object.values(c.store.notebooks).find((item) => item.ruleId === "reflection-single");
+    c.progress.running = true;
+    c.progress.activeSource = state.source;
+    c.progress.activePage = { source: state.source, number: 1, total: 2 };
+    c.progress.stage = "Rendering transcript";
+    c.progress.detail = "Rendering page links for the current transcript.";
+    c.progress.checked = 1;
+    c.progress.total = 2;
+    c.progress.renderingContext = true;
+    c.progress.activePages = [1];
+    c.notify();
+    return state.source;
+  });
+  const homeProgress = root.locator(".st-summary-status");
+  await homeProgress.getByText(/Recognizing… 2\/2 pages · Reflection/).waitFor();
+  const homeProgressDetails = homeProgress.locator(".st-home-progress-details");
+  check(!(await homeProgressDetails.evaluate((details) => details.open)), `${platform}: home progress details are expanded by default`);
+  check(!(await homeProgress.locator(":scope > .st-caption").innerText()).includes("Rendering transcript"), `${platform}: home progress caption exposes rendering details by default`);
+  await homeProgressDetails.locator("summary").click();
+  check(await homeProgressDetails.getByText(/Rendering transcript · page 1 of 2/).isVisible() && await homeProgressDetails.getByText(/Rendering context is included/i).isVisible(), `${platform}: home progress details omit stage/page or rendering context`);
+  await page.evaluate(() => {
+    const c = window.__streamlinedFixture.controller;
+    c.progress.detail = "Updated synthetic rendering detail.";
+    c.notify();
+  });
+  check(await homeProgress.locator(".st-home-progress-details").evaluate((details) => details.open), `${platform}: home progress refresh did not preserve the open Details disclosure`);
+  await page.screenshot({ path: join(evidenceDir, `${platform}-home-progress-details.png`) });
+  await page.evaluate((source) => {
+    const c = window.__streamlinedFixture.controller;
+    c.progress.running = false;
+    c.progress.activeSource = undefined;
+    c.progress.activePage = undefined;
+    c.progress.detail = "";
+    c.progress.renderingContext = false;
+    c.progress.activePages = undefined;
+    c.notify();
+  }, activeSource);
 }
 
 async function inspectViewport(platform, viewport, label) {
@@ -283,12 +341,17 @@ async function inspectViewport(platform, viewport, label) {
   const child = root.locator(".st-folder-contents .st-notebook-child").filter({ hasText: "Reflection" }).first();
   await child.waitFor();
   check(await child.locator('button[aria-label^="Pause"], button[aria-label^="Resume"]').count() === 1, `${label}: Satsang child pause action missing`);
-  check(await child.getByRole("button", { name: "Details", exact: true }).isVisible(), `${label}: Satsang child Details action missing`);
+  const childDetails = child.getByRole("button", { name: "Notebook details: Reflection", exact: true });
+  check(await childDetails.isVisible(), `${label}: Satsang child notebook detail icon action missing`);
+  check(await childDetails.getAttribute("title") === "Notebook details: Reflection", `${label}: Satsang child detail action lacks its accessible tooltip`);
   check(await child.locator(".st-document-actions, .st-cleanup-task, .st-reprocess-task, .st-cleanup-previous").count() === 0, `${label}: expanded home child renders full actions or cleanup metadata`);
   await screenshot("satsang-expanded-child-actions");
-  await child.getByRole("button", { name: "Details", exact: true }).click();
+  await childDetails.click();
   await root.locator(".st-detail-controls").waitFor();
-  check(await root.locator(".st-detail-controls").getByRole("button", { name: "Clean up document", exact: true }).isVisible(), `${label}: child Details does not expose the cleanup workflow launch`);
+  check(await root.locator(".st-detail-controls").getByRole("button", { name: "Clean up document", exact: true }).isVisible(), `${label}: child notebook detail does not expose the cleanup workflow launch`);
+  check(await root.locator(".st-restore-last-version").isVisible(), `${label}: notebook detail does not offer its available restore point`);
+  await root.locator(".st-restore-last-version").click();
+  check(await page.evaluate(() => window.__streamlinedFixture.controller.workflowCapture.restoreCalls.length) === 1, `${label}: restore-last-version action did not call the controller`);
   await root.getByRole("button", { name: "Back", exact: true }).click();
   await root.locator(".st-folder-contents .st-notebook-child").filter({ hasText: "Reflection" }).first().waitFor();
 
@@ -397,6 +460,26 @@ async function inspectViewport(platform, viewport, label) {
   await root.getByRole("button", { name: "Settings", exact: true }).click();
   await root.locator(".st-settings-section").first().waitFor();
   await assertLayout("Settings");
+  const defaultCleanupInstructions = root.getByLabel("Default cleanup instructions", { exact: true });
+  check((await defaultCleanupInstructions.inputValue()).trim().length > 0, `${label}: editable default cleanup instructions do not display the built-in default`);
+  check(await page.evaluate(() => window.__streamlinedFixture.controller.config.cleanupPrompt) === undefined, `${label}: merely opening Settings wrote the default cleanup prompt into saved config`);
+  await root.locator(".st-cleanup-defaults").scrollIntoViewIfNeeded();
+  await screenshot("cleanup-defaults-settings");
+  await root.getByRole("button", { name: "Review storage", exact: true }).click();
+  const storage = root.locator(".st-storage-screen");
+  await storage.waitFor();
+  check(await storage.getByText(/unresolved paid results, current recognized pages, the latest undo point, and the seven-day sync grace period/i).isVisible(), `${label}: storage review does not explain which recoverable data and sync grace are retained`);
+  check(await storage.getByText(/obsolete files from all synced devices/i).isVisible(), `${label}: storage review does not explain that obsolete files are removed across synced devices`);
+  check(await storage.getByText(/Local account cost records are kept/i).isVisible(), `${label}: storage review does not explain that local account cost records are retained`);
+  await storage.getByText(/can be removed/i).waitFor();
+  await assertLayout("Saved data review");
+  await screenshot("saved-data-storage");
+  const pruneStorage = root.getByRole("button", { name: /Clean up removable storage/i });
+  check(await pruneStorage.isEnabled(), `${label}: manual storage cleanup is not available when removable files exist`);
+  await pruneStorage.click();
+  check(await page.evaluate(() => window.__streamlinedFixture.controller.workflowCapture.pruneCalls.length) === 1, `${label}: manual storage cleanup did not call its controller action`);
+  await root.getByRole("button", { name: "Back", exact: true }).click();
+  await root.locator(".st-settings-section").first().waitFor();
   const assertOneSettingsLabel = async (step) => {
     const label = root.locator(".st-head-action .st-icon-button-label");
     const count = await label.count();
@@ -596,7 +679,9 @@ async function inspectViewport(platform, viewport, label) {
   await root.getByRole("button", { name: "Cancel", exact: true }).click();
 
   // Open standalone notebook detail, then inspect cleanup and reprocess in dedicated workflows.
-  await root.locator('article.st-rule-row[role="button"]').filter({ hasText: "Reflection" }).last().click();
+  const standaloneDetails = root.locator('article.st-rule-row .st-notebook-details-action[aria-label="Notebook details: Reflection"]').last();
+  check(await standaloneDetails.isVisible() && await standaloneDetails.getAttribute("title") === "Notebook details: Reflection", `${label}: standalone notebook does not use the same accessible details icon action as folder children`);
+  await standaloneDetails.click();
   await root.locator(".st-detail-controls").waitFor();
   const detail = root.locator(".st-detail-controls");
   check(await detail.locator(".st-notebook-advanced").count() === 0, `${label}: single-note detail still has a separate Advanced disclosure`);
@@ -612,6 +697,8 @@ async function inspectViewport(platform, viewport, label) {
   check(await cleanupFlow.locator(".st-cleanup-previous").count() === 1 && !(await cleanupFlow.locator(".st-cleanup-previous").evaluate((details) => details.open)), `${label}: previous cleanup metadata is not in a collapsed details section`);
   check(await cleanupFlow.locator(".st-cleanup-copy-field").isHidden(), `${label}: copy path is visible while save-as-copy is off`);
   check(await cleanupFlow.locator(".st-cleanup-destination-path").innerText() === "Fixture Output/Reflection", `${label}: default cleanup destination is not the canonical transcript`);
+  const removePageComments = cleanupFlow.getByLabel("Remove page comments from the cleaned copy", { exact: true });
+  check(await removePageComments.isDisabled(), `${label}: page comment removal is enabled while overwrite mode is selected`);
   await assertLayout("Cleanup workflow");
   await screenshot("cleanup-workflow");
   const model = cleanupFlow.getByLabel("Cleanup model", { exact: true });
@@ -626,6 +713,7 @@ async function inspectViewport(platform, viewport, label) {
   await model.selectOption("gpt-6-luna");
   const copyToggle = cleanupFlow.locator('input[data-testid="cleanup-save-copy"]');
   await copyToggle.check();
+  check(await removePageComments.isEnabled(), `${label}: page comment removal stays disabled in save-as-copy mode`);
   const copyPath = cleanupFlow.getByLabel("Copy path", { exact: true });
   check(await copyPath.isVisible() && (await copyPath.inputValue()).endsWith("(cleaned).md"), `${label}: enabled copy path did not show its default sibling path`);
   check(await cleanupFlow.locator(".st-cleanup-destination").isHidden(), `${label}: save-as-copy repeats its destination below the editable path: ${JSON.stringify(await cleanupFlow.locator(".st-cleanup-destination").evaluate((node) => ({ hidden: node.hidden, display: getComputedStyle(node).display })))}`);
@@ -637,15 +725,55 @@ async function inspectViewport(platform, viewport, label) {
   check(await copyPath.inputValue() === "Fixture Output/Reflection (reviewed).md", `${label}: editable copy destination did not retain the entered path`);
   await copyToggle.uncheck();
   check(await cleanupFlow.locator(".st-cleanup-copy-field").isHidden() && await cleanupFlow.locator(".st-cleanup-destination").isVisible() && await cleanupFlow.locator(".st-cleanup-destination-path").innerText() === "Fixture Output/Reflection", `${label}: disabling save-as-copy did not hide the path and restore canonical destination`);
+  check(await removePageComments.isDisabled() && !(await removePageComments.isChecked()), `${label}: leaving save-as-copy mode did not disable and reset page comment removal`);
   await root.getByRole("button", { name: "Cancel", exact: true }).click();
   check(await root.locator(".st-detail-controls").isVisible(), `${label}: cleanup Cancel did not return to notebook detail`);
+  await page.evaluate(() => {
+    const c = window.__streamlinedFixture.controller;
+    const state = Object.values(c.store.notebooks).find((item) => item.ruleId === "reflection-single");
+    for (let number = 3; number <= 20; number++) {
+      const descriptor = { id: `reflection-page-${number}`, number, fingerprint: `synthetic-reflection-${number}` };
+      state.desired.push(descriptor);
+      state.order.push(descriptor.id);
+      state.pages[descriptor.id] = { fingerprint: descriptor.fingerprint, text: `Synthetic reflection page ${number}.`, recipe: "fixture", number };
+    }
+  });
   await reprocess.click();
   const reprocessFlow = root.locator(".st-reprocess-workflow");
   await reprocessFlow.waitFor();
   check(await root.getByText("Enter pages or choose outdated pages.", { exact: true }).isVisible(), `${label}: empty reprocess range has no specific disabled reason`);
   check(await root.getByRole("button", { name: "Re-recognize selected pages", exact: true }).isDisabled(), `${label}: reprocess can run without a page selection`);
   const pageRange = reprocessFlow.getByLabel("Pages", { exact: true });
+  await reprocessFlow.locator(".st-page-preview-card").first().waitFor();
+  check(await reprocessFlow.getByText("Available pages: 1–20.", { exact: false }).isVisible(), `${label}: re-recognition workflow does not state the available page range`);
+  check(await reprocessFlow.getByText("Synthetic OCR page 1.", { exact: false }).isVisible(), `${label}: OCR text preview is not visible in the page selection grid`);
+  check(await reprocessFlow.locator(".st-page-preview-card img, .st-page-preview-card canvas").count() === 0, `${label}: page selection preview rendered images or canvases`);
+  const previewHelp = reprocessFlow.getByRole("button", { name: "Help: Page text preview", exact: true });
+  check(await previewHelp.getAttribute("aria-expanded") === "false", `${label}: page preview explanation is not collapsed behind its help icon`);
+  await previewHelp.click();
+  check(await reprocessFlow.getByText(/Read-only OCR text\. No images are rendered and no recognition request is sent\./i).isVisible(), `${label}: page preview help does not explain its read-only OCR behavior`);
+  await previewHelp.click();
+  await reprocessFlow.locator(".st-page-preview-card").first().click();
+  if (platform === "nomad") {
+    const visibleTextLines = await reprocessFlow.locator(".st-page-preview-card").first().locator(".st-page-preview-text").evaluate((text) => {
+      const lineHeight = Number.parseFloat(getComputedStyle(text).lineHeight);
+      return { visible: text.clientHeight, lineHeight, cardHeight: text.closest(".st-page-preview-card").getBoundingClientRect().height };
+    });
+    check(visibleTextLines.visible >= visibleTextLines.lineHeight * 3 - 1, `${label}: Nomad OCR excerpt shows fewer than 3 full lines: ${JSON.stringify(visibleTextLines)}`);
+  }
+  check(await pageRange.inputValue() === "1", `${label}: selecting a page card did not update the page range`);
+  check(await reprocessFlow.locator(".st-page-preview-card").first().getAttribute("aria-pressed") === "true", `${label}: selected page card does not expose its selected state accessibly`);
+  check(await reprocessFlow.getByText(/1 selected page · 1 request/).isVisible(), `${label}: singular selected page/request estimate is not grammatically correct`);
   await pageRange.fill("1-2");
+  check(await reprocessFlow.locator(".st-page-preview-card").evaluateAll((cards) => cards.slice(0, 2).every((card) => card.getAttribute("aria-pressed") === "true") && cards.slice(2).every((card) => card.getAttribute("aria-pressed") === "false")), `${label}: typing a page range did not synchronize the visible selected cards`);
+  const previewPageSize = platform === "nomad" || viewport.width <= 700 ? 6 : 9;
+  check(await reprocessFlow.locator(".st-page-preview-card").count() === previewPageSize, `${label}: page preview renders more than one bounded page of cards`);
+  await reprocessFlow.getByRole("button", { name: "Next", exact: true }).click();
+  await reprocessFlow.getByText(`Synthetic OCR page ${previewPageSize + 1}.`, { exact: false }).waitFor();
+  check(await reprocessFlow.locator(".st-page-preview-card").count() === previewPageSize && await reprocessFlow.getByText(`Page 2 of ${Math.ceil(20 / previewPageSize)}`, { exact: true }).isVisible(), `${label}: page preview pagination did not load the next bounded window`);
+  check(await page.evaluate((pageSize) => window.__streamlinedFixture.controller.workflowCapture.previewCalls.some((call) => call.start === pageSize + 1 && call.count === pageSize), previewPageSize), `${label}: page preview requested more than the visible window from the controller`);
+  await reprocessFlow.getByRole("button", { name: "Previous", exact: true }).click();
+  await reprocessFlow.getByText("Synthetic OCR page 1.", { exact: false }).waitFor();
   check(await reprocessFlow.getByText(/2 selected pages · 1 request/).isVisible() && await root.getByRole("button", { name: "Re-recognize selected pages", exact: true }).isEnabled(), `${label}: valid reprocess range did not refresh estimate or enable Run`);
   await screenshot("reprocess-workflow");
   await assertLayout("Reprocess workflow");
@@ -705,6 +833,10 @@ async function inspectViewport(platform, viewport, label) {
   await detail.getByRole("button", { name: "Clean up document", exact: true }).click();
   await root.locator(".st-cleanup-workflow").waitFor();
   check(await root.getByRole("button", { name: "Clean up document", exact: true }).isEnabled(), `${label}: restored complete cleanup is still disabled: ${await root.locator(".st-cleanup-workflow").innerText()}`);
+  const extraInstructions = root.locator(".st-cleanup-workflow").getByLabel("Extra instructions for this run", { exact: true });
+  await extraInstructions.fill("Keep Sanskrit diacritics and page order.");
+  await root.locator(".st-cleanup-workflow").getByLabel("Save cleaned text as a separate copy", { exact: true }).check();
+  await root.locator(".st-cleanup-workflow").getByLabel("Remove page comments from the cleaned copy", { exact: true }).check();
   await root.getByRole("button", { name: "Clean up document", exact: true }).click();
   await detail.waitFor();
   check(await root.locator(".st-cleanup-workflow").count() === 0, `${label}: successful cleanup did not redraw the returned detail screen`);
@@ -722,6 +854,8 @@ async function inspectViewport(platform, viewport, label) {
   await root.getByRole("button", { name: "Cancel", exact: true }).click();
   const stubCompletionCalls = await page.evaluate(() => ({ ...window.__streamlinedFixture.controller.workflowCapture }));
   check(stubCompletionCalls.cleanupCalls.length === 1 && stubCompletionCalls.reprocessCalls.length === 1, `${label}: expected only the explicitly controlled workflow success stubs to run: ${JSON.stringify(stubCompletionCalls)}`);
+  check(stubCompletionCalls.cleanupCalls[0].extraInstructions === "Keep Sanskrit diacritics and page order." && stubCompletionCalls.cleanupCalls[0].removePageComments === true && stubCompletionCalls.cleanupCalls[0].saveCopy === true, `${label}: cleanup did not pass per-run instructions and copy-only comment removal options to the controller: ${JSON.stringify(stubCompletionCalls.cleanupCalls[0])}`);
+  check(stubCompletionCalls.previewCalls.length >= 1 && stubCompletionCalls.restoreCalls.length === 1, `${label}: page preview or restore UI did not call its read-only/action controller method as expected: ${JSON.stringify({ previews: stubCompletionCalls.previewCalls, restores: stubCompletionCalls.restoreCalls })}`);
   await assertLayout("Reflection detail");
   await screenshot("reflection-detail-actions");
   const actionCounts = await page.evaluate(() => ({ ...window.__streamlinedFixture.controller.actionCounters }));

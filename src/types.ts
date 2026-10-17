@@ -36,6 +36,8 @@ export interface ConfigV1 {
   batchPages: number;
   continuous?: boolean;
   showPageHeadings?: boolean;
+  /** Default semantic instructions used by whole-document cleanup. */
+  cleanupPrompt?: string;
 }
 export interface SourceEntry {
   path: string;
@@ -258,8 +260,13 @@ export interface Controller {
   manual(path: string, range: string, force?: boolean): Promise<void>;
   reprocessPages(source: string, range: string, outdatedOnly?: boolean): Promise<void>;
   reprocessEstimate?(source: string, range: string, outdatedOnly?: boolean): QueueEstimate;
-  cleanupEstimate(source: string, options?: { model?: string }): QueueEstimate;
-  cleanupDocument(source: string, options?: { saveCopy?: boolean; copyPath?: string; model?: string }): Promise<void>;
+  cleanupEstimate(source: string, options?: { model?: string; extraInstructions?: string; removePageComments?: boolean }): QueueEstimate;
+  cleanupDocument(source: string, options?: { saveCopy?: boolean; copyPath?: string; model?: string; extraInstructions?: string; removePageComments?: boolean }): Promise<void>;
+  pageSelectionPreview?(source: string, start?: number, count?: number): Promise<{ number: number; text: string; origin: "device-ocr" | "recognized" | "empty" }[]>;
+  lastVersion?(source: string): Promise<{ path: string; createdAt: string } | undefined>;
+  restoreLastVersion?(source: string): Promise<void>;
+  storageSummary?(): Promise<{ historyFiles: number; cacheFiles: number; bytes: number; removableFiles: number; removableBytes: number }>;
+  pruneStorage?(): Promise<{ removedFiles: number; removedBytes: number }>;
   openOutput(path: string): Promise<void>;
   previewTranscriptRecovery(source: string): Promise<{ current: string; generated: string; output: string; revision: string }>;
   resolveTranscriptConflict(source: string, action: "replace" | "keep", expectedCurrent: string, expectedRevision?: string): Promise<{ backup?: string; output: string }>;

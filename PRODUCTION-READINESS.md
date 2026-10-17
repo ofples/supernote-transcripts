@@ -1,4 +1,19 @@
-# Production readiness review — 0.12.3
+# Production readiness review
+
+## 0.13.0 candidate findings
+
+The following user-facing behavior is documented against the current source candidate. This section records scope and safety boundaries; it does not establish a built artifact, installed version, live-device result, release, or public distribution.
+
+| Priority | Finding | Candidate behavior and boundary |
+| --- | --- | --- |
+| High | Users needed a way to undo the latest generated transcript update without losing the recognition data needed for future incremental work. | Keep one fixed restore point per notebook with exact Markdown and its matching recognition snapshot. **Restore last version** restores both and pauses that notebook. A later **Update** works from the current local original and settings. Obsidian Sync history remains a complementary file-recovery mechanism, not a replacement for this provenance. |
+| Medium | Old local history and shared recognition cache could accumulate, while broad cleanup risked deleting recovery data or records needed by another device. | Review candidate files and counts before cleanup. Remove only obsolete known legacy backups and sufficiently old unreferenced page results/publication receipts. Preserve the current and latest data, the last restore point, unresolved/unknown/malformed/conflicting records, claims, mirrors, newly received files, local cost records, and local plugin state recovery snapshots. Removed-source files remain unknown/archive data. |
+| Medium | Selecting pages for re-recognition needed context without rendering images or starting a paid request. | Offer a read-only page grid for pages 1 through the current maximum; use device OCR first and matching cached recognition as fallback. Selecting cards changes the requested range. The preview sends no AI request and renders no page images. |
+| Low | Queue progress and cleanup controls needed to remain understandable without making notebook lists dense. | Keep the compact progress summary and put extended progress under **Details**. Make default cleanup instructions configurable, append per-run additions, and allow page-comment removal only when writing a separate copy; in-place cleanup preserves comments and saves the prior version. |
+
+Automated verification passes **494 tests**, TypeScript checking and the production build. Synthetic visual checks pass **767 assertions** across desktop, narrow desktop and Nomad-sized layouts with zero external requests or provider calls. Live installation and UI checks are recorded separately in [Validation](VALIDATION.md).
+
+## Previous readiness review — 0.12.3
 
 Reviewed 16 October 2026. This is a release candidate assessment, not a claim that every device, provider or handwriting format has been validated.
 

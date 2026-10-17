@@ -1,4 +1,16 @@
-# Validation — 16 October 2026
+# Validation
+
+## Version 0.13.0 — 17 October 2026
+
+- **494/494 tests**, TypeScript checking and production build pass. New coverage includes restore-record identity/integrity and rollback, exact Markdown/cache restoration, queue preservation, bounded OCR preview reads, stale page-inventory refresh without durable mutations, offline cached-text previews, default plus extra cleanup instructions, copy-only marker removal, and conservative storage collection with receipt references and race guards.
+- The synthetic browser checker passes **767 assertions** across desktop, narrow desktop and Nomad-sized layouts, with zero external requests, provider calls or browser errors. It checks consistent notebook action icons, collapsed progress details, range/card selection and pagination, copy-only comment removal, cleanup defaults, restore controls, storage review, and readable multiline OCR excerpts on Nomad. These fixtures use synthetic source text and mock operations.
+- Storage deletion and transcript restoration were exercised only with fixtures in this pass. Live UI checks did not submit cleanup or re-recognition and must not be interpreted as provider-quality or destructive-operation acceptance.
+- Desktop Vedas is running **0.13.0** with the approved artifacts below. Guarded activation preserved settings, notebook/queue state, source flags and conflicts, outputs, encrypted session, preferences and accounting. It is idle and paused, with zero recognition calls in the fresh runtime. Live read-only checks covered the page grid, range/card selection and Cancel, cleanup additions and copy-only comment removal, and Saved data review. No storage deletion or restore was run.
+- The live desktop page selector initially found an 84-page saved inventory against a newer 122-page original. The read-only inventory refresh now shows **1–122**, nine cards per screen and fourteen grid screens, without a recognition request or durable queue/state change.
+- During Nomad preflight, bringing the existing **0.12.3** installation to the foreground resumed its previously enabled automatic recognition. Seven requests were observed before runtime Pause settled; completed work was preserved and a fresh post-save baseline was taken. These were real automatic requests, separate from the mocked tests and the fresh-build UI checks.
+- Nomad is running **0.13.0** with all three approved hashes matching. All ten activation checks pass, including preserved configuration, notebook/queue state, five transcript outputs, session, ledgers/preferences and AI/automatic choices. The fresh runtime is idle and paused, with zero new recognition calls. The post-save baseline, rather than the earlier preflight backup, was used to preserve the automatic run's completed work.
+- Approved SHA-256: `main.js` = `50014f543ed3a16e3e507ec495519b9b637f98bb170c71d749a26ef3bee2f9c0`; `manifest.json` = `6978598d267c921f4e28b0a4a9effab2fa4f189b83817ae91ff77bf6f7234683`; `styles.css` = `4ab5c79c98809e9e17777876b242a979f261ba250dfe5ddd45ee3775ae426a63`.
+
 
 ## Version 0.12.3 — notebook action workflows
 

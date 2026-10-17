@@ -17,6 +17,7 @@ import {
   parentBrowserPath,
 } from "./browser.mjs";
 import { availableModalHeight } from "./viewport.mjs";
+import { DEFAULT_CLEANUP_PROMPT } from "./cleanup.mjs";
 import { mergeProfileDrafts } from "./profile-draft.mjs";
 import {
   endpointKey,
@@ -54,6 +55,38 @@ const shortPath = (path: string) =>
     : path.startsWith(`${ROOT}/`)
       ? path.slice(ROOT.length + 1)
       : path;
+const pageRangeContains = (range: string, page: number) => range.split(",").some((part) => {
+  const match = part.trim().match(/^(\d+)\s*(?:-\s*(\d+))?$/);
+  if (!match) return false;
+  const first = Number(match[1]);
+  const last = Number(match[2] ?? match[1]);
+  return page >= Math.min(first, last) && page <= Math.max(first, last);
+});
+const pagesFromRange = (range: string, maxPage: number) => {
+  const pages = new Set<number>();
+  for (const part of range.split(",")) {
+    const match = part.trim().match(/^(\d+)\s*(?:-\s*(\d+))?$/);
+    if (!match) continue;
+    const first = Number(match[1]);
+    const last = Number(match[2] ?? match[1]);
+    const start = Math.max(1, Math.min(first, last));
+    const end = Math.min(maxPage, Math.max(first, last));
+    for (let page = start; page <= end; page++) pages.add(page);
+  }
+  return [...pages].sort((a, b) => a - b);
+};
+const formatPageRange = (pages: number[]) => {
+  const sorted = [...new Set(pages)].sort((a, b) => a - b);
+  const ranges: string[] = [];
+  for (let index = 0; index < sorted.length;) {
+    const first = sorted[index];
+    let last = first;
+    while (index + 1 < sorted.length && sorted[index + 1] === last + 1) last = sorted[++index];
+    ranges.push(first === last ? String(first) : `${first}-${last}`);
+    index++;
+  }
+  return ranges.join(", ");
+};
 const base = (path: string) =>
   path.replace(/\/+$/, "").split("/").pop() || "Notebook";
 const friendlyModel = (model: string) =>
@@ -197,6 +230,7 @@ type Screen =
   | "detail"
   | "recovery"
   | "cleanup"
+  | "storage"
   | "reprocess"
   | "glossaries"
   | "costs"
@@ -224,6 +258,7 @@ class MirrorsModal extends Modal {
   private pageIssuesLive?: HTMLElement;
   private notebookRetryQueued = new Set<string>();
   private updateButton?: HTMLButtonElement;
+  private homeProgressDetailsOpen = false;
   private forceUpdateSource = "";
   private forceUpdateReturnScreen: Screen = "home";
   private forceUpdateRecognizeAll = false;
@@ -253,6 +288,7 @@ class MirrorsModal extends Modal {
     provider: "api" | "subscription";
     concurrency: number;
     showPageHeadings: boolean;
+    cleanupPrompt: string;
     pairingAddress: string;
     pairingCode: string;
   };
@@ -302,6 +338,18 @@ class MirrorsModal extends Modal {
   private cleanupSaveCopy = false;
   private cleanupCopyPath = "";
   private cleanupModel = "";
+  private cleanupExtraInstructions = "";
+  private cleanupRemovePageComments = false;
+  private reprocessPreview: { number: number; text: string; origin: "device-ocr" | "recognized" | "empty" }[] = [];
+  private reprocessPreviewPage = 0;
+  private reprocessPreviewLoading = false;
+  private reprocessPreviewError = "";
+  private storageSummary?: { historyFiles: number; cacheFiles: number; bytes: number; removableFiles: number; removableBytes: number };
+  private storageBusy = false;
+  private storageLoading = false;
+  private storageError = "";
+  private storageRequest = 0;
+  private reprocessPreviewRequest = 0;
   private get displayStore(): Store {
     return this.c.displayStore ?? this.c.store;
   }
@@ -443,6 +491,7 @@ class MirrorsModal extends Modal {
       this.screen = "editor";
     else if (this.screen === "recovery") this.screen = "detail";
     else if (this.screen === "cleanup" || this.screen === "reprocess") this.screen = this.actionReturnScreen;
+    else if (this.screen === "storage") this.screen = "settings";
     else if (this.screen === "detail") this.screen = this.detailReturnScreen;
     else if (this.screen === "settings") {
       this.settingsDraft = undefined;
@@ -477,6 +526,7 @@ class MirrorsModal extends Modal {
       provider: controller.provider ?? "api",
       concurrency: controller.concurrency ?? 1,
       showPageHeadings: this.c.config.showPageHeadings === true,
+      cleanupPrompt: (this.c.config as typeof this.c.config & { cleanupPrompt?: string }).cleanupPrompt ?? DEFAULT_CLEANUP_PROMPT,
       pairingAddress: "",
       pairingCode: "",
     };
@@ -516,6 +566,8 @@ class MirrorsModal extends Modal {
               ? "Clean up document"
               : this.screen === "reprocess"
                 ? "Re-recognize pages"
+            : this.screen === "storage"
+              ? "Review storage"
             : this.screen === "notebook-selection"
               ? "Select notebooks"
               : this.screen === "editor"
@@ -549,6 +601,7 @@ class MirrorsModal extends Modal {
     else if (this.screen === "notebook-selection")
       void this.renderNotebookSelection();
     else if (this.screen === "settings") this.renderSettings();
+    else if (this.screen === "storage") this.renderStorage();
     else if (this.screen === "browser") void this.renderBrowser();
     else if (this.screen === "glossaries") void this.renderGlossaryPicker();
     else if (this.screen === "costs") this.renderCosts();
@@ -575,6 +628,7 @@ class MirrorsModal extends Modal {
       }
     }
     else if (this.screen === "costs") this.refreshCosts();
+    else if (this.screen === "storage") this.render();
     else if (this.screen === "settings") {
       const controller = this.c as Controller & {
         subscriptionStatus?: { connected: boolean; needsSignIn?: boolean; pairingPending?: boolean; status: string; email?: string };
@@ -696,6 +750,8 @@ class MirrorsModal extends Modal {
       this.c.progress.stage,
     ]);
     if (this.summary.dataset.key !== summaryKey) {
+      const existingProgressDetails = this.summary.querySelector<HTMLDetailsElement>(".st-home-progress-details");
+      if (existingProgressDetails) this.homeProgressDetailsOpen = existingProgressDetails.open;
       this.summary.dataset.key = summaryKey;
       this.summary.empty();
       this.summary.classList.add("st-summary-status");
@@ -711,10 +767,28 @@ class MirrorsModal extends Modal {
           : executionReason
             ? "Recognition is paused; review settings to continue."
             : active
-          ? `${base(active.source).replace(/\.note$/i, "")} · ${active.stage}${active.number ? ` · page ${active.number}${active.total ? ` of ${active.total}` : ""}` : ""}`
+          ? (() => {
+              const state = this.displayStore.notebooks[active.source];
+              const presentation = state ? notebookPresentation(state) : undefined;
+              const ready = presentation?.ready ?? this.c.progress.checked;
+              const total = presentation?.total ?? this.c.progress.total;
+              return `Recognizing… ${ready}/${total} pages · ${base(active.source).replace(/\.note$/i, "")}`;
+            })()
           : model.caption,
         "st-caption",
       );
+      if (active) {
+        const activePage = this.c.progress.activePage?.source === active.source ? this.c.progress.activePage : undefined;
+        const progressDetails = el(this.summary, "details", undefined, "st-home-progress-details") as HTMLDetailsElement;
+        progressDetails.open = this.homeProgressDetailsOpen;
+        progressDetails.addEventListener("toggle", () => { this.homeProgressDetailsOpen = progressDetails.open; });
+        el(progressDetails, "summary", "Details");
+        el(progressDetails, "p", `${active.stage}${activePage ? ` · page ${activePage.number}${activePage.total ? ` of ${activePage.total}` : ""}` : ""}`, "st-caption");
+        if (this.c.progress.detail) el(progressDetails, "p", this.c.progress.detail, "st-caption");
+        el(progressDetails, "p", this.c.progress.renderingContext ? "Rendering context is included." : "Rendering context is not included.", "st-caption");
+        if (this.c.progress.activePages?.length)
+          el(progressDetails, "p", `Active pages: ${this.c.progress.activePages.join(", ")}`, "st-caption");
+      }
       const blockerReason = budgetReason || executionReason;
       if (blockerReason) {
         const reason = el(this.summary, "details", undefined, "st-home-blocker-details");
@@ -1002,17 +1076,24 @@ class MirrorsModal extends Modal {
           "st-queue-row st-working",
         );
         const copy = this.queueCopy(row, q.working.source);
-        el(
-          copy,
-          "p",
-          `${q.working.stage}${q.working.number ? ` · page ${q.working.number}${q.working.total ? ` of ${q.working.total}` : ""}` : ""}`,
-          "st-caption",
-        );
+        const workingState = this.displayStore.notebooks[q.working.source];
+        const workingView = workingState ? notebookPresentation(workingState) : undefined;
+        const current = this.c.progress.activePage?.source === q.working.source
+          ? this.c.progress.activePage
+          : undefined;
+        const total = workingView?.total || current?.total || q.working.total || 0;
+        const completed = workingView?.ready ?? (current ? Math.max(0, current.number - 1) : 0);
+        const cleaningUp = /cleanup/i.test(q.working.stage);
+        el(copy, "p", cleaningUp ? "Cleaning up document…" : total ? `Recognizing… ${Math.min(completed, total)}/${total} pages` : "Recognizing…", "st-caption st-working-progress");
+        const workingDetails = el(copy, "details", undefined, "st-working-details");
+        workingDetails.dataset.queueSection = "working details";
+        el(workingDetails, "summary", "Details");
+        el(workingDetails, "p", `${q.working.stage}${current ? ` · page ${current.number} of ${current.total}` : ""}`, "st-caption");
         const contextPage = this.c.progress.renderingContext && this.c.progress.activePage?.source === q.working.source
           ? String(this.c.progress.activePage.number)
           : this.c.progress.detail.match(/(?:^|[—–-]\s*)context page\s+(\d+)\b/i)?.[1];
         if (contextPage)
-          el(copy, "p", `Context page ${contextPage}`, "st-caption st-context-page");
+          el(workingDetails, "p", `Rendering context · page ${contextPage}`, "st-caption st-context-page");
         const activePages = this.c.progress.activePages ?? [];
         const activeSource = this.c.progress.activePage?.source;
         if (
@@ -1020,23 +1101,23 @@ class MirrorsModal extends Modal {
           (!activeSource || activeSource === q.working.source)
         ) {
           const pageText = activePages.join(", ");
-          el(
-            copy,
-            "p",
-            `${activePages.length} ${activePages.length === 1 ? "page" : "pages"} in progress${activeSource === q.working.source ? ` · pages ${pageText}` : ""}`,
-            "st-caption st-active-pages",
-          );
+          el(workingDetails, "p", `${activePages.length} ${activePages.length === 1 ? "page" : "pages"} in progress${activeSource === q.working.source ? ` · pages ${pageText}` : ""}`, "st-caption st-active-pages");
         }
-        this.queueProgress(copy, q.working.source);
-        const cleanupInProgress = /cleanup/i.test(q.working.stage);
+        if (this.c.progress.detail && this.c.progress.detail !== q.working.stage)
+          el(workingDetails, "p", this.c.progress.detail, "st-caption st-working-detail");
+        if (workingView) {
+          el(workingDetails, "p", `${workingView.ready} of ${workingView.total} pages ready · ${workingView.pending} remaining`, "st-caption");
+          progressBar(workingDetails, workingView, `${base(q.working.source)} pages ready`);
+        }
+        const cleanupInProgress = cleaningUp;
         if (cleanupInProgress) {
           const cleanupEstimate = (this.c as Controller & { cleanupEstimate?: (source: string) => QueueEstimate }).cleanupEstimate?.(q.working.source);
           const estimate = cleanupEstimate
             ? `${cleanupEstimate.pages} pages · ${cleanupEstimate.requests} request${cleanupEstimate.requests === 1 ? "" : "s"}`
             : "one text-only request";
-          el(copy, "p", `Document cleanup · saved transcript text only · ${estimate}`, "st-caption st-cleanup-progress");
+          el(workingDetails, "p", `Document cleanup · saved transcript text only · ${estimate}`, "st-caption st-cleanup-progress");
         } else {
-          this.renderQueueEstimate(copy, q.working.source);
+          this.renderQueueEstimate(workingDetails, q.working.source);
         }
         const state = this.displayStore.notebooks[q.working.source];
         if (state) {
@@ -1517,6 +1598,13 @@ class MirrorsModal extends Modal {
     if (isNotebook && stateSources.length) {
       const state = this.displayStore.notebooks[stateSources[0]];
       this.renderForceUpdateAction(controls, state);
+      iconButton(
+        controls,
+        "info",
+        `Notebook details: ${title}`,
+        () => this.openNotebookDetail(rule.id, state.source),
+        "st-notebook-details-action",
+      );
       const paused = !!(rule.paused || state?.paused);
       const pause = iconButton(
         controls,
@@ -1653,7 +1741,13 @@ class MirrorsModal extends Modal {
       );
     }
     if (this.c.progress.stateBlocked && state.paused) pause.disabled = true;
-    btn(controls, "Details", () => this.openNotebookDetail(rule.id, state.source), "st-button st-text-button st-notebook-details-action");
+    iconButton(
+      controls,
+      "info",
+      `Notebook details: ${title}`,
+      () => this.openNotebookDetail(rule.id, state.source),
+      "st-notebook-details-action",
+    );
     this.makeNotebookOpenable(row, rule.id, state.source);
   }
   private openNotebookDetail(ruleId: string, source: string) {
@@ -3240,6 +3334,11 @@ class MirrorsModal extends Modal {
       this.qualitySlider(defaults, general.quality ?? "fast", (value) => { general.quality = value; });
       this.text(defaults, "Responses API endpoint", general.endpoint, (v) => (general.endpoint = v), "Use the provider Responses API endpoint.");
     }
+    const cleanupDefaults = el(root, "section", undefined, "st-form-section st-settings-section st-cleanup-defaults");
+    el(cleanupDefaults, "h2", "Document cleanup", "st-section-heading");
+    el(cleanupDefaults, "p", "Used for every cleanup run. Per-run instructions are added to this guidance.", "st-caption st-section-help");
+    const defaultCleanupPrompt = this.textarea(cleanupDefaults, "Default cleanup instructions", d.cleanupPrompt, (value) => { d.cleanupPrompt = value; });
+    defaultCleanupPrompt.maxLength = 20000;
     const presentation = el(root, "section", undefined, "st-form-section st-settings-section st-settings-presentation");
     el(presentation, "h2", "Appearance", "st-section-heading");
     this.toggle(
@@ -3249,6 +3348,10 @@ class MirrorsModal extends Modal {
       (v) => (d.showPageHeadings = v),
       "Presentation only; changing this does not run recognition again.",
     );
+    const storage = el(root, "section", undefined, "st-form-section st-settings-section st-settings-storage");
+    el(storage, "h2", "Storage", "st-section-heading");
+    el(storage, "p", "Review saved recognition history and cached source data. Cleanup is always started manually.", "st-caption");
+    btn(storage, "Review storage", () => this.openStorage(), "st-button st-text-button st-review-storage");
     const actions = el(this.footer, "div", undefined, "st-actions");
     btn(
       actions,
@@ -3291,6 +3394,7 @@ class MirrorsModal extends Modal {
             profiles: this.c.config.profiles,
             intervalMinutes: this.c.config.intervalMinutes,
             showPageHeadings: this.c.showPageHeadings,
+            cleanupPrompt: (this.c.config as typeof this.c.config & { cleanupPrompt?: string }).cleanupPrompt,
           };
           const appliedProfiles = JSON.stringify(nextProfiles);
           this.c.apiKey = d.apiKey;
@@ -3301,6 +3405,8 @@ class MirrorsModal extends Modal {
           this.c.config.profiles = nextProfiles;
           this.c.config.intervalMinutes = d.intervalMinutes;
           this.c.showPageHeadings = d.showPageHeadings;
+          const configWithCleanup = this.c.config as typeof this.c.config & { cleanupPrompt?: string };
+          configWithCleanup.cleanupPrompt = d.cleanupPrompt.trim() ? d.cleanupPrompt : undefined;
           try {
             await this.saveConfigQueued();
             this.settingsDraft = undefined;
@@ -3317,6 +3423,8 @@ class MirrorsModal extends Modal {
               this.c.config.intervalMinutes = previous.intervalMinutes;
             if (this.c.showPageHeadings === d.showPageHeadings)
               this.c.showPageHeadings = previous.showPageHeadings;
+            if (configWithCleanup.cleanupPrompt === (d.cleanupPrompt.trim() ? d.cleanupPrompt : undefined))
+              configWithCleanup.cleanupPrompt = previous.cleanupPrompt;
             new Notice(err(error));
           } finally {
             this.setFormControlsDisabled(false);
@@ -3326,6 +3434,89 @@ class MirrorsModal extends Modal {
       },
       "st-button st-primary",
     );
+  }
+  private openStorage() {
+    this.storageRequest++;
+    this.storageSummary = undefined;
+    this.storageError = "";
+    this.storageLoading = false;
+    this.screen = "storage";
+    this.render();
+  }
+  private formatBytes(bytes: number) {
+    if (!Number.isFinite(bytes) || bytes < 0) return "Unknown size";
+    if (bytes < 1024) return `${bytes} B`;
+    const units = ["KB", "MB", "GB", "TB"];
+    let value = bytes / 1024;
+    let unit = 0;
+    while (value >= 1024 && unit < units.length - 1) {
+      value /= 1024;
+      unit++;
+    }
+    return `${value.toFixed(value >= 10 ? 0 : 1)} ${units[unit]}`;
+  }
+  private renderStorage() {
+    const root = el(this.body, "section", undefined, "st-storage-screen");
+    const controller = this.c as Controller & {
+      storageSummary?: () => Promise<{ historyFiles: number; cacheFiles: number; bytes: number; removableFiles: number; removableBytes: number }>;
+      pruneStorage?: () => Promise<{ removedFiles: number; removedBytes: number }>;
+    };
+    el(root, "h2", "Saved data", "st-section-heading");
+    el(root, "p", "Review saved transcript history and cached recognition results. Cleanup keeps unresolved paid results, current recognized pages, the latest undo point, and the seven-day sync grace period. It removes obsolete files from all synced devices. Local account cost records are kept.", "st-caption");
+    const summary = el(root, "section", undefined, "st-storage-summary");
+    if (this.storageSummary) {
+      const value = this.storageSummary;
+      el(summary, "p", `${value.historyFiles} history files · ${value.cacheFiles} recognition results`, "st-summary-title");
+      el(summary, "p", `${this.formatBytes(value.bytes)} stored · ${value.removableFiles} files (${this.formatBytes(value.removableBytes)}) can be removed`, "st-caption");
+    } else if (this.storageLoading) {
+      el(summary, "p", "Reading storage…", "st-caption");
+    } else if (this.storageError) {
+      el(summary, "p", this.storageError, "st-error st-caption");
+    } else if (!controller.storageSummary || !controller.pruneStorage) {
+      el(summary, "p", "Storage review is unavailable in this runtime.", "st-caption st-attention-reason");
+    }
+    const actions = el(this.footer, "div", undefined, "st-actions");
+    const canPrune = !!this.storageSummary?.removableFiles && !this.storageBusy && !this.c.progress.stateBlocked && !this.c.progress.running;
+    const prune = btn(actions, this.storageBusy ? "Cleaning up…" : "Clean up removable storage", () => void this.pruneStorage(), "st-button st-primary st-prune-storage");
+    prune.disabled = !canPrune || !controller.pruneStorage;
+    if (this.c.progress.running)
+      el(root, "p", "Wait for the current operation to finish before cleaning up storage.", "st-caption");
+    else if (this.storageSummary && !this.storageSummary.removableFiles)
+      el(root, "p", "Nothing can be removed safely right now.", "st-caption");
+    if (!this.storageSummary && !this.storageLoading && !this.storageError && controller.storageSummary) {
+      this.storageLoading = true;
+      const request = ++this.storageRequest;
+      void controller.storageSummary.call(this.c).then((value) => {
+        if (request !== this.storageRequest) return;
+        this.storageSummary = value;
+        this.storageLoading = false;
+        if (this.screen === "storage") this.render();
+      }).catch((error) => {
+        if (request !== this.storageRequest) return;
+        this.storageError = `Could not read storage: ${err(error)}`;
+        this.storageLoading = false;
+        if (this.screen === "storage") this.render();
+      });
+    }
+  }
+  private async pruneStorage() {
+    const controller = this.c as Controller & {
+      storageSummary?: () => Promise<{ historyFiles: number; cacheFiles: number; bytes: number; removableFiles: number; removableBytes: number }>;
+      pruneStorage?: () => Promise<{ removedFiles: number; removedBytes: number }>;
+    };
+    if (this.storageBusy || !controller.pruneStorage || !this.storageSummary?.removableFiles || this.c.progress.stateBlocked || this.c.progress.running) return;
+    this.storageBusy = true;
+    this.render();
+    try {
+      const removed = await controller.pruneStorage.call(this.c);
+      this.storageSummary = controller.storageSummary ? await controller.storageSummary.call(this.c) : undefined;
+      new Notice(`Removed ${removed.removedFiles} files · ${this.formatBytes(removed.removedBytes)}.`);
+    } catch (error) {
+      new Notice(`Could not clean up storage: ${err(error)}`);
+    } finally {
+      this.storageBusy = false;
+      if (this.screen === "storage") this.render();
+    }
   }
   private renderCosts() {
     const root = el(this.body, "section", undefined, "st-cost-screen");
@@ -3856,6 +4047,7 @@ class MirrorsModal extends Modal {
       "st-button st-primary",
     );
     this.renderDocumentActions(controls, state);
+    this.renderLastVersion(controls, state.source);
     const previewDetails = el(controls, "details", undefined, "st-detail-preview");
     el(previewDetails, "summary", "Preview a page");
     const previewRange = this.input(
@@ -3924,6 +4116,52 @@ class MirrorsModal extends Modal {
       el(technical, "p", `Device OCR is available for ${deviceOcrPages} page${deviceOcrPages === 1 ? "" : "s"}; it is separate from saved AI recognition.`, "st-caption");
     }
   }
+  private renderLastVersion(parent: HTMLElement, source: string) {
+    const controller = this.c as Controller & {
+      lastVersion?: (source: string) => Promise<{ path: string; createdAt: string } | undefined>;
+      restoreLastVersion?: (source: string) => Promise<void>;
+    };
+    if (!controller.lastVersion || !controller.restoreLastVersion) return;
+    const section = el(parent, "section", undefined, "st-last-version");
+    el(section, "h2", "Transcript history", "st-section-heading");
+    const status = el(section, "p", "Checking saved versions…", "st-caption st-last-version-status");
+    const restore = btn(section, "Restore last version", () => {}, "st-button st-text-button st-restore-last-version");
+    restore.disabled = true;
+    void controller.lastVersion.call(this.c, source).then((version) => {
+      if (!section.isConnected || this.screen !== "detail" || this.selectedSource !== source) return;
+      if (!version) {
+        setText(status, "No saved transcript version is available.");
+        restore.hidden = true;
+        return;
+      }
+      const when = Number.isNaN(Date.parse(version.createdAt))
+        ? version.createdAt
+        : new Date(version.createdAt).toLocaleString();
+      setText(status, `Latest saved version · ${when}`);
+      restore.disabled = this.c.progress.running || this.cleanupBusySource === source || this.reprocessBusy;
+      restore.onclick = async (event) => {
+        event.stopPropagation();
+        if (this.c.progress.running || this.cleanupBusySource === source || this.reprocessBusy) return;
+        restore.disabled = true;
+        setText(restore, "Restoring…");
+        try {
+          await controller.restoreLastVersion!.call(this.c, source);
+          new Notice("Last saved transcript version restored.");
+          if (this.screen === "detail" && this.selectedSource === source) this.render();
+        } catch (error) {
+          new Notice(`Could not restore the saved version: ${err(error)}`);
+          if (restore.isConnected) {
+            setText(restore, "Restore last version");
+            restore.disabled = false;
+          }
+        }
+      };
+    }).catch((error) => {
+      if (!section.isConnected || this.screen !== "detail" || this.selectedSource !== source) return;
+      setText(status, `Could not check transcript history: ${err(error)}`);
+      restore.hidden = true;
+    });
+  }
   private renderDocumentActions(parent: HTMLElement, state: Controller["store"]["notebooks"][string]) {
     const controls = el(parent, "section", undefined, "st-document-actions");
     const actions = el(controls, "div", undefined, "st-document-action-buttons");
@@ -3961,12 +4199,19 @@ class MirrorsModal extends Modal {
       this.cleanupModel = this.savedModelFor(source);
       this.cleanupSaveCopy = false;
       this.cleanupCopyPath = this.defaultCopyPath(this.displayStore.notebooks[source]);
+      this.cleanupExtraInstructions = "";
+      this.cleanupRemovePageComments = false;
     } else {
       this.reprocessRange = "";
       this.outdatedOnly = false;
+      this.reprocessPreview = [];
+      this.reprocessPreviewPage = 0;
+      this.reprocessPreviewError = "";
+      this.reprocessPreviewLoading = true;
     }
     this.screen = screen;
     this.render();
+    if (screen === "reprocess") void this.loadReprocessPreview(source);
   }
   private documentActionReason(state: Controller["store"]["notebooks"][string], kind: "cleanup" | "reprocess") {
     if (this.c.progress.stateBlocked) return "Saved plugin state is unavailable.";
@@ -3989,7 +4234,11 @@ class MirrorsModal extends Modal {
   }
   private cleanupEstimateText(state: Controller["store"]["notebooks"][string]) {
     try {
-      const estimate = this.c.cleanupEstimate(state.source, { model: this.cleanupModel });
+      const estimate = this.c.cleanupEstimate(state.source, {
+        model: this.cleanupModel,
+        extraInstructions: this.cleanupExtraInstructions,
+        removePageComments: this.cleanupSaveCopy && this.cleanupRemovePageComments,
+      });
       const parts = [`${estimate.pages} page${estimate.pages === 1 ? "" : "s"}`, `${estimate.requests} request${estimate.requests === 1 ? "" : "s"}`];
       if (this.c.provider === "subscription") {
         if (estimate.seconds !== undefined) parts.push(`about ${this.duration(estimate.seconds)}`);
@@ -4001,7 +4250,7 @@ class MirrorsModal extends Modal {
   }
   private renderCleanupWorkflow() {
     const state = this.displayStore.notebooks[this.actionSource];
-    const root = el(this.body, "section", undefined, "st-form st-action-workflow st-cleanup-workflow");
+    const root = el(this.body, "section", undefined, "st-form st-action-workflow st-cleanup-workflow") as HTMLElement;
     if (!state) {
       el(root, "p", "This notebook is no longer available.", "st-caption st-attention-reason");
     } else {
@@ -4012,13 +4261,28 @@ class MirrorsModal extends Modal {
         if (estimate) setText(estimate, this.cleanupEstimateText(state));
         updateRunState();
       });
+      const extraInstructions = this.textarea(
+        root,
+        "Extra instructions for this run",
+        this.cleanupExtraInstructions,
+        (value) => {
+          this.cleanupExtraInstructions = value;
+          updateEstimate();
+        },
+        "Added to the saved default cleanup instructions for this run only.",
+      );
+      extraInstructions.addClass("st-cleanup-instructions");
       el(root, "p", this.cleanupEstimateText(state), "st-caption st-queue-estimate st-cleanup-estimate");
       const copyToggle = this.toggle(root, "Save cleaned text as a separate copy", this.cleanupSaveCopy, (value) => {
         this.cleanupSaveCopy = value;
+        if (!value) this.cleanupRemovePageComments = false;
         copyFieldWrapper.hidden = !value;
         destinationBlock.hidden = value;
         setText(copyConsequence, value ? "Leaves the original transcript unchanged." : "Replaces this transcript and backs up the previous version.");
         setText(destination, value ? this.cleanupCopyPath.trim() || "Enter a copy path." : state.output);
+        removePageComments.disabled = !value || this.cleanupBusySource === state.source;
+        if (!value) removePageComments.checked = false;
+        updateEstimate();
         updateRunState();
       }, "The original transcript stays unchanged when you save a copy.");
       copyToggle.dataset.testid = "cleanup-save-copy";
@@ -4035,6 +4299,15 @@ class MirrorsModal extends Modal {
       destinationBlock.hidden = this.cleanupSaveCopy;
       el(destinationBlock, "span", "Destination", "st-caption");
       const destination = el(destinationBlock, "strong", this.cleanupSaveCopy ? this.cleanupCopyPath : state.output, "st-cleanup-destination-path");
+      const removePageComments = this.toggle(root, "Remove page comments from the cleaned copy", this.cleanupRemovePageComments, (value) => {
+        this.cleanupRemovePageComments = value && this.cleanupSaveCopy;
+        updateEstimate();
+      }, "Available only when you save cleaned text as a separate copy.");
+      removePageComments.disabled = !this.cleanupSaveCopy || this.cleanupBusySource === state.source;
+      const updateEstimate = () => {
+        const estimate = root.querySelector<HTMLElement>(".st-cleanup-estimate");
+        if (estimate) setText(estimate, this.cleanupEstimateText(state));
+      };
       const previous = (state as typeof state & { cleanup?: { updatedAt?: string; model?: string; quality?: string; stale?: boolean } }).cleanup;
       if (previous) {
         const details = el(root, "details", undefined, "st-cleanup-previous");
@@ -4053,27 +4326,60 @@ class MirrorsModal extends Modal {
         run.disabled = !!message || this.cleanupBusySource === state.source;
       };
       updateRunState();
-      (Array.from(root.querySelectorAll("input, select")) as Array<HTMLInputElement | HTMLSelectElement>).forEach((control) => { control.disabled = this.cleanupBusySource === state.source; });
+      (Array.from(root.querySelectorAll("input, select, textarea")) as Array<HTMLInputElement | HTMLSelectElement | HTMLTextAreaElement>).forEach((control) => { control.disabled = this.cleanupBusySource === state.source; });
+      removePageComments.disabled = !this.cleanupSaveCopy || this.cleanupBusySource === state.source;
     }
     if (!state) {
       const actions = el(this.footer, "div", undefined, "st-actions");
       btn(actions, "Cancel", () => this.goBack(), "st-button st-text-button");
     }
   }
+  private async loadReprocessPreview(source: string) {
+    const request = ++this.reprocessPreviewRequest;
+    const pageSize = this.isDesktop() && this.modalEl.getBoundingClientRect().width > 700 ? 9 : 6;
+    const start = this.reprocessPreviewPage * pageSize + 1;
+    const controller = this.c as Controller & {
+      pageSelectionPreview?: (source: string, start?: number, count?: number) => Promise<{ number: number; text: string; origin: "device-ocr" | "recognized" | "empty" }[]>;
+    };
+    if (!controller.pageSelectionPreview) {
+      this.reprocessPreviewLoading = false;
+      this.reprocessPreviewError = "Text preview is unavailable in this runtime.";
+      if (request === this.reprocessPreviewRequest && this.screen === "reprocess" && this.actionSource === source) this.render();
+      return;
+    }
+    try {
+      const pages = await controller.pageSelectionPreview.call(this.c, source, start, pageSize);
+      if (request !== this.reprocessPreviewRequest || this.screen !== "reprocess" || this.actionSource !== source) return;
+      this.reprocessPreview = pages
+        .filter((page) => page.number >= start && page.number < start + pageSize)
+        .sort((a, b) => a.number - b.number);
+      this.reprocessPreviewLoading = false;
+      this.reprocessPreviewError = "";
+    } catch (error) {
+      if (request !== this.reprocessPreviewRequest || this.screen !== "reprocess" || this.actionSource !== source) return;
+      this.reprocessPreviewLoading = false;
+      this.reprocessPreviewError = `Could not read page text: ${err(error)}`;
+    }
+    if (request === this.reprocessPreviewRequest && this.screen === "reprocess" && this.actionSource === source) this.render();
+  }
   private renderReprocessWorkflow() {
     const state = this.displayStore.notebooks[this.actionSource];
-    const root = el(this.body, "section", undefined, "st-form st-action-workflow st-reprocess-workflow");
+    const root = el(this.body, "section", undefined, "st-form st-action-workflow st-reprocess-workflow") as HTMLElement;
     if (!state) {
       el(root, "p", "This notebook is no longer available.", "st-caption st-attention-reason");
     } else {
-      el(root, "p", "Choose pages to send for recognition. This action may use provider credit.", "st-caption");
+      const maxPage = Math.max(0, ...state.desired.map((page) => page.number), ...this.reprocessPreview.map((page) => page.number));
+      const pageSize = this.isDesktop() && this.modalEl.getBoundingClientRect().width > 700 ? 9 : 6;
+      el(root, "p", "Select pages to re-recognize. Requests may use provider credit.", "st-caption");
+      el(root, "p", maxPage ? `Available pages: 1–${maxPage}. Type a range or select cards below.` : "Available page range is not known yet.", "st-caption st-page-range-help");
       const pages = this.input(root, "Pages", this.reprocessRange, "text", (value) => {
         this.reprocessRange = value;
+        syncCards();
         refreshEstimate();
         updateRunState();
       }, "For example: 1, 3-5, 12");
       pages.placeholder = "For example: 1, 3-5, 12";
-      this.toggle(root, "Only pages with outdated recognition", this.outdatedOnly, (value) => {
+      const outdated = this.toggle(root, "Only pages with outdated recognition", this.outdatedOnly, (value) => {
         this.outdatedOnly = value;
         refreshEstimate();
         updateRunState();
@@ -4082,9 +4388,82 @@ class MirrorsModal extends Modal {
       const refreshEstimate = () => {
         try {
           const value = this.c.reprocessEstimate?.(state.source, this.reprocessRange, this.outdatedOnly);
-          setText(estimate, value ? `${value.pages} selected pages · ${value.requests} requests${this.c.provider === "api" && value.usd !== undefined ? ` · about $${value.usd.toFixed(4)}` : ""}${value.provisional ? " · provisional estimate" : ""}` : "Enter pages to estimate this operation.");
+          setText(estimate, value ? `${value.pages} selected page${value.pages === 1 ? "" : "s"} · ${value.requests} request${value.requests === 1 ? "" : "s"}${this.c.provider === "api" && value.usd !== undefined ? ` · about $${value.usd.toFixed(4)}` : ""}${value.provisional ? " · provisional estimate" : ""}` : "Enter pages to estimate this operation.");
         } catch (error) { setText(estimate, `Estimate unavailable: ${err(error)}`); }
       };
+      const preview = el(root, "section", undefined, "st-page-selection-preview");
+      const previewHeading = el(preview, "div", undefined, "st-page-preview-heading");
+      el(previewHeading, "h2", "Page text preview", "st-section-heading");
+      this.help(previewHeading, "Read-only OCR text. No images are rendered and no recognition request is sent.", "Page text preview");
+      const grid = el(preview, "div", undefined, "st-page-preview-grid") as HTMLElement;
+      const pagination = el(preview, "div", undefined, "st-page-preview-pagination") as HTMLElement;
+      const syncCards = () => {
+        for (const card of Array.from(grid.querySelectorAll<HTMLButtonElement>("[data-page-number]"))) {
+          const page = Number(card.dataset.pageNumber);
+          const selected = pageRangeContains(this.reprocessRange, page);
+          card.classList.toggle("is-selected", selected);
+          card.setAttribute("aria-pressed", String(selected));
+        }
+      };
+      const renderPagePreview = () => {
+        grid.empty();
+        pagination.empty();
+        if (this.reprocessPreviewLoading) {
+          el(grid, "p", "Reading page text…", "st-caption");
+          return;
+        }
+        if (this.reprocessPreviewError) {
+          el(grid, "p", this.reprocessPreviewError, "st-caption st-attention-reason");
+          return;
+        }
+        if (!this.reprocessPreview.length) {
+          el(grid, "p", "No page text is available to preview.", "st-caption");
+          return;
+        }
+        const pageCount = Math.ceil(maxPage / pageSize);
+        this.reprocessPreviewPage = Math.max(0, Math.min(this.reprocessPreviewPage, pageCount - 1));
+        for (const page of this.reprocessPreview) {
+          const selected = pageRangeContains(this.reprocessRange, page.number);
+          const card = btn(grid, "", () => {
+            const current = pagesFromRange(this.reprocessRange, maxPage);
+            const next = current.includes(page.number)
+              ? current.filter((number) => number !== page.number)
+              : [...current, page.number];
+            this.reprocessRange = formatPageRange(next);
+            pages.value = this.reprocessRange;
+            syncCards();
+            refreshEstimate();
+            updateRunState();
+          }, `st-page-preview-card${selected ? " is-selected" : ""}`);
+          card.dataset.pageNumber = String(page.number);
+          card.setAttribute("aria-pressed", String(selected));
+          card.disabled = this.reprocessBusy;
+          el(card, "strong", `Page ${page.number}`, "st-page-preview-title");
+          el(card, "small", page.origin === "device-ocr" ? "Device OCR" : page.origin === "recognized" ? "Saved recognition" : "No text", "st-page-preview-origin");
+          const text = page.text.trim();
+          el(card, "span", text ? `${text.slice(0, 480)}${text.length > 480 ? "…" : ""}` : "No OCR text available.", "st-page-preview-text");
+        }
+        if (pageCount > 1) {
+          const previous = btn(pagination, "Previous", () => {
+            this.reprocessPreviewPage--;
+            this.reprocessPreviewLoading = true;
+            this.reprocessPreviewError = "";
+            this.render();
+            void this.loadReprocessPreview(state.source);
+          }, "st-button st-text-button");
+          previous.disabled = this.reprocessPreviewPage === 0 || this.reprocessBusy;
+          el(pagination, "span", `Page ${this.reprocessPreviewPage + 1} of ${pageCount}`, "st-caption");
+          const next = btn(pagination, "Next", () => {
+            this.reprocessPreviewPage++;
+            this.reprocessPreviewLoading = true;
+            this.reprocessPreviewError = "";
+            this.render();
+            void this.loadReprocessPreview(state.source);
+          }, "st-button st-text-button");
+          next.disabled = this.reprocessPreviewPage >= pageCount - 1 || this.reprocessBusy;
+        }
+      };
+      renderPagePreview();
       refreshEstimate();
       const reason = el(root, "p", "", "st-caption st-attention-reason st-action-disabled-reason");
       const actions = el(this.footer, "div", undefined, "st-actions");
@@ -4097,7 +4476,9 @@ class MirrorsModal extends Modal {
         run.disabled = !!message || this.reprocessBusy;
       };
       updateRunState();
-      (Array.from(root.querySelectorAll("input, select")) as Array<HTMLInputElement | HTMLSelectElement>).forEach((control) => { control.disabled = this.reprocessBusy; });
+      outdated.disabled = this.reprocessBusy;
+      (Array.from(root.querySelectorAll("input, select, textarea")) as Array<HTMLInputElement | HTMLSelectElement | HTMLTextAreaElement>).forEach((control) => { control.disabled = this.reprocessBusy; });
+      if (this.reprocessBusy) grid.querySelectorAll<HTMLButtonElement>("button").forEach((control) => { control.disabled = true; });
     }
     if (!state) {
       const actions = el(this.footer, "div", undefined, "st-actions");
@@ -4123,6 +4504,8 @@ class MirrorsModal extends Modal {
       await this.c.cleanupDocument(source, {
         model: this.cleanupModel,
         saveCopy: this.cleanupSaveCopy,
+        extraInstructions: this.cleanupExtraInstructions,
+        removePageComments: this.cleanupSaveCopy && this.cleanupRemovePageComments,
         ...(this.cleanupSaveCopy ? { copyPath: this.cleanupCopyPath.trim() } : {}),
       });
       new Notice(this.cleanupSaveCopy ? "Cleaned transcript saved as a separate copy." : "Transcript cleanup completed; the previous version is in history.");
@@ -4395,7 +4778,7 @@ class MirrorsModal extends Modal {
         : view.label;
     const caption =
       active?.source === state.source
-        ? `Recognizing page ${active.number} of ${active.total} · ${view.ready} pages ready`
+        ? `Recognizing… ${Math.min(view.ready, view.total)}/${view.total} pages`
         : view.caption;
     const key = JSON.stringify([
       label,
@@ -4404,14 +4787,32 @@ class MirrorsModal extends Modal {
       this.forceUpdateReason(state, view.reason),
       currentPageIssues(state),
       state.error,
+      this.c.progress.stage,
+      this.c.progress.detail,
+      this.c.progress.renderingContext,
+      this.c.progress.activePages,
       (this.c.progress as typeof this.c.progress & { executionBlocked?: string }).executionBlocked,
     ]);
     if (root.dataset.key === key) return;
     const scroll = this.body.scrollTop;
+    const progressDetailsOpen = root.querySelector<HTMLDetailsElement>(".st-detail-progress-details")?.open ?? false;
     root.dataset.key = key;
     root.empty();
     el(root, "p", label, "st-summary-title");
     el(root, "p", caption, "st-caption");
+    if (active?.source === state.source) {
+      const details = el(root, "details", undefined, "st-detail-progress-details");
+      el(details, "summary", "Details");
+      el(details, "p", `${this.c.progress.stage} · page ${active.number} of ${active.total}`, "st-caption");
+      const contextPage = this.c.progress.renderingContext
+        ? String(active.number)
+        : this.c.progress.detail.match(/(?:^|[—–-]\s*)context page\s+(\d+)\b/i)?.[1];
+      if (contextPage) el(details, "p", `Rendering context · page ${contextPage}`, "st-caption st-context-page");
+      const pages = this.c.progress.activePages ?? [];
+      if (pages.length) el(details, "p", `${pages.length} active page${pages.length === 1 ? "" : "s"} · ${pages.join(", ")}`, "st-caption st-active-pages");
+      if (this.c.progress.detail) el(details, "p", this.c.progress.detail, "st-caption st-working-detail");
+      details.open = progressDetailsOpen;
+    }
     const reason = this.forceUpdateReason(state, view.reason);
     if (reason)
       el(root, "p", reason, "st-caption st-attention-reason");
@@ -4420,7 +4821,7 @@ class MirrorsModal extends Modal {
       el(diagnostics, "summary", "Notebook diagnostics");
       el(diagnostics, "p", state.error, "st-error st-attention-detail");
     }
-    const blocked = (this.c.progress as typeof this.c.progress & { executionBlocked?: string }).executionBlocked;
+    const blocked = this.c.progress.executionBlocked;
     if (blocked) el(root, "p", `Recognition paused · ${blocked}`, "st-caption st-attention-reason");
     if (canRecoverTranscriptEdits(state))
       btn(root, "Resolve edits", () => this.openRecovery(state.source), "st-button st-text-button st-recovery-action");

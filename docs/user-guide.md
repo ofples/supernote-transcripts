@@ -92,6 +92,8 @@ Automatic catch-up can process new and changed pages when Obsidian starts/resume
 
 Before AI work begins, Update checks the page counts and order in changed notebooks. It checks up to two notebooks at once on Nomad and four on desktop, without rendering page images or making recognition requests. Unchanged notebooks reuse their previous inventory. Sources and Queue refresh as these checks finish, so a later notebook does not have to wait for an earlier one to finish recognition before its page count updates. Each device keeps its own queue.
 
+Queue keeps the overall progress summary compact. Open **Details** on the active item for the current stage, page, and additional progress information. The existing notebook details/action icon is also the entry point for notebook actions.
+
 Failed pages remain visible for review and are not retried automatically. Use **Retry** when you want another attempt; **Skip** leaves a page out until you choose to retry it. Uncertain interrupted attempts can count against configured ceilings because a provider may have received the request even if no result returned.
 
 ## Maintain a transcript
@@ -102,11 +104,25 @@ Open a notebook’s details to see its progress and saved transcript. For a note
 
 ![Synthetic notebook Details view with separate Cleanup and Re-recognize actions](screenshots/notebook-details-actions-desktop.png)
 
+### Restore the previous transcript version
+
+Before an update replaces generated transcript text, Transcripts keeps one restore point per notebook at `Supernote Transcripts/History/<notebook>/Previous version.md`. It contains the exact previous Markdown and the matching cached recognition snapshot. Open notebook details and use **Restore last version** to put both back. Restoring pauses that notebook so it cannot immediately overwrite the restored version. When you choose **Update** later, recognition uses the current local `.note` file and current source settings.
+
+Obsidian Sync version history is useful for recovering vault files, but it does not replace this restore point: the recognition snapshot and its page provenance are needed to continue updates safely. Keep the local plugin data and state backups too; they are separate from Obsidian Sync.
+
+### Review and clean saved data
+
+In plugin **Settings → Storage → Review storage**, review the listed history and cache files and the removable count before choosing **Clean up removable storage**. Cleanup can remove older tracked transcript or recognition history and unreferenced page results or publication receipts older than seven days. It keeps the current transcript and current page results, the newest saved results and publication, the latest restore point and its recognition data, unresolved or unknown records, malformed/conflicting files, active claims and mirrors, and newly received files. It does not remove local account cost records. Files belonging to removed or no-longer-configured sources are treated as unknown and kept for recovery; a completed source scan may report that the previous transcript remains in the archive.
+
+Cleanup is for old vault history/cache files. It does not delete the plugin's local state snapshots or `state-a`/`state-b` recovery files. Obsidian Sync history and the restore point are complementary safeguards, not a replacement for each other.
+
 ### Clean up a transcript
 
 Cleanup sends the existing transcript text for one text-only request; it does not resend notebook images. All notebook pages need saved recognition results before cleanup is available. Before you run it, choose a listed model or enter a custom model ID supported by your provider, then review the estimate. Changing the model applies only to this cleanup and updates its estimate; it does not change the notebook’s saved recognition profile.
 
 By default, cleanup replaces the current generated transcript after preserving the previous version in History. To keep a separate result, turn on **Save cleaned text as a separate copy** and choose a new Markdown file in the vault. The path must be a new `.md` file; it cannot be the existing transcript or a file under `Supernote Transcripts/Shared Data/`. Saving a copy leaves the current transcript and its cleanup record unchanged.
+
+The default cleanup instructions are configurable in plugin settings. Optional instructions entered for one cleanup run are added to that default. **Remove page comments** is available only when saving a separate copy; the mirrored transcript retains its page references. An in-place cleanup keeps those comments and automatically saves the previous transcript version first.
 
 If the transcript or notebook changes while cleanup is running, the paid result is kept in History so you can review it without sending another request. Check the cleaned text against the original handwriting before relying on it. Expand **Previous cleanup details** to see the model, quality, date, and whether the source text has changed since that cleanup.
 
@@ -120,7 +136,7 @@ When the separate-copy option is on, the form shows the new path field and confi
 
 ### Re-recognize selected pages
 
-Choose **Re-recognize pages**, enter page numbers or ranges, and review the selection estimate. The option to limit the action to pages with outdated recognition helps avoid resending pages that already match the current settings. Re-recognition sends selected page images again, may use provider credit, and can replace transcript text for those pages. Save important manual edits before running it. Changing a prompt or model does not start re-recognition automatically.
+Choose **Re-recognize pages**, enter page numbers or ranges, and review the selection estimate. Available pages are numbered 1 through the notebook's current page count. You can select page cards in the grid; the read-only preview uses device OCR first and a matching cached AI result as a fallback. It does not render page images or send an AI request. The option to limit the action to pages with outdated recognition helps avoid resending pages that already match the current settings. Re-recognition sends selected page images again, may use provider credit, and can replace transcript text for those pages. Save important manual edits before running it. Changing a prompt or model does not start re-recognition automatically.
 
 ![Synthetic Re-recognize pages workflow with page range and selection estimate](screenshots/reprocess-workflow-desktop.png)
 
@@ -142,7 +158,7 @@ Transcript page links are optional navigation aids. On Nomad, opening a link in 
 
 ## Use the same source on two devices
 
-Choose the same Shared mirror for matching notebooks on both devices, then configure the source’s local path separately on each one. Keep a separate Obsidian configuration folder/profile per device (for example, `.obsidian` on desktop and `.obsidian-supernote` on Nomad). Install the plugin in each active profile and do not copy `data.json` or state slots between devices. Obsidian Sync profile/configuration choices control those local files; see [Obsidian Sync settings](https://obsidian.md/help/sync/settings). Sync `Supernote Transcripts/Shared Data/` and the transcript output folder. Provider credentials, queues, daily limits, accounting, automatic settings and pause remain device-local. Shared settings do not transfer credentials or start recognition. Delayed Sync cannot guarantee a single request across devices, and simultaneous Markdown writes can need conflict resolution.
+Choose the same Shared mirror for matching notebooks on both devices, then configure the source’s local path separately on each one. Keep a separate Obsidian configuration folder/profile per device (for example, `.obsidian` on desktop and `.obsidian-supernote` on Nomad). Install the plugin in each active profile and do not copy `data.json` or state slots between devices. Obsidian Sync profile/configuration choices control those local files; see [Obsidian Sync settings](https://obsidian.md/help/sync/settings). Sync `Supernote Transcripts/Shared Data/` and the transcript output folder. The portable mirror carries the source’s model, quality, prompt, glossary, output and exclusions; glossary Markdown files must also sync. Provider credentials, local source paths, queues, daily limits, accounting, automatic catch-up and pause remain device-local. Shared settings do not transfer credentials or start recognition. Delayed Sync cannot guarantee a single request across devices, and simultaneous Markdown writes can need conflict resolution.
 
 ![Synthetic example of a source settings conflict and explicit resolution choices](screenshots/settings-conflict-desktop.png)
 

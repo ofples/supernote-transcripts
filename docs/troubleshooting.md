@@ -44,6 +44,22 @@ The update inventory step refreshes changed notebook metadata before AI work: up
 
 Page links are optional and work without an MD Reader enhancement. Confirm the source identity and saved page ID still match the local notebook. On Nomad, native Notes navigation requires the separate Supernote login helper app version 0.2.0 or later; check that it is installed if the link does not open Notes. On desktop, a compatible enabled `.note` viewer may handle in-vault notebooks; otherwise Transcripts uses its own read-only page preview, including for external local sources.
 
+## Restore last version is unavailable or the notebook stays paused
+
+The restore action appears only when that notebook has a valid saved restore point. It restores the exact saved Markdown together with its matching recognition snapshot, then pauses the notebook to give you time to review it. The next explicit **Update** checks the current local `.note` file and current settings. If the transcript was edited or a Sync conflict appeared, resolve and preserve the version you want before restoring; the action will stop if it detects that the transcript or settings changed during the operation. Obsidian Sync history can recover vault file versions, but it does not contain the recognition snapshot or provenance stored with the Transcripts restore point.
+
+## Storage cleanup shows no removable files
+
+Open **Settings → Storage → Review storage** and review the counts. Cleanup deliberately keeps current and latest page results, the newest publication, the last restore point and its recognition data, unresolved or unknown notebooks, malformed/conflicting records, active claims and mirrors, newly arrived files, and local account cost records. It only removes safe old files that are no longer referenced. Sources removed from configuration are treated as unknown and retained. Plugin-local `state-a` and `state-b` recovery snapshots are not part of this cleanup. If nothing is marked removable, there is nothing safe for this action to remove.
+
+## Page selection preview is empty or not the text I expected
+
+The preview grid reads device OCR first, then uses a matching cached recognition result if OCR is unavailable. It is a read-only text preview: it does not render page images or make a recognition request. If both sources are empty, the card may have no preview text. Use the original notebook to inspect handwriting; select the page and run **Re-recognize pages** only when you intend to send its image to the configured provider.
+
+## Cleanup cannot remove page comments
+
+Removing page comments is supported only for a separate cleaned copy. Turn on **Save cleaned text as a separate copy** and choose a new Markdown destination. In-place cleanup preserves page references and first saves the previous transcript version. The default cleanup instructions are in plugin settings; additional instructions entered for one run are added only to that run.
+
 ## Saved plugin state is blocked
 
 Stop updates. Do not repeatedly click Update or delete plugin state files. Follow the project’s [recovery guide](../RECOVERY.md), which explains how to restore a valid state snapshot from a plugin backup. Recovery changes saved state and should be used only when the plugin explicitly directs you there. If you do not have a known-good backup, preserve the current plugin folder and contact the project maintainer before attempting recovery.

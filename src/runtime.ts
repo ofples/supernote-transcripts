@@ -25,7 +25,9 @@ import { interruptedAttempts } from "./attempt-recovery.mjs";
 import { RecognitionFailure, isRecognitionFailure, completedResponse, normalizePageText, isEmptyPage, providerFailure } from "./subscription-stream.mjs";
 import { GENERAL_TRANSCRIPTION_PROMPT, TRANSCRIPTION_RESPONSE_RULES, GROUP_RESPONSE_RULES, recognitionPrompt } from "./prompts.mjs";
 import { qualitySettings, planRecognitionGroups, contextPages } from "./quality.mjs";
-import { cleanupInput, cleanupPages } from "./cleanup.mjs";
+import { cleanupInput, cleanupPages, DEFAULT_CLEANUP_PROMPT, stripPageComments } from "./cleanup.mjs";
+import { restorePath, readRestore, writeRestore, restoredState } from "./restore";
+import { inspectStorage, cleanStorage } from "./storage";
 import { pageTextLayer } from "./provenance.mjs";
 import { runWorkers } from "./workers.mjs";
 import { inventoryNotebooks, inventoryView } from "./inventory.mjs";
@@ -137,6 +139,7 @@ export default class SupernoteTranscripts extends Plugin implements Controller {
   private settingsPersistencePending = false;
   private sharedSettingsTimer?: ReturnType<typeof setTimeout>;
   private sharedCache?: SharedNotebookCache;
+  private historyProtectedSources = new Set<string>();
   private chatGPT?: ChatGPTSession;
   private planUsage?: SubscriptionUsage;
   private recipes = new Map<string,string>();
@@ -221,6 +224,163 @@ export default class SupernoteTranscripts extends Plugin implements Controller {
     const a=this.app.vault.adapter;
     if(!a.list)return undefined;
     return {exists:p=>a.exists(p),read:p=>a.read(p),write:(p,t)=>a.write(p,t),create:(p,t)=>this.app.vault.create(p,t),list:p=>a.list(p),mkdir:p=>this.app.vault.createFolder(p)};
+  }
+  private historyIO(): SharedIO {
+    const a=this.app.vault.adapter;
+    return this.sharedIO()??{exists:p=>a.exists(p),read:p=>a.read(p),write:(p,t)=>a.write(p,t),
+      create:(p,t)=>this.app.vault.create(p,t),list:async()=>({files:[],folders:[]}),mkdir:p=>this.app.vault.createFolder(p)};
+  }
+  private async historyIdentity(state:NotebookState) {
+    const rule=this.config.rules.find(r=>r.id===state.ruleId)??ruleFor(state.source,this.config.rules);
+    if(!rule)throw Error("Configure this notebook's source before managing its previous version.");
+    const id=await notebookIdentity(rule.sharedId??rule.id,relativeToRule(state.source,rule));
+    const title=state.source.split("/").pop()!.replace(/\.note$/i,"");
+    return {id,path:restorePath(id,title)};
+  }
+  private async savePrevious(state:NotebookState,text:string,once=false) {
+    if(once&&this.historyProtectedSources.has(state.source))return (await this.historyIdentity(state)).path;
+    const {id,path}=await this.historyIdentity(state);
+    await writeRestore(this.historyIO(),path,id,text,state);
+    if(!this.store.history.includes(path))this.store.history.push(path);
+    if(once)this.historyProtectedSources.add(state.source);
+    await this.persist();
+    return path;
+  }
+  async lastVersion(source:string) {
+    const state=this.store.notebooks[source];if(!state)return;
+    const {id,path}=await this.historyIdentity(state),point=await readRestore(this.historyIO(),path,id,state);
+    return point?{path,createdAt:point.createdAt}:undefined;
+  }
+  async restoreLastVersion(source:string) {
+    return this.transcriptRecovery(async()=>{
+      const current=this.store.notebooks[source];if(!current)throw Error("Choose a mirrored notebook first.");
+      const {id,path}=await this.historyIdentity(current),io=this.historyIO(),point=await readRestore(io,path,id,current);
+      if(!point)throw Error("No previous version has been saved for this notebook yet.");
+      const oldRecord=await io.read(path);
+      const before=await io.read(current.output),signature=this.recoverySignature(current);
+      const previousQueue=clone(this.store.queue);
+      if(await hash(before)!==current.publishedHash)throw Error("The transcript has manual or synced edits. Resolve those edits before restoring a previous version.");
+      const shared=this.shared;let lease:LeaseHandle|null=null;
+      try {
+        if(shared){lease=await shared.acquire(id);if(!lease)throw Error("Another device is updating this notebook. Pause it and try Restore again.");}
+        if(this.store.notebooks[source]!==current||this.recoverySignature(current)!==signature||await io.read(current.output)!==before||await io.read(path)!==oldRecord)
+          throw Error("Transcript or settings changed. Review the previous version again.");
+        const next=restoredState(point,clone(current));next.lastSaved=new Date().toISOString();
+        await this.savePrevious(current,before); // Swapping the undo point makes the restore reversible too.
+        const replacementRecord=await io.read(path);
+        let written=false;
+        try {
+          if(shared&&lease&&!await shared.checkLease(lease))throw Error("Another device took priority. Your transcript is unchanged.");
+          await this.app.vault.adapter.process(current.output,text=>{if(text!==before)throw Error("The transcript changed while restoring. Its edits were preserved.");return point.text;});written=true;
+          if(this.sharedIO())await new PublicationReceipts(io).save(id,point.text,next.desired,next.pages,this.presentationFor(next));
+          this.store.notebooks[source]=next;this.store.queue=this.store.queue.filter(t=>t.source!==source);
+          await this.persist();
+        } catch(error) {
+          this.store.notebooks[source]=current;
+          this.store.queue=previousQueue;
+          if(written)await this.app.vault.adapter.process(current.output,text=>text===point.text?before:text);
+          if(await io.read(path)===replacementRecord)await io.write(path,oldRecord);
+          throw error;
+        }
+        this.stage("Previous version restored","This notebook is paused. Update when you want to apply current handwriting again.");
+      } finally {if(shared&&lease)await shared.release(lease);}
+    });
+  }
+  async pageSelectionPreview(source:string,start=1,count=12) {
+    const state=this.displayStore.notebooks[source];if(!state)throw Error("Update this notebook before choosing pages.");
+    if(!Number.isSafeInteger(start)||start<1||!Number.isSafeInteger(count)||count<1||count>12)throw Error("Choose a valid preview window of up to 12 pages.");
+    let snapshot=clone(state);
+    const makePreviews=(view:NotebookState)=>view.desired.slice(start-1,start-1+count).map(p=>{
+      const ocr=view.deviceOcr?.[p.id],recognized=view.pages[p.id];
+      return {number:p.number,text:ocr?.fingerprint===p.fingerprint?ocr.text:recognized?.fingerprint===p.fingerprint?recognized.text:"",
+        origin:(ocr?.fingerprint===p.fingerprint?"device-ocr":recognized?.fingerprint===p.fingerprint?"recognized":"empty") as "device-ocr"|"recognized"|"empty"};
+    });
+    let previews=makePreviews(snapshot);
+    if(this.task)return previews;
+    const reader=this.reader(false);
+    let opened;
+    try {opened=await reader.open(source);}catch{return previews;} // Offline/missing originals can still show saved text.
+    try {
+      if(opened.descriptor.path!==source)throw Error("The source reader returned a different notebook. Check this source before choosing pages.");
+      // Refresh presentation-only inventory, just as the normal queue scan does.
+      // Opening the selector must not require an AI-enabled Update first.
+      if(JSON.stringify(opened.descriptor.pages)!==JSON.stringify(snapshot.desired)){
+        snapshot=inventoryView(snapshot,opened.descriptor);previews=makePreviews(snapshot);
+      }
+      if(opened.readOcr)for(const preview of previews)if(preview.origin!=="device-ocr"){
+        const text=await opened.readOcr(preview.number);
+        if(text?.trim()){preview.text=text;preview.origin="device-ocr";}
+      }
+      if(await reader.revision(source)!==opened.descriptor.revision)throw Error("Notebook changed while reading page previews. Open the selector again.");
+      if(!this.task)this.inventories.set(source,{descriptor:clone(opened.descriptor)});
+    } finally {opened.close();}
+    return previews;
+  }
+  private storageIO(guard?:()=>Promise<void>) {
+    const a=this.app.vault.adapter;
+    if(!a.list||!a.remove)throw Error("Storage maintenance is unavailable with this vault adapter.");
+    return {exists:(p:string)=>a.exists(p),read:(p:string)=>a.read(p),list:(p:string)=>a.list(p),
+      stat:(p:string)=>a.stat(p),
+      remove:async(p:string)=>{
+        if(guard)await guard();
+        const file=this.app.vault.getAbstractFileByPath?.(p);
+        if(file)await this.app.vault.delete(file,true);else await a.remove(p);
+      },
+      rmdir:async(p:string)=>{if(guard)await guard();await a.rmdir(p,false);}};
+  }
+  private async storagePlan() {
+    this.assertStateReady();
+    const io=this.storageIO(),known=new Map<string,{notebookId:string;results:{pageId:string;fingerprint:string;recipe:string;textHash:string}[];publicationHashes:string[]}>();
+    const protectedHistory:string[]=[],guards=new Map<string,string>();
+    for(const state of Object.values(this.store.notebooks)) {
+      // Removed configurations are retained as unknown shared notebooks by the collector.
+      if(!this.config.rules.some(r=>r.id===state.ruleId))continue;
+      const {id,path}=await this.historyIdentity(state);
+      const entry=known.get(id)??{notebookId:id,results:[],publicationHashes:[]};
+      const protect=async(pages:NotebookState["pages"],h?:string)=>{
+        if(h)entry.publicationHashes.push(h);
+        for(const [pageId,p] of Object.entries(pages))if(p.recipe&&p.fingerprint)entry.results.push({pageId,fingerprint:p.fingerprint,recipe:p.recipe,textHash:await hash(p.text)});
+      };
+      await protect(state.pages,state.publishedHash);
+      if(await io.exists(state.output)){const text=await io.read(state.output);guards.set(state.output,text);entry.publicationHashes.push(await hash(text));}
+      else guards.set(state.output,"");
+      const point=await readRestore(this.historyIO(),path,id,state);
+      if(point){await protect(point.snapshot.pages,point.textHash);protectedHistory.push(path);guards.set(path,await io.read(path));}
+      known.set(id,entry);
+    }
+    const plan=await inspectStorage(io,{knownNotebooks:[...known.values()],trackedHistory:this.store.history,protectedHistory});
+    return {plan,guards};
+  }
+  async storageSummary() {
+    const {plan}=await this.storagePlan();
+    const {historyFiles,cacheFiles,bytes,removableFiles,removableBytes}=plan;
+    return {historyFiles,cacheFiles,bytes,removableFiles,removableBytes};
+  }
+  async pruneStorage() {
+    return this.transcriptRecovery(async()=>{
+      const {plan,guards}=await this.storagePlan();
+      const stamps=new Map<string,string>();
+      // Check contents once; use cheap metadata checks between removals instead
+      // of rereading every full transcript for every obsolete cache file.
+      for(const [path,expected]of guards){
+        const stat=await this.app.vault.adapter.stat(path);
+        if(stat?(await this.app.vault.adapter.read(path))!==expected:expected!=="")throw Error("Saved data changed during review. Review storage again before clearing files.");
+        stamps.set(path,JSON.stringify(stat?[stat.mtime,stat.size]:null));
+      }
+      const guard=async()=>{
+        for(const [path,expected]of stamps){
+          const stat=await this.app.vault.adapter.stat(path);
+          if(JSON.stringify(stat?[stat.mtime,stat.size]:null)!==expected)
+            throw Error("Synced transcripts or previous versions changed during maintenance. Review storage again.");
+        }
+      };
+      const result=await cleanStorage(this.storageIO(guard),plan);
+      const retained:string[]=[];
+      for(const path of this.store.history)if(await this.app.vault.adapter.exists(path))retained.push(path);
+      if(retained.length!==this.store.history.length){this.store.history=retained;await this.persist();}
+      this.stage("Storage cleaned",`${result.removedFiles} unused files removed. Current pages and previous versions are preserved.`);
+      return result;
+    });
   }
   private get shared(){
     const io=this.sharedIO();if(!io)return undefined;
@@ -806,6 +966,8 @@ export default class SupernoteTranscripts extends Plugin implements Controller {
     }
   }
   private validateConfig() {
+    if(this.config.cleanupPrompt!==undefined&&(typeof this.config.cleanupPrompt!=="string"||this.config.cleanupPrompt.length>20000))
+      throw Error("Keep the default cleanup instructions within 20,000 characters.");
     if (!this.config.rules.some((r) => r.enabled))
       throw new Error(
         "Enable at least one source folder or notebook in settings.",
@@ -869,6 +1031,7 @@ export default class SupernoteTranscripts extends Plugin implements Controller {
     }
     await this.refreshSharedSettings();
     if(this.task){await this.task;return;}
+    this.historyProtectedSources.clear();
     this.stop = false;
     this.automaticRun = automatic;
     this.callsThisRun = 0;
@@ -1874,13 +2037,7 @@ export default class SupernoteTranscripts extends Plugin implements Controller {
         await assertCurrent();
         const next = clone(c.state);
         if (action === "replace") {
-          const title = source.split("/").pop()!.replace(/\.note$/i, "").replace(/[<>:"/\\|?*\u0000-\u001f]/g, "-").replace(/[. ]+$/, "").slice(0, 100) || "Notebook";
-          const stamp = new Date().toISOString().replace(/[:.]/g, "-");
-          backup = `Supernote Transcripts/History/${title}/${stamp}-${crypto.randomUUID()}.md`;
-          await this.ensureFolder(backup);
-          await this.app.vault.create(backup, c.current);
-          this.store.history.push(backup);
-          await this.persist();
+          backup = await this.savePrevious(c.originalState,c.current);
           await assertCurrent();
           await this.app.vault.adapter.process(c.output, current => {
             if (current !== expectedCurrent) throw Error("Generated transcript was manually edited while saving recovery.");
@@ -1966,15 +2123,9 @@ export default class SupernoteTranscripts extends Plugin implements Controller {
     const needsHistory =
       previous !== text &&
       previous &&
-      state.historyRevision !== state.revision &&
       Object.keys(before.pages).length;
     if (needsHistory) {
-      const stamp = new Date().toISOString().replace(/[:.]/g, "-");
-      const historyPath = `Supernote Transcripts/History/${state.id.slice(0, 12)}/${stamp}-${crypto.randomUUID().slice(0, 8)}.md`;
-      await this.ensureFolder(historyPath);
-      await this.app.vault.create(historyPath, previous);
-      this.store.history.push(historyPath);
-      state.historyRevision = state.revision;
+      await this.savePrevious(before,previous,true);
     }
     if ((await this.reader().revision(state.source)) !== state.revision)
       throw new Error(
@@ -2356,14 +2507,8 @@ export default class SupernoteTranscripts extends Plugin implements Controller {
         const claimed=/^supernote_notebook_id:\s*["']?([^"'\n]+)["']?\s*$/m.exec(current)?.[1].trim();
         if(claimed&&claimed!==id)throw Error("Destination belongs to a different notebook. Choose a different output path.");
       }
-      const name=source.split("/").pop()!.replace(/\.note$/i,"").replace(/[<>:"/\\|?*\u0000-\u001f]/g,"-").slice(0,100)||"Notebook";
-      const stem=`Supernote Transcripts/History/${name}/${new Date().toISOString().replace(/[:.]/g,"-")}-${crypto.randomUUID()}`;
-      await this.ensureFolder(`${stem}-recognition.md`);
-      let backup:string|undefined;
-      if(current!==undefined){backup=`${stem}-transcript.md`;await this.app.vault.create(backup,current);this.store.history.push(backup);}
-      const cacheBackup=`${stem}-recognition.md`;
-      await this.app.vault.create(cacheBackup,"# Recognition backup before Force update\n\n```json\n"+JSON.stringify(clone(state))+"\n```\n");
-      this.store.history.push(cacheBackup);await this.persist();
+      this.historyProtectedSources.clear();
+      const backup=current!==undefined?await this.savePrevious(state,current,true):undefined;
       // Authority lasts for this invocation only. Never persist a bypass for a
       // future unattended retry, and never alter another device's claim files.
       const wasPaused=this.progress.paused;
@@ -2412,18 +2557,21 @@ export default class SupernoteTranscripts extends Plugin implements Controller {
     if(!selected||selected.length>200||/[\u0000-\u001f]/.test(selected))throw Error("Choose a valid cleanup model.");
     return {...profile,model:selected,quality:"careful"};
   }
-  cleanupEstimate(source: string, options:{model?:string}={}) {
+  cleanupEstimate(source: string, options:{model?:string;extraInstructions?:string;removePageComments?:boolean}={}) {
     const state=this.store.notebooks[source],rule=ruleFor(source,this.config.rules),profile=this.config.profiles.find(p=>p.id===rule?.profileId);
     if(!state||!profile)return {pages:0,requests:0,samples:0,provisional:true};
-    const chars=buildMarkdown(state,false).length+profile.prompt.length+profile.glossaries.length*4000;
+    const chars=buildMarkdown(state,false).length+profile.prompt.length+profile.glossaries.length*4000+(this.config.cleanupPrompt??DEFAULT_CLEANUP_PROMPT).length+(options.extraInstructions??"").length;
     const output=Math.min(128000,Math.max(8192,Math.ceil(chars/2)+8192));
     const selected=this.cleanupProfile(profile,options.model);
     const price=this.provider==="api"?priceFor(selected.endpoint,selected.model,this.costs.settings):undefined;
     return {pages:state.desired.length,requests:1,samples:0,provisional:true,
       ...(price?{usd:((chars/2+1000)*price.input+output*price.output)/1e6}:{} )};
   }
-  async cleanupDocument(source: string, options: {saveCopy?:boolean;copyPath?:string;model?:string} = {}) {
+  async cleanupDocument(source: string, options: {saveCopy?:boolean;copyPath?:string;model?:string;extraInstructions?:string;removePageComments?:boolean} = {}) {
     options={...options};
+    if(options.removePageComments&&!options.saveCopy)throw Error("Page links can be removed only from a separate cleaned copy. The mirrored transcript keeps its page references.");
+    if(options.extraInstructions!==undefined&&(typeof options.extraInstructions!=="string"||options.extraInstructions.length>10000))throw Error("Keep additional cleanup instructions within 10,000 characters.");
+    if(this.config.cleanupPrompt!==undefined&&(typeof this.config.cleanupPrompt!=="string"||this.config.cleanupPrompt.length>20000))throw Error("Keep default cleanup instructions within 20,000 characters.");
     this.assertStateReady();this.assertAttemptStorageReady();
     if(this.task)throw Error("Pause and wait for active requests before cleaning a document.");
     await this.refreshSharedSettings();
@@ -2454,9 +2602,9 @@ export default class SupernoteTranscripts extends Plugin implements Controller {
       try {if(JSON.stringify(opened.descriptor.pages)!==JSON.stringify(state.desired))throw Error("The notebook has changed. Update its mirrored pages before cleanup.");}
       finally {opened.close();}
       const revision=await reader.revision(source);
-      const signatureNow=()=>JSON.stringify([original.output,original.outputOverride,original.desired,original.pages,original.deviceOcr,ruleFor(source,this.config.rules),this.config.profiles.find(p=>p.id===rule.profileId),this.showPageHeadings]);
+      const signatureNow=()=>JSON.stringify([original.output,original.outputOverride,original.desired,original.pages,original.deviceOcr,ruleFor(source,this.config.rules),this.config.profiles.find(p=>p.id===rule.profileId),this.showPageHeadings,this.config.cleanupPrompt]);
       const signature=signatureNow();
-      const prompt=cleanupInput(state,current,resolved.profile.prompt,resolved.reference);
+      const prompt=cleanupInput(state,current,resolved.profile.prompt,resolved.reference,{defaultPrompt:this.config.cleanupPrompt,extraInstructions:options.extraInstructions});
       if(prompt.length>400000)throw Error("This document and its references exceed the single-pass cleanup size limit. No request was sent.");
       const cleanupRecipe=`cleanup:${await hash(JSON.stringify([resolved.recipe,cleanupProfile.model,prompt]))}`;
       const assertCurrent=async()=>{
@@ -2474,23 +2622,25 @@ export default class SupernoteTranscripts extends Plugin implements Controller {
         const cleaned=cleanupPages(raw,state);
         state.cleanedPages=cleaned;
         const text=buildMarkdown(state,this.showPageHeadings);
+        const savedText=options.saveCopy&&options.removePageComments?stripPageComments(text):text;
         state.cleanup={updatedAt:new Date().toISOString(),inputHash:await hash(current),outputHash:await hash(text),model:request.usedModel,quality:"careful",provider:this.provider,basePages:clone(state.desired)};
         const stamp=new Date().toISOString().replace(/[:.]/g,"-");
-        const backup=`Supernote Transcripts/History/${state.id.slice(0,12)}/${stamp}-${crypto.randomUUID().slice(0,8)}.md`;
-        const recovered=backup.replace(/\.md$/,"-cleanup-result.md");
-        await this.ensureFolder(backup);await this.app.vault.create(recovered,text);this.store.history.push(recovered);
-        await this.app.vault.create(backup,current);this.store.history.push(backup);await this.persist();
+        const {path:previousPath}=await this.historyIdentity(original);
+        const recovered=previousPath.replace(/Previous version\.md$/,`${stamp}-${crypto.randomUUID().slice(0,8)}-cleanup-result.md`);
+        await this.ensureFolder(recovered);await this.app.vault.create(recovered,savedText);this.store.history.push(recovered);
         try {
+        await this.persist();
         await assertCurrent();if(lost||shared&&lease&&!await shared.checkLease(lease))throw Error("Another device took priority while cleanup was running.");
         if(options.saveCopy){
           const stem=state.output.replace(/\.md$/i,"");let copy=explicitCopy??`${stem} (cleaned).md`,n=1;
           if(explicitCopy!==undefined&&await this.app.vault.adapter.exists(copy))throw Error("The cleanup copy destination appeared while cleanup was running. Its current contents were preserved.");
           if(explicitCopy===undefined)while(await this.app.vault.adapter.exists(copy))copy=`${stem} (cleaned ${++n}).md`;
           await this.ensureFolder(copy);
-          await this.app.vault.create(copy,text);
+          await this.app.vault.create(copy,savedText);
           // A separate copy must not replace the canonical mirror's receipt.
           this.stage("Cleanup saved",`Cleaned copy: ${copy}`);
         } else {
+          await this.savePrevious(original,current);
           // Cache the paid result before writing. A failed publication can be recovered without another request.
           original.cleanedPages=state.cleanedPages;original.cleanup=state.cleanup;await this.persist();
           await assertCurrent();
@@ -2500,6 +2650,16 @@ export default class SupernoteTranscripts extends Plugin implements Controller {
           delete original.error;original.status=pendingPages(original).length?"queued":"current";
           if(io)await new PublicationReceipts(io).save(id,text,original.desired,original.pages,this.presentationFor(original));
           await this.persist();this.stage("Document cleaned","Saved in place. The previous version is in History; new pages can append normally.");
+        }
+        // The paid result has a verified destination. It no longer needs a second copy.
+        if(this.app.vault.adapter.remove){
+          try {
+            if(await this.app.vault.adapter.read(recovered)===savedText){
+              const file=this.app.vault.getAbstractFileByPath?.(recovered);
+              if(file)await this.app.vault.delete(file,true);else await this.app.vault.adapter.remove(recovered);
+              this.store.history=this.store.history.filter(p=>p!==recovered);await this.persist();
+            }
+          }catch{/* Keep the recovery copy if removal or state persistence is unavailable. */}
         }
         } catch(error) { throw Error(`${readable(error)} The paid cleanup result is saved at ${recovered}; open it instead of sending another request.`); }
       } finally {if(heartbeat)clearInterval(heartbeat);if(shared&&lease)await shared.release(lease);}
@@ -2539,6 +2699,7 @@ export default class SupernoteTranscripts extends Plugin implements Controller {
       size: 0,
       mtime: 0,
     };
+    this.historyProtectedSources.clear();
     this.stop = false;
     this.callsThisRun = 0;
     this.setPaused(false);
