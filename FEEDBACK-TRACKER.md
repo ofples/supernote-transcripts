@@ -11,6 +11,7 @@ Source implementation, fixture checks, installed builds and live verification ar
 - [x] Consolidate notebook actions, put restore under History and keep technical details expandable; confirm notebook exclusion before changing the source.
 - [x] Simplify output folder browsing to Find; move creation to a separate name prompt reached beside Choose, with validation and Cancel.
 - [x] Remove Manage subscription usage from Settings and subscription activity.
+- [x] Verify 504 source tests, TypeScript/build and 855 synthetic UI assertions; refresh guides and screenshots. Install final 0.13.1 artifacts on desktop and Nomad, preserving saved results, settings, session and accounting; leave recognition paused. See [Validation](VALIDATION.md) for live checks and the Nomad's pre-existing in-memory queue discrepancy.
 
 
 ## Restore, storage, cleanup and page-selection follow-up — 0.13.0 candidate
