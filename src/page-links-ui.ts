@@ -1,7 +1,8 @@
-import { editorInfoField, editorLivePreviewField, MarkdownRenderer, MarkdownRenderChild, MarkdownView, TFile, type Component, type Plugin } from "obsidian";
+import { editorInfoField, editorLivePreviewField, MarkdownRenderer, MarkdownRenderChild, MarkdownView, Notice, TFile, type Component, type Plugin } from "obsidian";
 import { Decoration, EditorView, ViewPlugin, WidgetType } from "@codemirror/view";
 import { RangeSetBuilder, StateEffect, StateField, type EditorState } from "@codemirror/state";
 import { pageMarkerGroups, pageMarkerTableAnchor, parsePageLinkToken, parsePageMarkers } from "./page-links.mjs";
+import { createPageLinkVisibility } from "./page-link-visibility.mjs";
 import { isManagedTranscript } from "./page-navigation";
 
 export type PageLinkOpen = (outputPath: string, pageId: string, displayNumber: number) => Promise<void>;
@@ -21,12 +22,32 @@ export interface ReaderPageLinksApi {
   apiVersion: 1;
   /** Optional features exposed by this API version. */
   capabilities: readonly ["renderSection"];
-  enabled(): boolean;
+  enabled(sourcePath?: string): boolean;
   /** Render a reader chapter with validated chips. Returns false when it is not a managed transcript. */
   renderSection(section: ReaderPageLinkSection): Promise<boolean>;
 }
 
 type PluginWithReaderPageLinks = Plugin & { pageLinks?: ReaderPageLinksApi };
+type PageLinkVisibilityOptions = { storageKey?: string };
+
+function memoryStorage() {
+  const values = new Map<string, string>();
+  return {
+    getItem(key: string) { return values.get(key) ?? null; },
+    setItem(key: string, value: string) { values.set(key, value); },
+    removeItem(key: string) { values.delete(key); },
+  };
+}
+
+type PageLinkToggleView = {
+  getViewType?: () => string;
+  addAction?: (icon: string, title: string, callback: (event: MouseEvent) => unknown) => HTMLElement;
+  file?: TFile;
+  editor?: { getValue?: () => string };
+  getState?: () => { file?: string };
+  headerEl?: HTMLElement;
+  containerEl?: HTMLElement;
+};
 
 function pageButton(number: number, open: () => Promise<void>): HTMLButtonElement {
   const button = document.createElement("button");
@@ -130,9 +151,9 @@ function addInlinePageGroup(target: HTMLElement, group: (ReturnType<typeof pageM
   }
 }
 
-async function renderReaderPageLinkSection(plugin: Plugin, onOpen: PageLinkOpen, enabled: () => boolean,
+async function renderReaderPageLinkSection(plugin: Plugin, onOpen: PageLinkOpen, enabled: (sourcePath?: string) => boolean,
   section: ReaderPageLinkSection): Promise<boolean> {
-  if (!enabled() || !section?.element || !section.sourcePath || !section.component || typeof section.markdown !== "string") return false;
+  if (!section?.element || !section.sourcePath || !section.component || typeof section.markdown !== "string" || !enabled(section.sourcePath)) return false;
   const parts = section.sourcePath.split("/");
   if (section.sourcePath.startsWith("/") || section.sourcePath.includes("\\") ||
       /[\u0000-\u001f]/.test(section.sourcePath) || parts.some(part => !part || part === "." || part === ".." || part.includes(":"))) return false;
@@ -198,6 +219,7 @@ async function renderReaderPageLinkSection(plugin: Plugin, onOpen: PageLinkOpen,
   const fragment = document.createElement("div");
   fragment.dataset.stPageLinksRender = "true";
   await MarkdownRenderer.render(plugin.app, rendered, fragment, section.sourcePath, section.component);
+  if (!enabled(section.sourcePath)) return false;
   for (const anchor of Array.from(fragment.querySelectorAll<HTMLAnchorElement>("a[href]"))) {
     const token = parsePageLinkToken(anchor.getAttribute("href") ?? "") ?? parsePageLinkToken(anchor.getAttribute("data-href") ?? "");
     const marker = token ? linkTokens.get(token) : undefined;
@@ -227,7 +249,14 @@ async function renderReaderPageLinkSection(plugin: Plugin, onOpen: PageLinkOpen,
 }
 
 /** Install view-only page chips. Marker comments remain untouched in Markdown. */
-export function installPageLinks(plugin: Plugin, onOpen: PageLinkOpen, enabled: () => boolean = () => true): { refresh: () => void } {
+export function installPageLinks(plugin: Plugin, onOpen: PageLinkOpen, enabled: () => boolean = () => true,
+  options: PageLinkVisibilityOptions = {}): { refresh: () => void } {
+  const visibility = createPageLinkVisibility(
+    options.storageKey ? localStorage : memoryStorage(),
+    options.storageKey ?? "st-page-links-memory",
+    enabled,
+  );
+  const isEnabled = (sourcePath?: string) => visibility.enabled(sourcePath);
   const editorViews = new Set<EditorView>();
   type DecorationState = { source: string; markers: ReturnType<typeof parsePageMarkers>; decorations: ReturnType<RangeSetBuilder<Decoration>["finish"]> };
   const buildDecorations = (state: EditorState, previous?: DecorationState): DecorationState => {
@@ -238,7 +267,7 @@ export function installPageLinks(plugin: Plugin, onOpen: PageLinkOpen, enabled: 
       const empty = () => ({ source, markers, decorations: builder.finish() });
       if (state.field(editorLivePreviewField, false) !== true) return empty();
       const path = state.field(editorInfoField, false)?.file?.path;
-      if (!path || !enabled() || !markers.length) return empty();
+      if (!path || !isEnabled(path) || !markers.length) return empty();
       const selected = (from: number, to: number) => state.selection.ranges.some(range => range.empty
         ? range.head >= from && range.head < to : range.from < to && range.to > from);
       const groups = pageMarkerGroups(source, markers);
@@ -306,8 +335,8 @@ export function installPageLinks(plugin: Plugin, onOpen: PageLinkOpen, enabled: 
   const integration: ReaderPageLinksApi = {
     apiVersion: 1,
     capabilities: ["renderSection"],
-    enabled,
-    renderSection: section => renderReaderPageLinkSection(plugin, onOpen, enabled, section),
+    enabled: isEnabled,
+    renderSection: section => renderReaderPageLinkSection(plugin, onOpen, isEnabled, section),
   };
   const pluginWithApi = plugin as PluginWithReaderPageLinks;
   const notifyReader = () => {
@@ -321,6 +350,186 @@ export function installPageLinks(plugin: Plugin, onOpen: PageLinkOpen, enabled: 
       }
     } catch { /* Optional reader notification failed. */ }
   };
+  const toggleActions = new Map<PageLinkToggleView, { button: HTMLElement; generation: number; path?: string; source?: string; mtime?: number; scanned?: boolean; hasLinks?: boolean }>();
+  const getPath = (view: PageLinkToggleView): string | undefined => {
+    const path = view.file?.path ?? view.getState?.().file;
+    return typeof path === "string" && path ? path : undefined;
+  };
+  const setButtonState = (button: HTMLElement, path: string | undefined, hasLinks: boolean) => {
+    const visible = path ? isEnabled(path) : false;
+    button.hidden = !hasLinks;
+    button.setAttribute("aria-label", visible ? "Hide notebook page links" : "Show notebook page links");
+    button.setAttribute("title", visible ? "Hide notebook page links" : "Show notebook page links");
+    button.setAttribute("aria-pressed", String(visible));
+    if (button instanceof HTMLButtonElement) button.disabled = !path || !hasLinks;
+  };
+  const updateToggle = async (view: PageLinkToggleView) => {
+    const state = toggleActions.get(view);
+    if (!state) return;
+    const generation = ++state.generation;
+    const path = getPath(view);
+    if (state.path !== path) {
+      state.source = undefined;
+      state.mtime = undefined;
+      state.scanned = false;
+      state.hasLinks = false;
+      setButtonState(state.button, path, false);
+    }
+    state.path = path;
+    if (!path) { setButtonState(state.button, undefined, false); return; }
+    const editorSource = view.editor?.getValue?.();
+    if (typeof editorSource === "string") {
+      if (!state.scanned || state.source !== editorSource) {
+        state.source = editorSource;
+        state.hasLinks = isManagedTranscript(editorSource) && parsePageMarkers(editorSource).length > 0;
+        state.scanned = true;
+      }
+      setButtonState(state.button, path, state.hasLinks ?? false);
+      return;
+    }
+    const file = plugin.app.vault.getAbstractFileByPath(path);
+    if (!(file instanceof TFile) || file.path !== path || file.extension.toLowerCase() !== "md") {
+      setButtonState(state.button, path, false);
+      return;
+    }
+    const mtime = file.stat?.mtime;
+    if (state.scanned && state.mtime === mtime) {
+      setButtonState(state.button, path, state.hasLinks ?? false);
+      return;
+    }
+    try {
+      const source = await plugin.app.vault.cachedRead(file);
+      const current = toggleActions.get(view);
+      if (!current || current.generation !== generation || getPath(view) !== path) return;
+      state.source = source;
+      state.mtime = mtime;
+      state.hasLinks = isManagedTranscript(source) && parsePageMarkers(source).length > 0;
+      state.scanned = true;
+      setButtonState(state.button, path, state.hasLinks);
+    } catch {
+      const current = toggleActions.get(view);
+      if (current?.generation === generation) setButtonState(state.button, path, false);
+    }
+  };
+  let refreshActions = () => {};
+  const attachToggle = (view: PageLinkToggleView) => {
+    if (toggleActions.has(view) || typeof view.addAction !== "function") return;
+    const viewType = view.getViewType?.() ?? "";
+    const header = view.headerEl ?? view.containerEl;
+    const paperModeAction = header?.querySelector<HTMLElement>(".sn-mode-action");
+    const isPaperView = viewType.toLowerCase().includes("paper");
+    if (viewType !== "markdown" && viewType !== "horizontal-reader-view" && !paperModeAction && !isPaperView) return;
+    const button = view.addAction("link-2", "Show notebook page links", () => {
+      const state = toggleActions.get(view);
+      const path = getPath(view);
+      if (!path || !state || state.path !== path || button.hidden) {
+        void updateToggleSafely(view);
+        return;
+      }
+      if (!visibility.setEnabled(path, !isEnabled(path))) new Notice("Page-link visibility could not be saved.");
+      refreshActions();
+    });
+    button.classList.add("st-page-links-toggle");
+    button.hidden = true;
+    toggleActions.set(view, { button, generation: 0 });
+    placeToggle(view, button);
+  };
+  const placeToggle = (view: PageLinkToggleView, button: HTMLElement) => {
+    const header = view.headerEl ?? view.containerEl;
+    const target = header?.querySelector<HTMLElement>(".sn-mode-action") ??
+      header?.querySelector<HTMLElement>('.view-action[aria-label^="Current view:"]');
+    if (target && target !== button && target.parentElement === button.parentElement && target.nextElementSibling !== button) {
+      target.insertAdjacentElement("afterend", button);
+    }
+  };
+  const updateToggleSafely = async (view: PageLinkToggleView) => {
+    try {
+      await updateToggle(view);
+    } catch {
+      const state = toggleActions.get(view);
+      if (state) {
+        let path: string | undefined;
+        try { path = getPath(view); } catch { /* Closed views may reject state reads during teardown. */ }
+        setButtonState(state.button, path, false);
+      }
+    }
+  };
+  const updateToggleActions = () => {
+    const workspace = plugin.app.workspace as typeof plugin.app.workspace & {
+      iterateAllLeaves?: (callback: (leaf: { view?: PageLinkToggleView }) => void) => void;
+      getLeavesOfType?: (type: string) => Array<{ view?: PageLinkToggleView }>;
+    };
+    const views = new Set<PageLinkToggleView>();
+    for (const type of ["markdown", "horizontal-reader-view"]) {
+      for (const leaf of workspace.getLeavesOfType?.(type) ?? []) if (leaf.view) views.add(leaf.view);
+    }
+    workspace.iterateAllLeaves?.(leaf => { if (leaf.view) views.add(leaf.view); });
+    for (const [view, state] of toggleActions) {
+      if (!views.has(view)) { state.button.remove(); toggleActions.delete(view); }
+    }
+    for (const view of views) {
+      attachToggle(view);
+      const state = toggleActions.get(view);
+      if (state) {
+        placeToggle(view, state.button);
+        void updateToggleSafely(view);
+      }
+    }
+  };
+  refreshActions = () => {
+    updateToggleActions();
+  };
+  const workspaceEvents = plugin.app.workspace as typeof plugin.app.workspace & {
+    on?: (name: string, callback: (...args: unknown[]) => void) => unknown;
+  };
+  for (const eventName of ["active-leaf-change", "layout-change", "file-open", "editor-change"]) {
+    try {
+      const ref = workspaceEvents.on?.(eventName, () => updateToggleActions());
+      if (ref) plugin.registerEvent(ref as never);
+    } catch { /* Older Obsidian test stubs may not expose workspace events. */ }
+  }
+  const vaultEvents = plugin.app.vault as typeof plugin.app.vault & {
+    on?: (name: string, callback: (...args: unknown[]) => void) => unknown;
+  };
+  try {
+    const modifyRef = vaultEvents.on?.("modify", file => {
+      const path = (file as TFile | undefined)?.path;
+      for (const [view, state] of toggleActions) {
+        if (typeof path === "string" && getPath(view) === path) {
+          state.source = undefined;
+          state.mtime = undefined;
+          state.scanned = false;
+          state.hasLinks = false;
+          setButtonState(state.button, path, false);
+        }
+      }
+      updateToggleActions();
+    });
+    if (modifyRef) plugin.registerEvent(modifyRef as never);
+    const renameRef = vaultEvents.on?.("rename", (file, oldPath) => {
+      if (typeof oldPath === "string" && typeof (file as TFile | undefined)?.path === "string") visibility.rename(oldPath, (file as TFile).path);
+      updateToggleActions();
+    });
+    if (renameRef) plugin.registerEvent(renameRef as never);
+    const deleteRef = vaultEvents.on?.("delete", file => {
+      if (typeof (file as TFile | undefined)?.path === "string") visibility.deletePath((file as TFile).path);
+      updateToggleActions();
+    });
+    if (deleteRef) plugin.registerEvent(deleteRef as never);
+  } catch { /* File lifecycle events are optional in test stubs. */ }
+  const refreshPageLinksNow = () => {
+    plugin.app.workspace.updateOptions();
+    const leaves = plugin.app.workspace.getLeavesOfType("markdown") as unknown as Array<{ view: MarkdownView }>;
+    for (const view of editorViews) view.dispatch({ effects: refreshPageLinks.of() });
+    for (const leaf of leaves) leaf.view.previewMode.rerender(true);
+    updateToggleActions();
+    notifyReader();
+  };
+  refreshActions = refreshPageLinksNow;
+  plugin.register(() => {
+    for (const { button } of toggleActions.values()) button.remove();
+    toggleActions.clear();
+  });
   pluginWithApi.pageLinks = integration;
   plugin.register(() => {
     if (pluginWithApi.pageLinks === integration) {
@@ -329,10 +538,11 @@ export function installPageLinks(plugin: Plugin, onOpen: PageLinkOpen, enabled: 
     }
   });
   notifyReader();
+  updateToggleActions();
 
   plugin.registerMarkdownPostProcessor(async (el, ctx) => {
     if (el.closest("[data-st-page-links-render]") || el.hasAttribute("data-st-page-links-render")) return;
-    if (!enabled()) return;
+    if (!isEnabled(ctx.sourcePath)) return;
     const section = ctx.getSectionInfo(el);
     if (!section) return;
     let fullSource = section.text;
@@ -343,6 +553,7 @@ export function installPageLinks(plugin: Plugin, onOpen: PageLinkOpen, enabled: 
       try { fullSource = await plugin.app.vault.cachedRead(file); } catch { return; }
     }
     if (!isManagedTranscript(fullSource)) return;
+    if (!isEnabled(ctx.sourcePath)) return;
     const allMarkers = parsePageMarkers(fullSource);
     if (!allMarkers.length) return;
     const groups = pageMarkerGroups(fullSource, allMarkers);
@@ -389,6 +600,7 @@ export function installPageLinks(plugin: Plugin, onOpen: PageLinkOpen, enabled: 
       const fragment = document.createElement("div");
       fragment.dataset.stPageLinksRender = "true";
       await MarkdownRenderer.render(plugin.app, rendered, fragment, ctx.sourcePath, child);
+      if (!isEnabled(ctx.sourcePath)) return;
       for (const anchor of Array.from(fragment.querySelectorAll<HTMLAnchorElement>("a[href]"))) {
         const token = parsePageLinkToken(anchor.getAttribute("href")) ?? parsePageLinkToken(anchor.getAttribute("data-href"));
         const marker = token ? linkTokens.get(token) : undefined;
@@ -405,13 +617,5 @@ export function installPageLinks(plugin: Plugin, onOpen: PageLinkOpen, enabled: 
     }
   });
 
-  return {
-    refresh: () => {
-      plugin.app.workspace.updateOptions();
-      const leaves = plugin.app.workspace.getLeavesOfType("markdown") as unknown as Array<{ view: MarkdownView }>;
-      for (const view of editorViews) view.dispatch({ effects: refreshPageLinks.of() });
-      for (const leaf of leaves) leaf.view.previewMode.rerender(true);
-      notifyReader();
-    },
-  };
+  return { refresh: refreshPageLinksNow };
 }

@@ -21,7 +21,7 @@ An enabled provider exposes `app.plugins.plugins['nomad-transcripts'].pageLinks`
 interface ReaderPageLinksV1 {
   apiVersion: 1;
   capabilities: readonly ['renderSection'];
-  enabled(): boolean;
+  enabled(sourcePath?: string): boolean;
   renderSection(section: {
     element: HTMLElement;
     sourcePath: string;          // vault-relative Markdown file
@@ -33,6 +33,8 @@ interface ReaderPageLinksV1 {
 ```
 
 The provider validates the managed transcript and canonical source mapping before adding chips. The reader does not parse device paths, call recognition, own credentials or write transcript metadata. Page chips retain inline placement and are applied before pagination, including prefetched chapters.
+
+The optional `sourcePath` argument returns effective visibility for that document. Without an argument, `enabled()` remains a compatibility precheck: it is true if the default or a document override enables links. `renderSection` always checks its own document's preference. The provider owns a contextual header button in core Markdown and compatible reader views, beside the optional Sidebar mode control when present. This integration does not require a Sidebar or theme change.
 
 Consumers resolve the optional provider for each render. Version 1 is supported; a structurally compatible older adapter with no `apiVersion` is accepted for existing installations. Unknown versions, missing methods, disabled providers, a false result or an adapter error all fall back to ordinary Obsidian Markdown rendering. Clear partial adapter output before fallback. Ordinary notes remain readable without either the provider or its theme.
 

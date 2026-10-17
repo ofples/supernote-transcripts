@@ -1,5 +1,12 @@
 # Validation
 
+## Version 0.13.2 — document page-link visibility
+
+- **513/513 source tests**, TypeScript checking and production build pass. New checks cover per-document persistence/defaults, malformed/unavailable storage, renderer visibility and asynchronous toggle races, core/Sidebar header placement, ordinary-document hiding, stale clicks after file switches, modified reader-file rescans, and closed-view/unload cleanup. Header placement is verified with simulated DOM fixtures, not a live app in this pass.
+- The contextual link action is owned by Transcripts. No Paper or MD Reader runtime changes are required. Existing page metadata and notebook navigation remain unchanged; no AI requests or Digest writes were made.
+- Frozen SHA-256: `main.js` = `dfd76ca2182851c6530ae078411af49ab735ffde1d7bae1434a0dc238836067d`; `manifest.json` = `1d401fdd24cf01bb6cdd8ceca85081f68ac7b8d264853fff4c6ec447cc9bffac`; `styles.css` = `f6f7aaf2ff6797ca13f7ee10d9ad3ee6c73b9061b93564e883ae6fc3471fe7bd`.
+- The Nomad was unavailable over ADB and desktop Obsidian was closed during the check. Live toolbar placement, physical taps and the installed-reader combination remain to be verified. The final three assets are staged in desktop Vedas, with all hashes read back against the frozen candidate and verified backups of the previous assets. Obsidian remained stopped; configuration, state, session and notes were not touched. This is staging, not active-app verification. Private evidence: `private/device-evidence/2026-10-17/page-visibility/desktop-stage-evidence.json`.
+
 ## Version 0.13.1 — selected-page preview and notebook actions
 
 - **504/504 source tests** pass. Preview regressions compare actual rendered pixels, assert that unrelated page metadata/layers/bitmap blocks are not requested, reject invalid ordinals, guard edited originals, verify in-flight deduplication, retry failures, bound the revision-aware cache and retain the legacy reader fallback. OCR-window tests verify cached reads avoid reopening an unchanged notebook and refresh after edits without AI or durable state mutations.

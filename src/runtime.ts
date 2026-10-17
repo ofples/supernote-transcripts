@@ -585,14 +585,15 @@ export default class SupernoteTranscripts extends Plugin implements Controller {
     const pageLinks = installPageLinks(this, async (outputPath, pageId, displayNumber) => {
       try { await this.openNotebookPage(outputPath, pageId, displayNumber); }
       catch (error) { new Notice(readable(error)); }
-    }, () => localStorage.getItem(`${this.devicePrefix}:page-links`) !== "false");
+    }, () => localStorage.getItem(`${this.devicePrefix}:page-links`) !== "false",
+    { storageKey: `${this.devicePrefix}:page-links-files` });
     this.addCommand({
-      id: "toggle-page-links", name: "Show or hide notebook page links",
+      id: "toggle-page-links", name: "Show or hide notebook page links by default",
       callback: () => {
         const enabled = localStorage.getItem(`${this.devicePrefix}:page-links`) === "false";
         localStorage.setItem(`${this.devicePrefix}:page-links`, String(enabled));
         pageLinks.refresh();
-        new Notice(enabled ? "Notebook page links shown" : "Notebook page links hidden");
+        new Notice(enabled ? "Notebook page links shown by default" : "Notebook page links hidden by default");
       },
     });
     const wake = () => {

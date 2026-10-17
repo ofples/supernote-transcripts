@@ -19,12 +19,13 @@ class FakeNode {
 }
 
 class FakeButton extends FakeNode {
-  constructor() { super(); this.tagName = "BUTTON"; }
+  constructor() { super(); this.tagName = "BUTTON"; this.classList = { add() {} }; }
 }
 class FakeAnchor extends FakeNode {
   constructor(href) { super(); this.tagName = "A"; this.attributes.href = href; }
 }
 globalThis.document = { createElement(tag) { return tag === "button" ? new FakeButton() : new FakeNode(); } };
+globalThis.HTMLButtonElement = FakeButton;
 globalThis.FakeAnchor = FakeAnchor;
 
 const mocks = {
@@ -32,11 +33,13 @@ const mocks = {
     export const editorInfoField = {};
     export const editorLivePreviewField = {};
     export const MarkdownRenderer = { async render(_app, markdown, target) {
+      if (globalThis.renderGate) { globalThis.renderGate.started(); await globalThis.renderGate.promise; }
       const pattern = /\\[[^\\]]+\\]\\((obsidian:\\/\\/[^)\\s]+)\\)/g;
       for (const match of markdown.matchAll(pattern)) target.appendChild(new globalThis.FakeAnchor(match[1]));
     } };
     export class MarkdownRenderChild {}
     export class MarkdownView {}
+    export class Notice {}
     export class TFile { static [Symbol.hasInstance](value) { return value?.isTFile === true; } }
   `,
   "@codemirror/view": `
@@ -122,6 +125,102 @@ test("reader hook rejects spoofed markers and respects the page-link toggle", as
   }), false);
   assert.equal(readCount, 0);
   enabled = true;
+});
+
+test("reader rendering rechecks the document toggle after its asynchronous render", async () => {
+  const target = new FakeNode();
+  let allowRender;
+  let started;
+  const renderStarted = new Promise(resolve => { started = resolve; });
+  const renderGate = new Promise(resolve => { allowRender = resolve; });
+  globalThis.renderGate = { promise: renderGate, started: () => started() };
+  enabled = true;
+  const result = plugin.pageLinks.renderSection({
+    element: target, sourcePath: "Transcripts/book.md",
+    markdown: "# Repeat\n<!-- supernote-page:native%3Afirst number:1 -->\n\nRepeated chapter text.",
+    sourceLineMap: [4, 5, 6, 7], component: {},
+  });
+  await renderStarted;
+  enabled = false;
+  allowRender();
+  assert.equal(await result, false);
+  assert.equal(target.children.length, 0);
+  delete globalThis.renderGate;
+  enabled = true;
+});
+
+test("view header toggle appears only for a document with page links and refreshes its state", () => {
+  const actions = [];
+  const toggleSource = { value: source };
+  const view = {
+    file: { path: "Transcripts/book.md" },
+    editor: { getValue: () => toggleSource.value },
+    getViewType: () => "markdown",
+    addAction(icon, title, callback) {
+      const button = new FakeButton();
+      actions.push({ icon, title, callback, button });
+      return button;
+    },
+    previewMode: { rerender() {} },
+  };
+  const workspace = {
+    ...plugin.app.workspace,
+    getLeavesOfType(type) { return type === "markdown" ? [{ view }] : []; },
+  };
+  const storage = new Map();
+  globalThis.localStorage = {
+    getItem(key) { return storage.get(key) ?? null; },
+    setItem(key, value) { storage.set(key, value); },
+    removeItem(key) { storage.delete(key); },
+  };
+  const localPlugin = { ...plugin, app: { ...plugin.app, workspace }, register() {} };
+  const controller = installPageLinks(localPlugin, async () => {}, () => true, { storageKey: "test-page-link-visibility" });
+  assert.equal(actions.length, 1);
+  const action = actions[0];
+  assert.equal(action.icon, "link-2");
+  assert.equal(action.button.hidden, false);
+  assert.equal(action.button.getAttribute("aria-label"), "Hide notebook page links");
+  assert.equal(action.button.getAttribute("aria-pressed"), "true");
+  action.callback({});
+  assert.equal(action.button.getAttribute("aria-label"), "Show notebook page links");
+  assert.equal(action.button.getAttribute("aria-pressed"), "false");
+
+  toggleSource.value = "---\nnomad_transcripts: true\n---\n\nNo page links here.";
+  controller.refresh();
+  assert.equal(action.button.hidden, true);
+  delete globalThis.localStorage;
+});
+
+test("optional horizontal reader view gets a per-document header toggle", async () => {
+  const actions = [];
+  const view = {
+    file: files.get("Transcripts/book.md"),
+    getViewType: () => "horizontal-reader-view",
+    addAction(icon, title, callback) {
+      const button = new FakeButton();
+      actions.push({ icon, title, callback, button });
+      return button;
+    },
+  };
+  const workspace = {
+    ...plugin.app.workspace,
+    getLeavesOfType(type) { return type === "horizontal-reader-view" ? [{ view }] : []; },
+  };
+  const values = new Map();
+  globalThis.localStorage = {
+    getItem(key) { return values.get(key) ?? null; },
+    setItem(key, value) { values.set(key, value); },
+    removeItem(key) { values.delete(key); },
+  };
+  const localPlugin = { ...plugin, app: { ...plugin.app, workspace }, register() {} };
+  installPageLinks(localPlugin, async () => {}, () => true, { storageKey: "reader-page-link-visibility" });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(actions.length, 1);
+  assert.equal(actions[0].button.hidden, false);
+  assert.equal(actions[0].button.getAttribute("aria-label"), "Hide notebook page links");
+  actions[0].callback({});
+  assert.equal(actions[0].button.getAttribute("aria-pressed"), "false");
+  delete globalThis.localStorage;
 });
 
 test("reader chips open the validated stable page and plugin unload removes the API", async () => {

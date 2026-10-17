@@ -30,6 +30,10 @@
   outline: 2px solid var(--text-normal);
   outline-offset: 2px;
 }
+.st-page-links-toggle[hidden] { display: none !important; }
+.st-page-links-toggle[aria-pressed="true"] { color: var(--text-normal); }
+.st-page-links-toggle[aria-pressed="false"] { color: var(--text-muted); }
+.st-page-links-toggle:focus-visible { outline: 2px solid var(--interactive-accent); outline-offset: 2px; }
 .st-page-link:hover { background: var(--background-modifier-hover); }
 .st-page-link:disabled { opacity: 0.65; cursor: wait; }
 .st-fullscreen-modal {
