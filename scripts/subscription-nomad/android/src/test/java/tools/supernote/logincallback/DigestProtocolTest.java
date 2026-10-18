@@ -3,6 +3,8 @@ package tools.supernote.logincallback;
 import org.junit.Test;
 
 import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
+import java.util.Locale;
 
 import static org.junit.Assert.*;
 
@@ -18,6 +20,9 @@ public final class DigestProtocolTest {
         assertTrue(DigestProtocol.manualComment(p).startsWith("Obsidian: Satsang/2610.md\nobsidian://open?"));
         assertTrue(DigestProtocol.metadataJson(p).contains("\"supernote_bridge\""));
         assertFalse(DigestProtocol.metadataJson(p).contains(p.text));
+        String withNote = DigestProtocol.manualComment(p, "My observation");
+        assertTrue(withNote.startsWith("Note: My observation\n\nObsidian: Satsang/2610.md\n"));
+        assertTrue(withNote.length() <= 2000);
     }
 
     @Test public void acceptsBoundedNotebookTargetAndPreservesIdsForManualMetadata() throws Exception {
@@ -155,11 +160,105 @@ public final class DigestProtocolTest {
         catch (DigestProtocol.InvalidPayloadException expected) { }
     }
 
+    @Test public void reviewAndQuickEnvelopeKeepPayloadIdentityUnchanged() throws Exception {
+        String client = repeat('b', 32), secretHex = repeat('c', 64);
+        byte[] secret = DigestProtocol.parseHexSecret(secretHex);
+        long now = 1792291200000L;
+        String signature = DigestProtocol.quickSignature(client, now, BASE, secret);
+        String review = "supernote-bridge://digest?payload=" + encode(BASE) + "&mode=review";
+        String quick = "supernote-bridge://digest?payload=" + encode(BASE) + "&mode=quick&client=" + client
+                + "&time=" + now + "&signature=" + signature + "&setup=" + secretHex;
+        DigestProtocol.RequestEnvelope reviewEnvelope = DigestProtocol.parseEnvelope(review);
+        DigestProtocol.RequestEnvelope quickEnvelope = DigestProtocol.parseEnvelope(quick);
+        assertEquals(DigestProtocol.RequestMode.REVIEW, reviewEnvelope.mode);
+        assertEquals(DigestProtocol.RequestMode.QUICK, quickEnvelope.mode);
+        assertEquals(BASE, quickEnvelope.payload.rawJson);
+        assertEquals(reviewEnvelope.payload.requestId, quickEnvelope.payload.requestId);
+        assertEquals(sha256(reviewEnvelope.payload.rawJson), sha256(quickEnvelope.payload.rawJson));
+        assertTrue(DigestProtocol.quickSignatureMatches(client, now, BASE, secret, signature));
+        assertFalse(DigestProtocol.quickSignatureMatches(client, now, BASE + " ", secret, signature));
+        assertFalse(DigestProtocol.quickSignatureMatches(client, now, BASE, secret, repeat('d', 64)));
+    }
+
+    @Test public void quickEnvelopeRejectsUnknownDuplicateAndMalformedFields() throws Exception {
+        String client = repeat('b', 32), secretHex = repeat('c', 64), time = "1792291200000";
+        byte[] secret = DigestProtocol.parseHexSecret(secretHex);
+        String signature = DigestProtocol.quickSignature(client, Long.parseLong(time), BASE, secret);
+        String quick = "supernote-bridge://digest?payload=" + encode(BASE) + "&mode=quick&client=" + client
+                + "&time=" + time + "&signature=" + signature + "&setup=" + secretHex;
+        rejects(quick + "&extra=x");
+        rejects(quick + "&client=" + client);
+        rejects(quick.replace("&time=" + time, "&time=-1"));
+        rejects(quick.replace("&setup=" + secretHex, "&setup=" + repeat('G', 64)));
+        try { DigestProtocol.parseHexSecret("short"); fail("Expected invalid setup secret"); }
+        catch (DigestProtocol.InvalidPayloadException expected) { }
+    }
+
+    @Test public void quickSignatureMatchesIndependentUnicodeKnownAnswer() throws Exception {
+        byte[] secret = DigestProtocol.parseHexSecret("0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20");
+        String client = "0123456789abcdef0123456789abcdef";
+        long timestamp = 1792291200000L;
+        String rawJson = "{\"text\":\"synthetic नमस्ते\"}";
+        assertEquals("2c63fbce6fd7812c95149fb1948bcfdd2040e5d2261bf16cdee5e5e932715206",
+                DigestProtocol.quickSignature(client, timestamp, rawJson, secret));
+    }
+
+    @Test public void quickTimestampWindowIsFiveMinutesOnEitherSide() {
+        long now = 1792291200000L;
+        assertTrue(DigestProtocol.isTimestampFresh(now, now - 300000));
+        assertTrue(DigestProtocol.isTimestampFresh(now, now + 300000));
+        assertFalse(DigestProtocol.isTimestampFresh(now, now - 300001));
+        assertFalse(DigestProtocol.isTimestampFresh(now, now + 300001));
+    }
+
+    @Test public void newReceiptsEnforceListButLegacyReceiptsSkipIt() {
+        assertTrue(DigestProtocol.listAssociationMatches(null, "legacy-provider-default", false));
+        assertTrue(DigestProtocol.listAssociationMatches("list-a", "list-a", true));
+        assertFalse(DigestProtocol.listAssociationMatches("list-a", "list-b", true));
+        assertTrue(DigestProtocol.listAssociationMatches(null, null, true));
+        assertTrue(DigestProtocol.listAssociationMatches(null, "", true));
+        assertFalse(DigestProtocol.listAssociationMatches(null, "list-a", true));
+    }
+
+    @Test public void listDisplayNameUsesSafeFallbackAndWhitespaceNormalization() {
+        DigestProtocol.ListDisplayName blankDefault = DigestProtocol.normalizeListDisplayName(" \t\n ", true);
+        assertEquals("Uncategorized", blankDefault.value);
+        assertEquals("name_blank_default_fallback", blankDefault.problem);
+        DigestProtocol.ListDisplayName multiline = DigestProtocol.normalizeListDisplayName("  Study\n Notes\tToday  ", false);
+        assertEquals("Study Notes Today", multiline.value);
+        assertNull(multiline.problem);
+        assertNull(DigestProtocol.normalizeListDisplayName("\n\t", false).value);
+    }
+
+    @Test public void listDisplayNameTruncatesAndRejectsUnsafeUnicode() {
+        DigestProtocol.ListDisplayName longName = DigestProtocol.normalizeListDisplayName(repeat('x', 400), false);
+        assertEquals(256, longName.value.length());
+        assertTrue(longName.value.endsWith("…"));
+        assertEquals("name_truncated", longName.problem);
+        assertEquals("name_control", DigestProtocol.normalizeListDisplayName("Valid\u0001Name", false).problem);
+        assertEquals("name_unpaired_surrogate", DigestProtocol.normalizeListDisplayName("Bad\uD800", false).problem);
+    }
+
+    @Test public void listIdentityKeepsOnlyKnownDefaultAndBoundNondefaultAssociations() {
+        assertTrue(DigestProtocol.isValidListChoiceIdentity(0, null));
+        assertTrue(DigestProtocol.isValidListChoiceIdentity(0, ""));
+        assertFalse(DigestProtocol.isValidListChoiceIdentity(0, "unexpected"));
+        assertFalse(DigestProtocol.isValidListChoiceIdentity(-1, "known"));
+        assertFalse(DigestProtocol.isValidListChoiceIdentity(3, null));
+        assertFalse(DigestProtocol.isValidListChoiceIdentity(3, ""));
+        assertFalse(DigestProtocol.isValidListChoiceIdentity(3, repeat('a', 257)));
+        assertTrue(DigestProtocol.isValidListChoiceIdentity(3, "exact-unique-attribute"));
+    }
+
     private static void rejects(String uri) {
         try { DigestProtocol.parseDeepLink(uri); fail("Expected invalid URI"); }
         catch (DigestProtocol.InvalidPayloadException expected) { }
     }
     private static String link(String json) { return "supernote-bridge://digest?payload=" + encode(json); }
+    private static String sha256(String value) throws Exception {
+        byte[] bytes = MessageDigest.getInstance("SHA-256").digest(value.getBytes(StandardCharsets.UTF_8));
+        StringBuilder result = new StringBuilder(64); for (byte b : bytes) result.append(String.format(Locale.ROOT, "%02x", b & 0xff)); return result.toString();
+    }
     private static String encode(String value) {
         StringBuilder b = new StringBuilder();
         for (byte raw : value.getBytes(StandardCharsets.UTF_8)) {

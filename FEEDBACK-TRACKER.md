@@ -3,6 +3,19 @@
 This checklist is cumulative. Later feedback does not replace earlier requests.
 Source implementation, fixture checks, installed builds and live verification are separate states.
 
+## Reader selection actions and native Digest lists — Reader 2.2 / Bridge 0.6.0
+
+- [x] Provide four clear selection actions: Digest, Digest with note, Highlight, and Copy; keep Save quote to Obsidian secondary.
+- [x] Require explicit first-use Quick Digest approval, then use a device-local default list; support reviewed notes and list choice.
+- [x] Store Reader highlights as ordinary Markdown annotations without editing source transcripts; preserve conservative context matching and duplicate guards.
+- [x] Keep the selection dock independent of hidden status bars and make its buttons and gutters safe from page/fullscreen gestures.
+- [x] Open a context menu when saved highlighted text is tapped, with Copy, Remove highlight, applicable Digest actions, and a receipt-checked route to the native Digest Edit screen; preserve long-press selection and overlapping excerpts.
+- [x] Verify source tests, real Chromium selection/layout regressions, and the helper protocol/build/signature checks.
+- [x] Verify all four actions together on the active Nomad build, including first-use and subsequent quick saves, a detailed note/list save, duplicate prevention, and synthetic cleanup.
+- [ ] Publish the matching Reader and optional Bridge releases and update the optional Paper bundle.
+
+Native Digest-to-notebook backlinks remain unsupported: the workflow does not alter `.note` files. The separate existing page-link and Bridge Open original notebook routes are documented independently.
+
 ## Handwriting formatting and toolbar follow-up — 0.14.0
 
 - [x] Describe the sample's four heading styles, strikethrough, highlights, underlines and hand-drawn tables in the recognition prompt, preserving line reflow and source wording. No extra reference image is attached by default.
@@ -137,7 +150,10 @@ No publication, visibility change, release tag or device installation is implied
 - [x] Keep ordinary Markdown capture independent from Transcripts, Paper and Sidebar; use optional Transcripts provenance for notebook excerpts.
 - [x] Keep page provenance usable with hidden chips, chapter packing, repeated text and changed source pages.
 - [x] Verify actual Reader-to-Bridge confirmation/Cancel for ordinary and managed Markdown; test acknowledgement and uncertain outcomes with fixtures and document live-test boundaries.
-- [ ] Exercise a second disposable Digest through the production Save/acknowledgement/Open-original sequence after user authorization.
+- [x] Exercise one authorized production Save, Reader acknowledgement, same-request reopen and duplicate-prevention check; remove the acknowledged synthetic entry through native Digest UI. The exact search for a previously observed same-phrase Manual Entry returned no results later, so that older row was not deleted and its current status is unresolved. See [Validation](VALIDATION.md).
+- [ ] Verify the native Digest quick list and its trusted default behavior with a bounded read-only list inspection; do not log or publish entry labels or IDs.
+- [ ] Verify detailed Save with a synthetic note and list, including the highlight-only case.
+- [ ] Verify Reader highlight persistence and copy behavior with synthetic text, without creating extra Digest entries.
 - [x] Install verified Bridge 0.4.0, Reader 2.1.3 and Transcripts 0.15.0 artifacts on Nomad; preserve configuration, auth, recognition state and accounting, and leave recognition paused.
 - [x] Remove the known native test record, temporary Markdown fixture and disposable probe app; leave an unidentified same-text Manual Entry untouched. Restore the original Reader view and document the cleanup boundary.
 - [x] Update illustrated installation and Digest guides with the native-backlink limitation and separate live verification evidence.

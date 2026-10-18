@@ -40,7 +40,7 @@ manifest.json
 styles.css
 ```
 
-Do not copy source code or `node_modules` as a substitute for those files. **Supernote Bridge** is a separate optional Android app, used for native Notes page links and the Reader-to-Digest handoff. Download `Supernote-Bridge-0.4.0.apk` from the same release and open it on the Nomad to install; approve sideloading if prompted. Update an existing helper in place without uninstalling it. Bridge opens from Obsidian rather than adding a launcher icon. Ordinary reading, transcription and desktop-assisted sign-in do not require it. See the [helper guide](../scripts/subscription-nomad/android/README.md) for source builds and signing compatibility.
+Do not copy source code or `node_modules` as a substitute for those files. **Supernote Bridge 0.6.0** is a separate optional Android app for native Notes page links, Reader-to-Digest capture, and opening a linked saved Digest in its native detail screen. Download `Supernote-Bridge-0.6.0.apk` from the [Bridge 0.6.0 release](https://github.com/ofples/supernote-transcripts/releases/tag/bridge-v0.6.0) and open it on the Nomad to install; approve sideloading if prompted. Update an existing helper in place without uninstalling it. Bridge opens from Obsidian rather than adding a launcher icon. Ordinary reading, transcription, and desktop-assisted account pairing do not require it. See the [helper guide](../scripts/subscription-nomad/android/README.md) for source builds and signing compatibility.
 
 ## Install in Obsidian desktop
 
@@ -79,4 +79,4 @@ Open **Supernote Transcripts: Open mirrors**, add one small notebook, choose an 
 
 ## Optional companions
 
-Transcripts works independently. An optional compatible MD Reader can enhance page-link display and provide selected text for Native Digests; ordinary Markdown and transcription remain available without it. Supernote Bridge is an optional Android companion for the Digest handoff. Paper and Sidebar are also optional. They are not installed or enabled by Transcripts. See [component boundaries](../INTEGRATION.md), [page links](../PAGE_LINKS.md), and [Native Digests](native-digests.md).
+Transcripts works independently. MD Reader 2.2.0 is an optional compatible reader that provides selection actions, including Reader Highlights and Android Digest handoff. Supernote Bridge 0.6.0 is a separate optional Android companion for native Digest creation, opening a saved entry from a linked Highlight's tap menu (**Open Digest**, then use native **Edit**), and Notes page links. Highlights sync as Markdown; the Bridge receipt that authorizes opening a Digest is device-local, and removing a Highlight does not remove the native Digest. Neither Reader nor Bridge is required for ordinary Markdown reading or transcription. Paper and Sidebar are also optional; Transcripts does not install or enable them. See [component boundaries](../INTEGRATION.md), [page links](../PAGE_LINKS.md), and [Native Digests](native-digests.md).

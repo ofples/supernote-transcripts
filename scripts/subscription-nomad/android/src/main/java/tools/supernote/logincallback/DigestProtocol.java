@@ -5,6 +5,7 @@ import java.math.BigDecimal;
 import java.net.URI;
 import java.net.URISyntaxException;
 import java.net.URLEncoder;
+import java.security.MessageDigest;
 import java.nio.ByteBuffer;
 import java.nio.charset.CharacterCodingException;
 import java.nio.charset.CodingErrorAction;
@@ -17,6 +18,8 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
+import javax.crypto.Mac;
+import javax.crypto.spec.SecretKeySpec;
 
 /** Strict, Android-independent parser and validator for the external Digest request contract. */
 final class DigestProtocol {
@@ -29,10 +32,15 @@ final class DigestProtocol {
     private static final String DIGEST_SCHEME = "supernote-bridge";
     private static final String DIGEST_AUTHORITY = "digest";
     private static final String PROVIDER_AUTHORITY = "com.ratta.supernote.knowledge.provider";
+    private static final String QUICK_MAC_PREFIX = "supernote-bridge-quick-v1\n";
 
     private DigestProtocol() {}
 
     static DigestPayload parseDeepLink(String rawUri) throws InvalidPayloadException {
+        return parseEnvelope(rawUri).payload;
+    }
+
+    static RequestEnvelope parseEnvelope(String rawUri) throws InvalidPayloadException {
         if (rawUri == null || rawUri.length() > MAX_ENCODED_URI_LENGTH) throw invalid("URI length");
         final URI uri;
         try {
@@ -48,13 +56,20 @@ final class DigestProtocol {
                 || uri.getRawFragment() != null) {
             throw invalid("URI target");
         }
-        String query = uri.getRawQuery();
-        if (query == null || !query.startsWith("payload=") || query.length() <= 8
-                || query.indexOf('&') >= 0 || query.indexOf('=') != 7) {
-            throw invalid("URI query");
+        Map<String, String> query = parseQuery(uri.getRawQuery());
+        if (!query.containsKey("payload")) throw invalid("URI query");
+        String modeValue = query.getOrDefault("mode", "review");
+        RequestMode mode;
+        if ("review".equals(modeValue)) mode = RequestMode.REVIEW;
+        else if ("quick".equals(modeValue)) mode = RequestMode.QUICK;
+        else throw invalid("mode");
+        if (mode == RequestMode.REVIEW) {
+            for (String key : query.keySet()) if (!"payload".equals(key) && !"mode".equals(key)) throw invalid("review envelope field");
+        } else {
+            for (String key : query.keySet()) if (!"payload".equals(key) && !"mode".equals(key)
+                    && !"client".equals(key) && !"time".equals(key) && !"signature".equals(key) && !"setup".equals(key)) throw invalid("quick envelope field");
         }
-
-        String json = strictDecodeComponent(query.substring(8));
+        String json = strictDecodeComponent(query.get("payload"));
         if (json.length() > MAX_DECODED_JSON_LENGTH) throw invalid("JSON length");
         Object root = new JsonParser(json).parse();
         Map<String, Object> object = object(root);
@@ -71,7 +86,112 @@ final class DigestProtocol {
 
         Origin origin = parseOrigin(object(object.get("origin")));
         Note note = object.containsKey("note") ? parseNote(object(object.get("note"))) : null;
-        return new DigestPayload(json, requestId, text, origin, note);
+        DigestPayload payload = new DigestPayload(json, requestId, text, origin, note);
+        String client = query.get("client"), timeText = query.get("time"), signature = query.get("signature"), setup = query.get("setup");
+        long time = -1;
+        if (mode == RequestMode.QUICK) {
+            if (client == null || !client.matches("[0-9a-f]{32}") || timeText == null || !timeText.matches("0|[1-9][0-9]{0,15}")
+                    || signature == null || !signature.matches("[0-9a-f]{64}")
+                    || (setup != null && !setup.matches("[0-9a-f]{64}"))) throw invalid("quick signature fields");
+            try { time = Long.parseLong(timeText); } catch (NumberFormatException ignored) { throw invalid("quick timestamp"); }
+        }
+        return new RequestEnvelope(payload, mode, client, time, signature, setup);
+    }
+
+    private static Map<String, String> parseQuery(String raw) throws InvalidPayloadException {
+        if (raw == null || raw.isEmpty()) throw invalid("URI query");
+        Map<String, String> result = new LinkedHashMap<>();
+        String[] parts = raw.split("&", -1);
+        if (parts.length > 6) throw invalid("URI query count");
+        for (String part : parts) {
+            int equals = part.indexOf('=');
+            if (equals <= 0 || equals != part.lastIndexOf('=')) throw invalid("URI query pair");
+            String key = part.substring(0, equals);
+            String value = part.substring(equals + 1);
+            if (!key.matches("[a-z]+") || result.put(key, value) != null) throw invalid("URI query key");
+        }
+        return result;
+    }
+
+    static String quickSignature(String client, long time, String rawJson, byte[] secret) throws Exception {
+        if (client == null || !client.matches("[0-9a-f]{32}") || time < 0 || rawJson == null || secret == null || secret.length != 32)
+            throw new IllegalArgumentException("quick signature input");
+        Mac mac = Mac.getInstance("HmacSHA256");
+        mac.init(new SecretKeySpec(secret, "HmacSHA256"));
+        byte[] digest = mac.doFinal((QUICK_MAC_PREFIX + client + "\n" + time + "\n" + rawJson).getBytes(StandardCharsets.UTF_8));
+        StringBuilder out = new StringBuilder(64);
+        for (byte b : digest) out.append(String.format(Locale.ROOT, "%02x", b & 0xff));
+        return out.toString();
+    }
+
+    static boolean quickSignatureMatches(String client, long time, String rawJson, byte[] secret, String supplied) {
+        try { return supplied != null && MessageDigest.isEqual(quickSignature(client, time, rawJson, secret).getBytes(StandardCharsets.US_ASCII), supplied.getBytes(StandardCharsets.US_ASCII)); }
+        catch (Exception ignored) { return false; }
+    }
+
+    static byte[] parseHexSecret(String hex) throws InvalidPayloadException {
+        if (hex == null || !hex.matches("[0-9a-f]{64}")) throw invalid("quick setup secret");
+        byte[] result = new byte[32];
+        for (int i = 0; i < result.length; i++) result[i] = (byte) ((hex(hex.charAt(i * 2)) << 4) | hex(hex.charAt(i * 2 + 1)));
+        return result;
+    }
+
+    static boolean isTimestampFresh(long now, long timestamp) {
+        return timestamp >= now - 5 * 60 * 1000L && timestamp <= now + 5 * 60 * 1000L;
+    }
+
+    static boolean listAssociationMatches(String expected, String actual, boolean enforce) {
+        if (!enforce) return true;
+        return expected == null ? actual == null || actual.isEmpty() : expected.equals(actual);
+    }
+
+    static ListDisplayName normalizeListDisplayName(String raw, boolean isDefault) {
+        if (raw == null) return new ListDisplayName(isDefault ? "Uncategorized" : null, isDefault ? "name_blank_default_fallback" : "name_blank");
+        final int inputLimit = Math.min(raw.length(), 4096);
+        int end = inputLimit;
+        if (raw.length() > inputLimit && end > 0 && Character.isHighSurrogate(raw.charAt(end - 1))) end--;
+        StringBuilder normalized = new StringBuilder(Math.min(end, 256));
+        boolean pendingSpace = false;
+        for (int i = 0; i < end;) {
+            char ch = raw.charAt(i);
+            if (Character.isHighSurrogate(ch)) {
+                if (i + 1 >= end || !Character.isLowSurrogate(raw.charAt(i + 1))) return new ListDisplayName(null, "name_unpaired_surrogate");
+            } else if (Character.isLowSurrogate(ch)) return new ListDisplayName(null, "name_unpaired_surrogate");
+            int cp = raw.codePointAt(i);
+            i += Character.charCount(cp);
+            if (Character.isISOControl(cp) && !Character.isWhitespace(cp)) return new ListDisplayName(null, "name_control");
+            if (Character.isWhitespace(cp) || Character.isSpaceChar(cp) || Character.isISOControl(cp)) {
+                pendingSpace = normalized.length() > 0;
+                continue;
+            }
+            if (pendingSpace) normalized.append(' ');
+            pendingSpace = false;
+            normalized.appendCodePoint(cp);
+        }
+        String display = normalized.toString();
+        if (display.isEmpty()) return new ListDisplayName(isDefault ? "Uncategorized" : null, isDefault ? "name_blank_default_fallback" : "name_blank");
+        boolean truncated = raw.length() > end || display.length() > 256;
+        if (display.length() > 256) {
+            int cut = 255;
+            if (cut > 0 && Character.isHighSurrogate(display.charAt(cut - 1))) cut--;
+            display = display.substring(0, cut) + "…";
+        }
+        return new ListDisplayName(display, truncated ? "name_truncated" : null);
+    }
+
+    static boolean isValidListChoiceIdentity(long id, String attribute) {
+        if (id < 0) return false;
+        if (id == 0) return attribute == null || attribute.isEmpty();
+        if (attribute == null || attribute.isEmpty() || attribute.length() > 256) return false;
+        for (int i = 0; i < attribute.length(); i++) {
+            char ch = attribute.charAt(i);
+            if (Character.isISOControl(ch)) return false;
+            if (Character.isHighSurrogate(ch)) {
+                if (i + 1 >= attribute.length() || !Character.isLowSurrogate(attribute.charAt(i + 1))) return false;
+                i++;
+            } else if (Character.isLowSurrogate(ch)) return false;
+        }
+        return true;
     }
 
     static String strictDecodeComponent(String value) throws InvalidPayloadException {
@@ -153,9 +273,15 @@ final class DigestProtocol {
     }
 
     static String manualComment(DigestPayload payload) throws InvalidPayloadException {
+        return manualComment(payload, "");
+    }
+
+    static String manualComment(DigestPayload payload, String userNote) throws InvalidPayloadException {
+        if (userNote == null) userNote = "";
         String uri = "obsidian://open?vault=" + encodeQuery(payload.origin.vault)
                 + "&file=" + encodeQuery(payload.origin.file);
         StringBuilder comment = new StringBuilder();
+        if (!userNote.trim().isEmpty()) comment.append("Note: ").append(userNote.trim()).append("\n\n");
         if (payload.note != null) comment.append("Supernote: ").append(fileName(payload.note.path))
                 .append(" · page ").append(payload.note.page).append('\n');
         comment.append("Obsidian: ").append(payload.origin.file).append('\n').append(uri);
@@ -393,6 +519,25 @@ final class DigestProtocol {
             this.origin = origin;
             this.note = note;
         }
+    }
+
+    enum RequestMode { REVIEW, QUICK }
+
+    static final class RequestEnvelope {
+        final DigestPayload payload;
+        final RequestMode mode;
+        final String client, signature, setupHex;
+        final long time;
+        RequestEnvelope(DigestPayload payload, RequestMode mode, String client, long time, String signature, String setupHex) {
+            this.payload = payload; this.mode = mode; this.client = client; this.time = time; this.signature = signature; this.setupHex = setupHex;
+        }
+        boolean isQuick() { return mode == RequestMode.QUICK; }
+    }
+
+    static final class ListDisplayName {
+        final String value;
+        final String problem;
+        ListDisplayName(String value, String problem) { this.value = value; this.problem = problem; }
     }
 
     static final class Origin {
