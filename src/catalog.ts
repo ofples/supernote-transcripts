@@ -60,8 +60,14 @@ function portable(input: PortableMirror): PortableMirror {
   // Explicit whitelist strips API keys, source mounts, pauses and execution settings.
   if (p.quality !== undefined && !["fast", "balanced", "careful"].includes(p.quality))
     throw new Error("Invalid shared transcription quality.");
+  if (p.preserveFormatting !== undefined && typeof p.preserveFormatting !== "boolean")
+    throw new Error("Invalid shared formatting preference.");
+  if (p.formattingGuide !== undefined && (typeof p.formattingGuide !== "string" || p.formattingGuide.length > 10_000 || p.formattingGuide.includes("\0")))
+    throw new Error("Invalid shared formatting cues.");
   return { profile: { id: p.id, name: p.name, model: p.model, endpoint: p.endpoint,
-    prompt: p.prompt, glossaries, ...(p.quality === undefined ? {} : { quality: p.quality }) }, output: input.output, recursive: input.recursive, exclude };
+    prompt: p.prompt, glossaries, ...(p.quality === undefined ? {} : { quality: p.quality }),
+    ...(p.preserveFormatting === undefined ? {} : { preserveFormatting: p.preserveFormatting }),
+    ...(p.formattingGuide === undefined ? {} : { formattingGuide: p.formattingGuide }) }, output: input.output, recursive: input.recursive, exclude };
 }
 async function validate(value: any): Promise<SharedMirror> {
   if (!value || value.kind !== "mirror" || value.version !== 1 ||

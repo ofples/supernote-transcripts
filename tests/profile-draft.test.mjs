@@ -13,6 +13,21 @@ test("user field edits merge with independent current changes and identical conc
   assert.equal(merged[0].prompt,"our instructions");assert.equal(merged[0].model,"remote model");
   current[0].prompt=draft[0].prompt;assert.deepEqual(mergeProfileDrafts(current,base,draft),merged);
 });
+test("formatting preference and cue edits merge independently and preserve explicit empty cues",()=>{
+  const base=[{...profile(),preserveFormatting:false,formattingGuide:"base cues"}],draft=structuredClone(base),current=structuredClone(base);
+  draft[0].preserveFormatting=true;current[0].formattingGuide="remote cues";
+  const merged=mergeProfileDrafts(current,base,draft);
+  assert.equal(merged[0].preserveFormatting,true);assert.equal(merged[0].formattingGuide,"remote cues");
+  draft[0].formattingGuide="";
+  assert.equal(mergeProfileDrafts(base,base,draft)[0].formattingGuide,"");
+});
+test("concurrent formatting cue conflicts are reported and clearing an override deletes it",()=>{
+  const base=[profile()],draft=structuredClone(base),current=structuredClone(base);
+  draft[0].formattingGuide="ours";current[0].formattingGuide="theirs";
+  assert.throws(()=>mergeProfileDrafts(current,base,draft),/formattingGuide/);
+  const overridden=[{...profile(),formattingGuide:"custom"}],clear=[profile()];
+  assert.equal(Object.hasOwn(mergeProfileDrafts(overridden,overridden,clear)[0],"formattingGuide"),false);
+});
 test("divergent edits throw without changing any current or draft profiles",()=>{
   const base=[profile()],draft=structuredClone(base),current=structuredClone(base);
   draft[0].prompt="ours";draft[0].glossaries=["Our terms.md"];current[0].prompt="theirs";

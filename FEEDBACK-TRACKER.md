@@ -3,6 +3,25 @@
 This checklist is cumulative. Later feedback does not replace earlier requests.
 Source implementation, fixture checks, installed builds and live verification are separate states.
 
+## Handwriting formatting and toolbar follow-up — 0.14.0
+
+- [x] Describe the sample's four heading styles, strikethrough, highlights, underlines and hand-drawn tables in the recognition prompt, preserving line reflow and source wording. No extra reference image is attached by default.
+- [x] Default formatting On; support source Default/On/Off and editable/inherited visual cues. Preserve saved user instructions and sync effective source settings.
+- [x] Exclude generated Page N headings whenever a source's formatting is enabled; retain original-page metadata and navigation chips. Preserve existing formatting during text-only cleanup.
+- [x] Hash formatting settings into recognition recipes/provenance, leave existing pages cached until explicitly re-recognized, and include guidance in provisional API estimates.
+- [x] Pass 528 source tests and 855 current synthetic UI assertions, plus focused formatting UI inheritance/save checks.
+- [x] Run the single user-approved isolated Sol sample test: all four heading levels, strike/highlight/underline and three-column table were correctly returned. Keep output private and outside the vault; preserve the queue and record the single usage entry.
+- [x] Stage the frozen desktop 0.14.0 assets while Obsidian is closed; preserve configuration/state/auth.
+- [x] Activate the frozen 0.14.0 build on the Nomad without further recognition requests; this records asset activation and preservation checks only.
+- [ ] Inspect 0.14.0 formatting settings with a Cancel-only check; the Nomad disconnected after activation before this inspection.
+- [ ] Install the frozen Paper Sidebar 0.4.2 direct Read/Edit change on the Nomad and verify it with physical taps. Source implementation and tests are complete in the Paper repo; keep Reader scrolling settings unchanged.
+
+## Document page-link visibility — 0.13.2
+
+- [x] Add the contextual per-document visibility control beside the mode control, with local persistence and optional Reader/Sidebar support.
+- [x] Verify physical MD Reader hide/show on Nomad, 48×48 alignment and ordinary-note hiding; preserve notes and leave recognition paused.
+- [ ] Verify core Reading/Live Preview on the physical Nomad; source fixtures cover these paths.
+
 ## Preview speed and simplified notebook controls — 0.13.1
 
 - [x] Render original-page previews without fingerprinting unrelated pages; retain revision and selected-content checks, deduplicate pending renders and bound the revision-aware memory cache.
@@ -104,6 +123,6 @@ See [the readiness findings](PRODUCTION-READINESS.md) for severity, fixes and re
 - [x] Standalone Transcripts, canonical MD Reader and optional Paper/Sidebar boundaries documented and source-checked.
 - [x] Paper packages a pinned, hash-verified canonical Reader artifact with an offline build.
 - [x] MIT selected and applied to original Paper/Sidebar code; Reader MIT, font OFL and Transcripts GPL notices retained.
-- [x] Native Digests integration remains deferred.
+- [ ] Native Digests remains an open feasibility enhancement: static inspection found a candidate Android provider route, but no native creation/backlink test or implementation exists. See the [reader enhancement](https://github.com/ofples/obsidian-md-reader/issues/1).
 
 No publication, visibility change, release tag or device installation is implied by a checked source item.

@@ -1,5 +1,5 @@
 /** @typedef {import("./types").Profile} Profile */
-const fields = ["name", "model", "endpoint", "prompt", "glossaries", "quality"];
+const fields = ["name", "model", "endpoint", "prompt", "glossaries", "quality", "preserveFormatting", "formattingGuide"];
 const clone = profile => ({ ...profile, glossaries: [...profile.glossaries] });
 const equal = (a, b, field) => JSON.stringify(field === "quality" ? a ?? "fast" : a) ===
   JSON.stringify(field === "quality" ? b ?? "fast" : b);

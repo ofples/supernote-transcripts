@@ -13,7 +13,7 @@ const clone = (value: PortableMirror): PortableMirror => ({
   output: value.output, recursive: value.recursive, exclude: [...value.exclude],
 });
 const equal = (a: unknown, b: unknown) => JSON.stringify(a) === JSON.stringify(b);
-const fields = ["model", "endpoint", "prompt", "glossaries", "quality"] as const;
+const fields = ["model", "endpoint", "prompt", "glossaries", "quality", "preserveFormatting", "formattingGuide"] as const;
 /** Identity and display names belong to each device; only recipe and selection values reconcile. */
 export function portableMirrorEqual(a: PortableMirror, b: PortableMirror): boolean {
   return a.output === b.output && a.recursive === b.recursive && equal(a.exclude, b.exclude) &&
@@ -38,7 +38,9 @@ export function reconcileMirror(local: PortableMirror, baseline: MirrorBaseline 
   };
   for (const key of fields) {
     const get = (item: PortableMirror) => key === "quality" ? item.profile[key] ?? "fast" : item.profile[key];
-    (value.profile as any)[key] = merge(`profile.${key}`, get(local), get(baseline), get(remote));
+    const merged = merge(`profile.${key}`, get(local), get(baseline), get(remote));
+    if (key === "quality" || merged !== undefined) (value.profile as any)[key] = merged;
+    else delete (value.profile as any)[key];
   }
   for (const key of ["output", "recursive", "exclude"] as const)
     (value as any)[key] = merge(key, local[key], baseline[key], remote[key]);

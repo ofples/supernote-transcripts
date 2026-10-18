@@ -311,7 +311,7 @@ test("document cleanup uses one text-only high-reasoning request, backs up and p
   const f=await populatedCleanupFixture(2),state=f.plugin.store.notebooks[source],raw=structuredClone(state.pages),before=f.files.get("Mirror/a.md"),calls=f.calls.length,requests=f.plugin.costs.total.requests,pages=f.plugin.costs.total.pages;
   await f.plugin.cleanupDocument(source);const request=f.calls.at(-1),content=request.input[0].content;
   assert.equal(f.calls.length,calls+1);assert.equal(content.filter(item=>item.type==="input_image").length,0);assert.equal(content.filter(item=>item.type==="input_text").length,1);
-  assert.equal(request.reasoning.effort,"high");assert.match(content[0].text,/Original page map/);assert.match(content[0].text,/Page 1/);assert.match(content[0].text,/Page 2/);
+  assert.equal(request.reasoning.effort,"high");assert.match(content[0].text,/Original page map/);assert.match(content[0].text,/"number":1/);assert.match(content[0].text,/"number":2/);assert.match(content[0].text,/supernote-page:native%3A1/);assert.match(content[0].text,/supernote-page:native%3A2/);
   assert.equal(f.plugin.costs.total.requests,requests+1);assert.equal(f.plugin.costs.total.pages,pages+2);assert.deepEqual(state.pages,raw);
   assert.notEqual(f.files.get("Mirror/a.md"),before);assert.match(f.files.get("Mirror/a.md"),/clean page 1/);assert.match(f.files.get("Mirror/a.md"),/clean page 2/);
   const history=f.plugin.store.history.filter(path=>path.endsWith("Previous version.md"));assert.equal(history.length,1);
@@ -1584,10 +1584,59 @@ test("a desktop mount reuses Nomad results and publishes safely without paying t
   assert.equal(Object.keys(b.plugin.store.notebooks[local].pages).length,3);
   await b.plugin.update();assert.equal(b.calls.length,1);
 });
-test("header presentation changes reuse cached pages and preserve hidden page provenance",async()=>{
-  const f=fixture(2);await f.plugin.update();assert.ok(f.files.get("Mirror/a.md").includes("## Page 1"));
+test("header presentation changes reuse cached pages and preserve hidden page provenance when formatting is off",async()=>{
+  const f=fixture(2);f.plugin.config.profiles[0].preserveFormatting=false;await f.plugin.update();assert.ok(f.files.get("Mirror/a.md").includes("## Page 1"));
   f.plugin.showPageHeadings=false;await f.plugin.update();
   assert.equal(f.calls.length,2);assert.ok(f.files.get("Mirror/a.md").includes("supernote-page:"));assert.ok(!f.files.get("Mirror/a.md").includes("## Page 1"));
+});
+
+test("formatting prompts reach both grouped and single-page fallback requests",async()=>{
+  const f=fixture(2);await f.plugin.update();
+  const groupPrompt=f.calls[0].input[0].content.find(item=>item.type==="input_text").text;
+  assert.match(groupPrompt,/Handwriting formatting is on/);
+  assert.match(groupPrompt,/Use # through ####/);
+
+  const resolved=await f.plugin.profile("general");
+  const before=f.calls.length;
+  await f.plugin.transcribe("image:fallback",3,resolved.profile,resolved.reference,source,resolved.recipe);
+  assert.equal(f.calls.length,before+1);
+  const fallbackPrompt=f.calls.at(-1).input[0].content.find(item=>item.type==="input_text").text;
+  assert.match(fallbackPrompt,/Handwriting formatting is on/);
+  assert.match(fallbackPrompt,/Use # through ####/);
+});
+
+test("formatting cues and enablement change the recipe without automatically rerunning cached pages",async()=>{
+  const f=fixture(1);await f.plugin.update();
+  const state=f.plugin.store.notebooks[source],cachedText=state.pages["native:1"].text;
+  const initial=await f.plugin.profile("general");
+  f.plugin.config.profiles[0].formattingGuide="A dotted rectangular border means heading 2.";
+  const customCue=await f.plugin.profile("general");
+  assert.notEqual(customCue.recipe,initial.recipe);
+  assert.notEqual(customCue.promptHash,initial.promptHash);
+  f.plugin.config.profiles[0].preserveFormatting=false;
+  const disabled=await f.plugin.profile("general");
+  assert.notEqual(disabled.recipe,customCue.recipe);
+  assert.notEqual(disabled.promptHash,customCue.promptHash);
+
+  const before=f.calls.length;
+  await f.plugin.update();
+  assert.equal(f.calls.length,before);
+  assert.equal(state.pages["native:1"].text,cachedText);
+});
+
+test("formatting suppresses synthetic page headings but keeps stable inline page markers",async()=>{
+  const f=fixture(2);f.plugin.config.showPageHeadings=true;await f.plugin.update();
+  const markdown=f.files.get("Mirror/a.md");
+  assert.doesNotMatch(markdown,/^## Page \d+$/m);
+  assert.match(markdown,/<!-- supernote-page:native%3A1 number:1 -->/);
+  assert.match(markdown,/<!-- supernote-page:native%3A2 number:2 -->/);
+});
+
+test("formatting off preserves configured synthetic page headings",async()=>{
+  const f=fixture(2);f.plugin.config.showPageHeadings=true;f.plugin.config.profiles[0].preserveFormatting=false;await f.plugin.update();
+  const markdown=f.files.get("Mirror/a.md");
+  assert.match(markdown,/^## Page 1$/m);
+  assert.match(markdown,/^## Page 2$/m);
 });
 
 test("subscription interruption acknowledgement retains request counts and leaves API accounting untouched", async () => {
@@ -2581,6 +2630,37 @@ test("shared settings publish a baseline and background refresh stays read-only 
   assert.equal(mirrorRecord(f).record.output,"Mirror");
   assert.equal(f.plugin.config.rules[0].sharedBaseline.profile.prompt,"transcribe");
   assert.equal(f.calls.length,0);
+});
+
+test("shared source settings materialize inherited formatting so devices use the same recipe",async()=>{
+  const nomad=settingsFixture("formatting-portable-nomad");
+  const general=nomad.plugin.config.profiles[0];
+  general.preserveFormatting=false;
+  general.formattingGuide="A double border means a section heading.";
+  const sourceProfile={...general,id:"source-style",name:"Source style"};
+  delete sourceProfile.preserveFormatting;
+  delete sourceProfile.formattingGuide;
+  nomad.plugin.config.profiles.push(sourceProfile);
+  nomad.plugin.config.rules[0].profileId=sourceProfile.id;
+  await nomad.plugin.saveConfig();
+
+  const portable=mirrorRecord(nomad).record.profile;
+  assert.equal(portable.preserveFormatting,false);
+  assert.equal(portable.formattingGuide,"A double border means a section heading.");
+  assert.equal(sourceProfile.preserveFormatting,undefined);
+  assert.equal(sourceProfile.formattingGuide,undefined);
+
+  const desktop=settingsFixture("formatting-portable-desktop");
+  for(const [path,text]of nomad.files)if(!path.startsWith(".obsidian"))desktop.files.set(path,text);
+  await desktop.plugin.refreshSharedSettings();
+  const desktopProfile=activeRuleProfile(desktop);
+  assert.equal(desktopProfile.preserveFormatting,false);
+  assert.equal(desktopProfile.formattingGuide,"A double border means a section heading.");
+  const nomadResolved=await nomad.plugin.profile("source-style");
+  const desktopResolved=await desktop.plugin.profile(desktop.plugin.config.rules[0].profileId);
+  assert.equal(desktopResolved.recipe,nomadResolved.recipe);
+  assert.equal(desktopResolved.promptHash,nomadResolved.promptHash);
+  assert.equal(nomad.calls.length,0);assert.equal(desktop.calls.length,0);
 });
 
 test("shared remote recipe and output refresh preserve local mounts and execution choices",async()=>{

@@ -22,7 +22,7 @@ function fixture() {
   return { files, io, catalog: new MirrorCatalog(io), make: () => new MirrorCatalog(io) };
 }
 const portable = () => ({
-  profile: { id: "general", name: "General", model: "vision-model", endpoint: "https://example.test/v1/responses", quality: "balanced",
+  profile: { id: "general", name: "General", model: "vision-model", endpoint: "https://example.test/v1/responses", quality: "balanced", preserveFormatting: true, formattingGuide: "Use marked headings and highlights.",
     prompt: "Transcribe this page faithfully.", glossaries: ["References/Glossary.md", "References/Terms.txt"] },
   output: "Supernote Transcripts/Transcripts", recursive: true, exclude: ["existing/a.note", "Private/**", "literal\\*.note"],
 });
@@ -47,6 +47,12 @@ test("catalog round-trips quality and keeps old records without quality readable
   delete old.revision; delete old.ancestors;
   f.files.set(path, envelope(old));
   assert.equal((await f.make().load("careful")).profile.quality, undefined);
+});
+test("catalog round-trips formatting defaults, including an explicit empty guide", async () => {
+  const f=fixture(), input=portable(); input.profile.preserveFormatting=false; input.profile.formattingGuide="";
+  await f.catalog.save("formatting","Formatting",input);
+  const saved=await f.make().load("formatting");
+  assert.equal(saved.profile.preserveFormatting,false);assert.equal(saved.profile.formattingGuide,"");
 });
 test("only portable whitelist fields are written, never source mounts, credentials or execution settings", async () => {
   const f = fixture(), input = portable();
@@ -89,6 +95,9 @@ test("catalog rejects native paths, traversal, nonportable references and secret
     (r) => { r.profile.endpoint = "https://example.test/v1#secret"; },
     (r) => { r.profile.endpoint = "file:///private/key"; },
     (r) => { r.profile.quality = "unlimited"; },
+    (r) => { r.profile.preserveFormatting = "yes"; },
+    (r) => { r.profile.formattingGuide = 100; },
+    (r) => { r.profile.formattingGuide = "x".repeat(10_001); },
   ];
   for (const change of modifications) {
     const f = fixture(), input = portable();

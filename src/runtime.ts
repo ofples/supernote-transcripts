@@ -23,7 +23,7 @@ import { SubscriptionUsage } from "./subscription-usage";
 import { encodeStateSnapshot, loadStateSlots, STATE_STORAGE_BLOCK } from "./state";
 import { interruptedAttempts } from "./attempt-recovery.mjs";
 import { RecognitionFailure, isRecognitionFailure, completedResponse, normalizePageText, isEmptyPage, providerFailure } from "./subscription-stream.mjs";
-import { GENERAL_TRANSCRIPTION_PROMPT, TRANSCRIPTION_RESPONSE_RULES, GROUP_RESPONSE_RULES, recognitionPrompt } from "./prompts.mjs";
+import { GENERAL_TRANSCRIPTION_PROMPT, TRANSCRIPTION_RESPONSE_RULES, GROUP_RESPONSE_RULES, recognitionPrompt, resolveFormatting, handwritingFormattingPrompt } from "./prompts.mjs";
 import { qualitySettings, planRecognitionGroups, contextPages } from "./quality.mjs";
 import { cleanupInput, cleanupPages, DEFAULT_CLEANUP_PROMPT, stripPageComments } from "./cleanup.mjs";
 import { restorePath, readRestore, writeRestore, restoredState } from "./restore";
@@ -66,6 +66,7 @@ const DEFAULT_PROFILE: Profile = {
   prompt: GENERAL_PROMPT,
   glossaries: [],
   quality: "balanced",
+  preserveFormatting: true,
 };
 const freshConfig = (): ConfigV1 => ({
   version: 1,
@@ -153,7 +154,14 @@ export default class SupernoteTranscripts extends Plugin implements Controller {
   get provider(): "api" | "subscription" { return localStorage.getItem(`${this.devicePrefix}:provider`)==="subscription"?"subscription":"api"; }
   set provider(value:"api"|"subscription") { if(this.task)throw Error("Pause and wait for active requests before changing provider."); localStorage.setItem(`${this.devicePrefix}:provider`,value);this.emit(); }
   get showPageHeadings() { return this.config.showPageHeadings!==false; }
-  set showPageHeadings(value:boolean) { this.config.showPageHeadings=value;for(const s of Object.values(this.store.notebooks))if(this.sourceSelected(s.source)&&!["missing","conflict"].includes(s.status))this.enqueue(s.source);this.emit(); }
+  set showPageHeadings(value:boolean) { if(this.showPageHeadings===value)return;this.config.showPageHeadings=value;for(const s of Object.values(this.store.notebooks))if(this.sourceSelected(s.source)&&!["missing","conflict"].includes(s.status))this.enqueue(s.source);this.emit(); }
+  /** Authored heading levels and synthetic Page N headings cannot share an output. */
+  private pageHeadingsFor(state: NotebookState): boolean {
+    const rule = this.config.rules.find(rule => rule.id === state.ruleId) ?? ruleFor(state.source, this.config.rules);
+    const general = this.config.profiles.find(profile => profile.id === "general") ?? this.config.profiles[0];
+    const profile = this.config.profiles.find(profile => profile.id === rule?.profileId) ?? general;
+    return this.showPageHeadings && !resolveFormatting(profile, general).enabled;
+  }
   private subscriptionRecovery?: Promise<void>;
   private get session() { return this.chatGPT??=new ChatGPTSession(this.app,()=>{
     this.emit();
@@ -436,7 +444,7 @@ export default class SupernoteTranscripts extends Plugin implements Controller {
       if(this.provider==="api"){
         const cost=(avg as {usd?:number}).usd;
         if(cost!==undefined)usd+=cost*n;
-        else{const price=priceFor(p.endpoint,p.model,this.costs.settings);provisional=true;if(price)usd+=groups.reduce((sum,g)=>sum+(3000*(g.length+contextPages(g,s.desired,p.quality).length)*price.input+(1000*g.length+(qualitySettings(p.quality).mode==="careful"?4000:qualitySettings(p.quality).mode==="balanced"?2000:0))*price.output)/1e6,0);else priced=false;}
+        else{const price=priceFor(p.endpoint,p.model,this.costs.settings);provisional=true;const formattingTokens=Math.ceil(handwritingFormattingPrompt(p,this.config.profiles.find(profile=>profile.id==="general")).length/2);if(price)usd+=groups.reduce((sum,g)=>sum+((3000*(g.length+contextPages(g,s.desired,p.quality).length)+formattingTokens)*price.input+(1000*g.length+(qualitySettings(p.quality).mode==="careful"?4000:qualitySettings(p.quality).mode==="balanced"?2000:0))*price.output)/1e6,0);else priced=false;}
       }
     }
     return {pages,usd:this.provider==="api"&&priced?usd:undefined,reservationUsd:this.provider==="api"?(source?this.costs.notebooks.find(n=>n.source===source)?.heldUsd??0:this.costs.total.heldUsd):undefined,samples,provisional:provisional||!samples,seconds:timed?seconds:undefined,requests};
@@ -731,7 +739,8 @@ export default class SupernoteTranscripts extends Plugin implements Controller {
   private portableSettings(rule: FolderRule): PortableMirror {
     const profile=this.config.profiles.find(p=>p.id===rule.profileId);
     if(!profile)throw Error("Choose recognition settings for this source.");
-    return {profile:clone(profile),output:rule.output,recursive:rule.recursive,exclude:[...rule.exclude]};
+    const formatting=resolveFormatting(profile,this.config.profiles.find(p=>p.id==="general")??this.config.profiles[0]);
+    return {profile:{...clone(profile),preserveFormatting:formatting.enabled,formattingGuide:formatting.guide},output:rule.output,recursive:rule.recursive,exclude:[...rule.exclude]};
   }
   private applyPortableSettings(rule: FolderRule, value: PortableMirror, profileId: string) {
     const before=this.portableSettings(rule);
@@ -976,6 +985,7 @@ export default class SupernoteTranscripts extends Plugin implements Controller {
     }
   }
   private validateConfig() {
+    for(const profile of this.config.profiles)resolveFormatting(profile,this.config.profiles.find(p=>p.id==="general")??this.config.profiles[0]);
     if(this.config.cleanupPrompt!==undefined&&(typeof this.config.cleanupPrompt!=="string"||this.config.cleanupPrompt.length>20000))
       throw Error("Keep the default cleanup instructions within 20,000 characters.");
     if (!this.config.rules.some((r) => r.enabled))
@@ -1000,6 +1010,10 @@ export default class SupernoteTranscripts extends Plugin implements Controller {
     const found = this.config.profiles.find((p) => p.id === id);
     if (!found) throw new Error("Transcription profile was removed.");
     const profile = clone(found);
+    const formatting = resolveFormatting(profile, this.config.profiles.find(p => p.id === "general") ?? this.config.profiles[0]);
+    profile.preserveFormatting = formatting.enabled;
+    profile.formattingGuide = formatting.guide;
+    const visualRules = handwritingFormattingPrompt(profile);
     let reference = "";
     for (const path of profile.glossaries) {
       validateDestination(path);
@@ -1016,13 +1030,13 @@ export default class SupernoteTranscripts extends Plugin implements Controller {
     }
     if (reference.length > 150000)
       throw new Error("Combined glossaries are too large.");
-    const recipe = await hash(JSON.stringify([profile.model, this.provider==="subscription"?"https://api.openai.com/v1/responses":profile.endpoint,profile.prompt,reference,TRANSCRIPTION_RESPONSE_RULES,qualitySettings(profile.quality),GROUP_RESPONSE_RULES,"group-json-v1"]));
+    const recipe = await hash(JSON.stringify([profile.model, this.provider==="subscription"?"https://api.openai.com/v1/responses":profile.endpoint,profile.prompt,reference,TRANSCRIPTION_RESPONSE_RULES,qualitySettings(profile.quality),GROUP_RESPONSE_RULES,"group-json-v1",visualRules]));
     this.recipes.set(id,recipe);
     return {
       profile,
       reference,
       recipe,
-      promptHash: await hash(profile.prompt),
+      promptHash: await hash(JSON.stringify([profile.prompt,visualRules])),
       glossaryHash: await hash(reference),
     };
   }
@@ -1622,8 +1636,8 @@ export default class SupernoteTranscripts extends Plugin implements Controller {
         await this.relocateOutput(state, destination, true);
       const before = clone(state);
       if (state.publishedHash && !state.publishedPages?.length &&
-          (await hash(buildMarkdown(before, this.showPageHeadings)) === state.publishedHash ||
-           await hash(buildMarkdown(before, !this.showPageHeadings)) === state.publishedHash))
+          (await hash(buildMarkdown(before, this.pageHeadingsFor(before))) === state.publishedHash ||
+           await hash(buildMarkdown(before, !this.pageHeadingsFor(before))) === state.publishedHash))
         state.publishedPages = clone(before.desired);
       state.status = "checking";
       delete state.error;
@@ -1832,7 +1846,7 @@ export default class SupernoteTranscripts extends Plugin implements Controller {
             .filter(Boolean).join("\n").slice(0,qualitySettings(resolved.profile.quality).textContextChars);
           // Snapshot group identities and context; late cache arrivals cancel and replan unsent targets in this update.
           const requestTargets=targets.slice();
-          const prompt=recognitionPrompt(resolved.profile.prompt,resolved.reference,targets,context,textContext,resolved.profile.quality);
+          const prompt=recognitionPrompt(resolved.profile.prompt,resolved.reference,targets,context,textContext,resolved.profile.quality,resolveFormatting(resolved.profile));
           state.status="recognizing";phase="recognize";
           this.progress.activePage={source:entry.path,number:targets[0].number,total:descriptor.pages.length};
           this.progress.renderingContext=false;
@@ -1908,7 +1922,7 @@ export default class SupernoteTranscripts extends Plugin implements Controller {
     finally { this.task = null; this.emit(); }
   }
   private recoverySignature(state: NotebookState) {
-    return JSON.stringify([state, this.showPageHeadings, this.config.rules]);
+    return JSON.stringify([state, this.pageHeadingsFor(state), this.config.rules]);
   }
   private ownedLegacyAppend(state: NotebookState, receipt: Receipt, actualHash: string) {
     const tips = receipt.candidates ?? [receipt];
@@ -1962,8 +1976,8 @@ export default class SupernoteTranscripts extends Plugin implements Controller {
       // Reconcile a private working copy only. Source edits may have accumulated
       // while output publishing was blocked by the user's Markdown corrections.
       if (state.publishedHash && !state.publishedPages?.length &&
-          (await hash(buildMarkdown(originalState, this.showPageHeadings)) === state.publishedHash ||
-           await hash(buildMarkdown(originalState, !this.showPageHeadings)) === state.publishedHash))
+          (await hash(buildMarkdown(originalState, this.pageHeadingsFor(originalState))) === state.publishedHash ||
+           await hash(buildMarkdown(originalState, !this.pageHeadingsFor(originalState))) === state.publishedHash))
         state.publishedPages = clone(originalState.desired);
       const reconciled = reconcilePages(state.pages, descriptor.pages);
       state.pages = reconciled.pages as NotebookState["pages"];
@@ -2001,7 +2015,7 @@ export default class SupernoteTranscripts extends Plugin implements Controller {
       try { pageId = decodeURIComponent(marker[1]); } catch { throw Error("Invalid transcript page ownership marker."); }
       if (!known.has(pageId)) throw Error("Transcript contains pages missing from this local .note source. Refresh that source before recovering.");
     }
-    const generated = buildMarkdown(state, this.showPageHeadings);
+    const generated = buildMarkdown(state, this.pageHeadingsFor(state));
     if (current === generated || await hash(current) === state.publishedHash)
       throw Error("Transcript no longer has manual changes. Check sources instead.");
     await this.recoveryReceipts(state, current, generated, id);
@@ -2064,10 +2078,10 @@ export default class SupernoteTranscripts extends Plugin implements Controller {
           next.output = output; next.outputOverride = output;
           await this.ensureFolder(output); await assertCurrent();
           // create refuses an unexpected file appearing after the availability check.
-          await this.app.vault.create(output, buildMarkdown(next, this.showPageHeadings));
+          await this.app.vault.create(output, buildMarkdown(next, this.pageHeadingsFor(next)));
           await assertCurrent();
         }
-        const generated = buildMarkdown(next, this.showPageHeadings);
+        const generated = buildMarkdown(next, this.pageHeadingsFor(next));
         if (await this.app.vault.adapter.read(next.output) !== generated)
           throw Error("Generated transcript was manually edited before recovery completed.");
         const io = this.sharedIO();
@@ -2105,7 +2119,7 @@ export default class SupernoteTranscripts extends Plugin implements Controller {
       "Saving Markdown",
       `${state.output}. This is a local save; Obsidian Sync delivers it separately.`,
     );
-    const text = buildMarkdown(state,this.showPageHeadings),
+    const text = buildMarkdown(state,this.pageHeadingsFor(state)),
       path = state.output;
     await this.ensureFolder(path);
     const exists = await this.app.vault.adapter.exists(path);
@@ -2205,7 +2219,7 @@ export default class SupernoteTranscripts extends Plugin implements Controller {
         await this.persist();
       }
       if (state.publishedHash !== actual) {
-        if (text === buildMarkdown(state,this.showPageHeadings) || text===buildMarkdown(state,!this.showPageHeadings)) {
+        if (text === buildMarkdown(state,this.pageHeadingsFor(state)) || text===buildMarkdown(state,!this.pageHeadingsFor(state))) {
           state.publishedHash = actual;
           state.publishedPages = clone(state.desired);
           await this.persist();
@@ -2271,7 +2285,7 @@ export default class SupernoteTranscripts extends Plugin implements Controller {
       if(!await claimReady())return null;
       let reservation:string|undefined;
       try{
-        const result=await this.session.recognize(profile.model,image,group?.prompt??`${profile.prompt}${reference}\n\n${TRANSCRIPTION_RESPONSE_RULES}\n\nTranscribe page ${page}.`,async()=>{
+        const result=await this.session.recognize(profile.model,image,group?.prompt??`${profile.prompt}${reference}\n\n${handwritingFormattingPrompt(profile)}\n\n${TRANSCRIPTION_RESPONSE_RULES}\n\nTranscribe page ${page}.`,async()=>{
           if(!await claimReady())return false;
           if(this.stop||this.disposed||!this.active||!this.aiEnabled||this.sourcePaused(source)||this.progress.budgetBlocked||this.progress.executionBlocked)return false;
           reservation=this.subscriptionBook.reserve(source,profile.model,recipe,this.costs.settings.dailyRequests,this.store.notebooks[source]?.desired.find(p=>p.number===page)?.id,page,fingerprint,targets);this.callsThisRun++;this.stage(group?.textOnly?"Cleaning document":"Recognizing",`${source.split("/").pop()} — ${group?.textOnly?"one text-only request":group?`pages ${group.targets.map(p=>p.number).join(", ")}`:`page ${page}`}`);this.emit();return true;
@@ -2303,7 +2317,7 @@ export default class SupernoteTranscripts extends Plugin implements Controller {
         content: [
           {
             type: "input_text",
-            text: group?.prompt??`${profile.prompt}${reference}\n\n${TRANSCRIPTION_RESPONSE_RULES}\n\nTranscribe page ${page}.`,
+            text: group?.prompt??`${profile.prompt}${reference}\n\n${handwritingFormattingPrompt(profile)}\n\n${TRANSCRIPTION_RESPONSE_RULES}\n\nTranscribe page ${page}.`,
           },
           ...(group?group.images.flatMap(item=>[{type:"input_text",text:item.label},{type:"input_image",image_url:item.image,detail:"original"}]):[{ type: "input_image", image_url: image, detail: "original" }]),
         ],
@@ -2639,7 +2653,7 @@ export default class SupernoteTranscripts extends Plugin implements Controller {
       try {if(JSON.stringify(opened.descriptor.pages)!==JSON.stringify(state.desired))throw Error("The notebook has changed. Update its mirrored pages before cleanup.");}
       finally {opened.close();}
       const revision=await reader.revision(source);
-      const signatureNow=()=>JSON.stringify([original.output,original.outputOverride,original.desired,original.pages,original.deviceOcr,ruleFor(source,this.config.rules),this.config.profiles.find(p=>p.id===rule.profileId),this.showPageHeadings,this.config.cleanupPrompt]);
+      const signatureNow=()=>JSON.stringify([original.output,original.outputOverride,original.desired,original.pages,original.deviceOcr,ruleFor(source,this.config.rules),this.config.profiles.find(p=>p.id===rule.profileId),this.pageHeadingsFor(original),this.config.cleanupPrompt]);
       const signature=signatureNow();
       const prompt=cleanupInput(state,current,resolved.profile.prompt,resolved.reference,{defaultPrompt:this.config.cleanupPrompt,extraInstructions:options.extraInstructions});
       if(prompt.length>400000)throw Error("This document and its references exceed the single-pass cleanup size limit. No request was sent.");
@@ -2658,7 +2672,7 @@ export default class SupernoteTranscripts extends Plugin implements Controller {
         if(raw===null){this.stage("Cleanup cancelled","No cleanup was sent. Your transcript is unchanged.");return;}
         const cleaned=cleanupPages(raw,state);
         state.cleanedPages=cleaned;
-        const text=buildMarkdown(state,this.showPageHeadings);
+        const text=buildMarkdown(state,this.pageHeadingsFor(state));
         const savedText=options.saveCopy&&options.removePageComments?stripPageComments(text):text;
         state.cleanup={updatedAt:new Date().toISOString(),inputHash:await hash(current),outputHash:await hash(text),model:request.usedModel,quality:"careful",provider:this.provider,basePages:clone(state.desired)};
         const stamp=new Date().toISOString().replace(/[:.]/g,"-");

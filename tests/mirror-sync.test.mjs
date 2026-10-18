@@ -25,6 +25,22 @@ test("local and remote changes merge independently per recipe and source field",
   assert.equal(local.output, "Transcripts");
   assert.equal(reconcileMirror(base, base, remote).publish, false);
 });
+test("formatting preferences and explicit empty guides reconcile as portable profile fields",()=>{
+  const base=make(),local=make(),remote=make();
+  local.profile.preserveFormatting=false;remote.profile.formattingGuide="remote cues";
+  const merged=reconcileMirror(local,base,remote);
+  assert.deepEqual(merged.conflicts,[]);assert.equal(merged.value.profile.preserveFormatting,false);
+  assert.equal(merged.value.profile.formattingGuide,"remote cues");
+  const empty=make();empty.profile.formattingGuide="";
+  assert.equal(reconcileMirror(empty,make(),make()).value.profile.formattingGuide,"");
+});
+test("divergent formatting cue edits conflict and do not advance baseline",()=>{
+  const base=make(),local=make(),remote=make();
+  base.profile.formattingGuide="base";local.profile.formattingGuide="ours";remote.profile.formattingGuide="theirs";
+  const result=reconcileMirror(local,base,remote);
+  assert.deepEqual(result.conflicts,["profile.formattingGuide"]);assert.equal(result.value.profile.formattingGuide,"ours");
+  assert.equal(result.baseline.profile.formattingGuide,"base");
+});
 test("divergence preserves original local values and baseline until explicit resolution", () => {
   const base = make(), local = make(), remote = make();
   local.profile.model = "ours"; remote.profile.model = "theirs"; remote.output = "Remote output";

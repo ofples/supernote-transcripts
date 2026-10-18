@@ -7,6 +7,10 @@ export interface Profile {
   glossaries: string[];
   /** Recognition effort. Older saved profiles without this field use fast. */
   quality?: "fast" | "balanced" | "careful";
+  /** Missing source-specific fields inherit the General formatting defaults. */
+  preserveFormatting?: boolean;
+  /** Additional visual cues; an explicit empty string suppresses inherited cues. */
+  formattingGuide?: string;
 }
 export interface FolderRule {
   id: string;

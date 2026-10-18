@@ -164,6 +164,33 @@ By default, matching cached recognition is reused; existing explicit re-recognit
 
 *Example warning from a synthetic fixture. Check the source and estimate before choosing Force update.*
 
+## Recognize handwriting formatting
+
+**Recognize handwriting formatting** is on by default in Settings → Recognition. It adds visual-formatting instructions to the existing recognition prompt; it does not replace your saved instructions or attach an extra reference image. In a source's settings, enable **Use source-specific recognition settings**, then choose **Handwriting formatting → Use default / On / Off**. You can also customize **Formatting cues** for that source or reset them to the General defaults. Shared mirrors carry the effective formatting settings to the other device.
+
+The built-in marking guide recognizes these conventions:
+
+| Handwritten mark | Markdown output |
+| --- | --- |
+| White title on a solid black rectangle | `# Heading` |
+| White title on a medium-gray rectangle | `## Heading` |
+| Dark title on a light-gray rectangle | `### Heading` |
+| Title on a diagonally hatched rectangle | `#### Heading` |
+| Line through readable words | `~~crossed-out words~~` |
+| Broad, uneven gray marker stroke | `==highlighted words==` |
+| Authored line below words | `<u>underlined words</u>` |
+| Clear hand-drawn table | Markdown pipe table |
+
+![Synthetic Nomad source settings with a handwriting-formatting selector and editable formatting cues](screenshots/formatting-source-nomad.png)
+
+*Synthetic settings example; the cue text is placeholder configuration, not private notebook content.*
+
+Formatting cues describe visual conventions; they are not words to add to your notes. An empty custom cue field removes the inherited marking guide while retaining the general Markdown-formatting rules. The model still reflows handwriting line wraps, preserves meaningful paragraphs and uses `[...]` for unreadable fragments. Notebook ruling and decorative template lines should not become underlines or tables. Cleanup preserves formatting already present in the text; without images it cannot verify new visual formatting.
+
+Generated **Page N** headings are unavailable when default formatting is enabled, and are always omitted for any source whose effective formatting setting is On. Original page-link comments and inline navigation chips remain available. Changing these settings marks earlier results as using older recognition instructions; it does **not** automatically re-recognize existing pages. Use **Re-recognize pages** to apply the new rules to selected existing pages. New or edited pages use the current rules on their next recognition request.
+
+Text guidance adds input tokens to recognition requests. API budgets account for the full prompt, estimates use matching recent results when available, and subscription requests consume the connected plan's allowance. No reference-image upload or extra model call is added by this feature.
+
 ## View original pages
 
 Documents with notebook page links have a page-link button beside their reading/editing control. Choose **Hide notebook page links** for an uninterrupted reading view, or **Show notebook page links** to bring them back. The choice applies to that file on this device, including standard Obsidian views and the compatible MD Reader. It does not alter the document, its metadata comments, or recognition. Ordinary documents have no extra button. The command **Show or hide notebook page links by default** changes the default for files without an individual choice.

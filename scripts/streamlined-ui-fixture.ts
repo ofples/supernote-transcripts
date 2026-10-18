@@ -26,7 +26,7 @@ export default class StreamlinedUIFixture {
       paused: `${research}/Paused.note`,
       attention: `${research}/Failed.note`,
     };
-    const general = { id: "general", name: "General", model: "gpt-6.1-sol", endpoint: "https://api.openai.com/v1/responses", prompt: "General fixture instructions.", glossaries: [] as string[], quality: "balanced" as const };
+    const general = { id: "general", name: "General", model: "gpt-6.1-sol", endpoint: "https://api.openai.com/v1/responses", prompt: "General fixture instructions.", glossaries: [] as string[], quality: "balanced" as const, preserveFormatting: true, formattingGuide: "Synthetic general formatting cues." };
     const researchProfile = { id: "research-profile", name: "Research", model: "gpt-5.6-sol", endpoint: "https://api.openai.com/v1/responses", prompt: "Research fixture instructions.", glossaries: ["Reference/Fixture glossary.md"], quality: "fast" as const };
     const config: any = {
       version: 1,
@@ -35,7 +35,7 @@ export default class StreamlinedUIFixture {
         { id: "journal-source", enabled: true, source: journal, output: "Fixture Output/Journal", recursive: true, exclude: [], profileId: general.id },
         { id: "research-source", enabled: true, source: research, output: "Fixture Output/Research", recursive: true, exclude: [], profileId: researchProfile.id },
       ],
-      intervalMinutes: 5, batchPages: 1, continuous: false,
+      intervalMinutes: 5, batchPages: 1, continuous: false, showPageHeadings: true,
     };
     const states: any = {
       [paths.working]: makeState(paths.working, "journal-source", 6, 2, "queued"),

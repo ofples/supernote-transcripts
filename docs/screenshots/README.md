@@ -100,4 +100,6 @@ For task instructions see the [user guide](../user-guide.md); for setup see [ins
 
 ## Verification
 
+Version 0.14.0 also has a focused synthetic formatting check (`scripts/check-formatting-ui.mjs`), covering General defaults, source overrides and disabled generated page headings. Its source-settings capture is shown in the [user guide](../user-guide.md#recognize-handwriting-formatting). The current 855-assertion UI suite also passes with the formatting controls.
+
 `node scripts/check-current-ui.mjs` passed 855 assertions for plugin version 0.13.1 at 1280×800 desktop, 470×799 narrow desktop, and 749×999 Nomad-sized viewports. The Nomad-sized Preview action measures 48×44 pixels. The checker used synthetic fixtures only: zero external requests, recognition calls, production Obsidian sessions, or production configuration changes. Browser errors: none.

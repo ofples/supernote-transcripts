@@ -18,6 +18,7 @@ import {
 } from "./browser.mjs";
 import { availableModalHeight } from "./viewport.mjs";
 import { DEFAULT_CLEANUP_PROMPT } from "./cleanup.mjs";
+import { DEFAULT_FORMATTING_GUIDE } from "./prompts.mjs";
 import { mergeProfileDrafts } from "./profile-draft.mjs";
 import {
   endpointKey,
@@ -281,6 +282,8 @@ class MirrorsModal extends Modal {
   private modelDraft = "";
   private endpointDraft = "";
   private qualityDraft: "fast" | "balanced" | "careful" = "fast";
+  private editorPreserveFormattingDraft?: boolean;
+  private editorFormattingGuideDraft?: string;
   private settingsDraft?: {
     apiKey: string;
     aiEnabled: boolean;
@@ -550,7 +553,8 @@ class MirrorsModal extends Modal {
       intervalMinutes: this.c.config.intervalMinutes,
       provider: controller.provider ?? "api",
       concurrency: controller.concurrency ?? 1,
-      showPageHeadings: this.c.config.showPageHeadings === true,
+      showPageHeadings: this.c.config.showPageHeadings === true &&
+        (profilesSnapshot.find((p) => p.id === "general")?.preserveFormatting ?? true) === false,
       cleanupPrompt: (this.c.config as typeof this.c.config & { cleanupPrompt?: string }).cleanupPrompt ?? DEFAULT_CLEANUP_PROMPT,
       pairingAddress: "",
       pairingCode: "",
@@ -1926,6 +1930,8 @@ class MirrorsModal extends Modal {
     this.modelDraft = this.editorProfile?.model ?? "";
     this.endpointDraft = this.editorProfile?.endpoint ?? "";
     this.qualityDraft = QUALITY.includes(this.editorProfile?.quality as any) ? this.editorProfile!.quality! : "fast";
+    this.editorPreserveFormattingDraft = this.editorProfile?.preserveFormatting;
+    this.editorFormattingGuideDraft = this.editorProfile?.formattingGuide;
     this.screen = "editor";
     this.render();
   }
@@ -2062,6 +2068,8 @@ class MirrorsModal extends Modal {
           this.modelDraft = general.model;
           this.endpointDraft = general.endpoint;
           this.qualityDraft = general.quality ?? "fast";
+          this.editorPreserveFormattingDraft = general.preserveFormatting;
+          this.editorFormattingGuideDraft = general.formattingGuide;
         }
         this.render();
       },
@@ -2076,6 +2084,39 @@ class MirrorsModal extends Modal {
       this.endpointDraft,
       (v) => (this.endpointDraft = v),
     );
+    const generalProfile = this.c.config.profiles.find((profile) => profile.id === "general");
+    const formattingEnabled = this.editorPreserveFormattingDraft ?? generalProfile?.preserveFormatting ?? true;
+    if (this.editorUsesGeneral) {
+      el(sourceOverrides, "p", "Using General formatting settings.", "st-caption st-formatting-inherited-note");
+    } else {
+      this.select(
+        sourceOverrides,
+        "Handwriting formatting",
+        this.editorPreserveFormattingDraft === undefined ? "default" : this.editorPreserveFormattingDraft ? "on" : "off",
+        [["default", `Use default (${(generalProfile?.preserveFormatting ?? true) ? "On" : "Off"})`], ["on", "On"], ["off", "Off"]],
+        (value) => {
+          this.editorPreserveFormattingDraft = value === "default" ? undefined : value === "on";
+          this.render();
+        },
+        "Recognizes marked headings, bold, strikethrough, highlights, underlines and clear hand-drawn tables while keeping paragraphs readable.",
+      );
+      const formattingGuide = this.textarea(
+        sourceOverrides,
+        "Formatting cues",
+        this.editorFormattingGuideDraft ?? generalProfile?.formattingGuide ?? DEFAULT_FORMATTING_GUIDE,
+        (value) => { this.editorFormattingGuideDraft = value; },
+        "Optional visual conventions. An empty override uses only the general Markdown formatting rules.",
+      );
+      formattingGuide.maxLength = 10_000;
+      formattingGuide.disabled = !formattingEnabled;
+      const guideReset = btn(sourceOverrides, "Reset cues to default", () => {
+        this.editorFormattingGuideDraft = undefined;
+        this.render();
+      }, "st-button st-text-button");
+      guideReset.disabled = this.editorFormattingGuideDraft === undefined;
+    }
+    if (formattingEnabled && this.c.config.showPageHeadings === true)
+      el(sourceOverrides, "p", "Generated page headings are omitted for this source.", "st-caption st-formatting-headings-note");
     const instructions = el(
       transcription,
       "section",
@@ -2138,7 +2179,9 @@ class MirrorsModal extends Modal {
       JSON.stringify(this.glossaries) !== JSON.stringify(profile.glossaries) ||
       this.modelDraft !== profile.model ||
       this.endpointDraft !== profile.endpoint ||
-      this.qualityDraft !== (profile.quality ?? "fast");
+      this.qualityDraft !== (profile.quality ?? "fast") ||
+      this.editorPreserveFormattingDraft !== profile.preserveFormatting ||
+      this.editorFormattingGuideDraft !== profile.formattingGuide;
   }
   private async renderSharedMirrors(parent: HTMLElement, rule: FolderRule) {
     const controller = this.c as Controller & {
@@ -2389,6 +2432,8 @@ class MirrorsModal extends Modal {
           this.modelDraft !== p.model ||
           this.endpointDraft !== p.endpoint ||
           this.qualityDraft !== (p.quality ?? "fast") ||
+          this.editorPreserveFormattingDraft !== p.preserveFormatting ||
+          this.editorFormattingGuideDraft !== p.formattingGuide ||
           (!this.editorUsesGeneral && this.editorBaseId === generalProfileId);
         if (custom) {
           const profile = {
@@ -2401,6 +2446,10 @@ class MirrorsModal extends Modal {
             endpoint: this.endpointDraft,
             quality: this.qualityDraft,
           };
+          if (this.editorPreserveFormattingDraft === undefined) delete (profile as Partial<Profile>).preserveFormatting;
+          else profile.preserveFormatting = this.editorPreserveFormattingDraft;
+          if (this.editorFormattingGuideDraft === undefined) delete (profile as Partial<Profile>).formattingGuide;
+          else profile.formattingGuide = this.editorFormattingGuideDraft;
           writtenProfile = profile;
           customProfileId = profile.id;
           priorProfileIndex = this.c.config.profiles.findIndex((x) => x.id === profile.id);
@@ -2488,7 +2537,9 @@ class MirrorsModal extends Modal {
     this.glossaries = [...p.glossaries];
     this.modelDraft = p.model;
     this.endpointDraft = p.endpoint;
-      this.qualityDraft = p.quality ?? "fast";
+    this.qualityDraft = p.quality ?? "fast";
+    this.editorPreserveFormattingDraft = p.preserveFormatting;
+    this.editorFormattingGuideDraft = p.formattingGuide;
     this.screen = "editor";
     this.render();
   }
@@ -3422,6 +3473,27 @@ class MirrorsModal extends Modal {
       this.modelPicker(defaults, "Default model", general.model, (v) => (general.model = v));
       this.qualitySlider(defaults, general.quality ?? "fast", (value) => { general.quality = value; });
       this.text(defaults, "Responses API endpoint", general.endpoint, (v) => (general.endpoint = v), "Use the provider Responses API endpoint.");
+      const formattingEnabled = general.preserveFormatting ?? true;
+      this.toggle(
+        defaults,
+        "Recognize handwriting formatting",
+        formattingEnabled,
+        (value) => {
+          general.preserveFormatting = value;
+          if (value) d.showPageHeadings = false;
+          this.render();
+        },
+        "Recognizes marked headings, bold, strikethrough, highlights, underlines and clear hand-drawn tables while keeping paragraphs readable.",
+      );
+      const formattingGuide = this.textarea(
+        defaults,
+        "Formatting cues",
+        general.formattingGuide ?? DEFAULT_FORMATTING_GUIDE,
+        (value) => { general.formattingGuide = value; },
+        "Optional visual conventions. An empty override uses only the general Markdown formatting rules.",
+      );
+      formattingGuide.maxLength = 10_000;
+      formattingGuide.disabled = !formattingEnabled;
     }
     const cleanupDefaults = el(root, "section", undefined, "st-form-section st-settings-section st-cleanup-defaults");
     el(cleanupDefaults, "h2", "Document cleanup", "st-section-heading");
@@ -3430,13 +3502,16 @@ class MirrorsModal extends Modal {
     defaultCleanupPrompt.maxLength = 20000;
     const presentation = el(root, "section", undefined, "st-form-section st-settings-section st-settings-presentation");
     el(presentation, "h2", "Appearance", "st-section-heading");
-    this.toggle(
+    const pageHeadings = this.toggle(
       presentation,
       "Show page headings in transcripts",
       d.showPageHeadings,
       (v) => (d.showPageHeadings = v),
-      "Presentation only; changing this does not run recognition again.",
+      general?.preserveFormatting ?? true
+        ? "Generated page headings are unavailable while handwriting formatting is recognized."
+        : "Presentation only; changing this does not run recognition again.",
     );
+    pageHeadings.disabled = (general?.preserveFormatting ?? true) === true;
     const storage = el(root, "section", undefined, "st-form-section st-settings-section st-settings-storage");
     el(storage, "h2", "Storage", "st-section-heading");
     el(storage, "p", "Review saved recognition history and cached source data. Cleanup is always started manually.", "st-caption");

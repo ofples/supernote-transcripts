@@ -2,7 +2,7 @@
 
 Supernote Transcripts is an Obsidian plugin that reads selected Supernote `.note` notebooks and creates or updates Markdown transcripts using an AI provider you configure. It keeps notebook files as read-only source material. You choose which notebooks to mirror and where to save the Markdown.
 
-The source for **0.13.2** is available in this repository. There are no packaged release downloads or confirmed Community Plugins listing yet, so installation currently requires a local build. See [validation notes](VALIDATION.md) for build, desktop, and Nomad verification status.
+The source for **0.14.0** is available in this repository. There are no packaged release downloads or confirmed Community Plugins listing yet, so installation currently requires a local build. See [validation notes](VALIDATION.md) for build, desktop, and Nomad verification status.
 
 ## Start here
 
