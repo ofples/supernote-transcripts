@@ -2,12 +2,12 @@
 
 Supernote Transcripts is an Obsidian plugin that reads selected Supernote `.note` notebooks and creates or updates Markdown transcripts using an AI provider you configure. It keeps notebook files as read-only source material. You choose which notebooks to mirror and where to save the Markdown.
 
-The source for **0.14.0** is available in this repository. There are no packaged release downloads or confirmed Community Plugins listing yet, so installation currently requires a local build. See [validation notes](VALIDATION.md) for build, desktop, and Nomad verification status.
+Version **0.14.0** is an early prerelease. Download the manual-install ZIP from the [GitHub prerelease](https://github.com/ofples/supernote-transcripts/releases/tag/v0.14.0); there is no confirmed Community Plugins listing. The separate Android callback/page-link helper is not published yet. See [validation notes](VALIDATION.md) for build, desktop, and Nomad verification status.
 
 ## Start here
 
 - [End-to-end workflow](docs/workflow.md): how Nomad, desktop Obsidian, Supernote Cloud Sync, and Obsidian Sync fit together.
-- [Installation](docs/installation.md): requirements, local build, and manual desktop or Nomad installation.
+- [Installation](docs/installation.md): manual ZIP installation on desktop or Nomad, with source-build steps as an alternative.
 - [User guide](docs/user-guide.md): add notebooks, configure recognition, manage the queue, and maintain transcripts.
 - [Troubleshooting](docs/troubleshooting.md): common source, sync, provider, and recovery problems.
 - [Screenshots](docs/screenshots/README.md): synthetic examples of the current interface.
@@ -23,7 +23,7 @@ The plugin is independent of optional page viewers and themes. Page links can be
 
 ## Build from source
 
-Use Node.js 22 and npm, matching the project’s CI build environment. From this directory, run:
+Most users can install the prerelease ZIP using the [installation guide](docs/installation.md). To build the plugin yourself, use Node.js 22 and npm, matching the project’s CI build environment. From this directory, run:
 
 ```sh
 npm ci

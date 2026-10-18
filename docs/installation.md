@@ -1,6 +1,6 @@
 # Installation
 
-Supernote Transcripts is an Obsidian community plugin package. The plugin ID is `nomad-transcripts`; its manifest requires Obsidian 1.7.2 or later. There are no published release assets or confirmed public listing at this time, so install a local build. BRAT is not a usable installation path for this unpublished package.
+Supernote Transcripts is an Obsidian community plugin package. The plugin ID is `nomad-transcripts`; its manifest requires Obsidian 1.7.2 or later. Version 0.14.0 is an early prerelease available as a manual ZIP from the [GitHub prerelease](https://github.com/ofples/supernote-transcripts/releases/tag/v0.14.0). There is no confirmed Community Plugins listing, and BRAT is not a supported installation path.
 
 For the complete Nomad-to-desktop setup, including the roles of both Supernote Cloud Sync and Obsidian Sync, follow the [end-to-end workflow](workflow.md) first.
 
@@ -8,11 +8,20 @@ For the complete Nomad-to-desktop setup, including the roles of both Supernote C
 
 - Obsidian 1.7.2 or later. Desktop and Nomad/mobile use the same plugin package; the plugin is not desktop-only.
 - A current Obsidian release with encrypted SecretStorage for ChatGPT subscription sign-in. The manifest minimum alone does not guarantee subscription sign-in support. Ordinary API-key mode is separate.
-- [Node.js 22](https://nodejs.org/en/download) with npm to build from source, matching the project’s CI environment. Dependencies and versions are pinned in `package-lock.json`.
+- Node.js 22 with npm only if you plan to build from source. Dependencies and versions are pinned in `package-lock.json`.
 - Supernote `.note` files available as local files to Obsidian. Cloud-only placeholders are not readable.
 - An AI provider configured in plugin settings only if you want recognition. The plugin does not include provider credentials.
 
-## Build the plugin
+## Install the prerelease ZIP
+
+Download `supernote-transcripts-0.14.0.zip` from the [GitHub prerelease](https://github.com/ofples/supernote-transcripts/releases/tag/v0.14.0) and extract it. The archive contains a `nomad-transcripts` folder with the three plugin runtime files plus its license and notices. Copy that folder into the active vault configuration's `plugins` directory:
+
+- Desktop: `.obsidian/plugins/nomad-transcripts/`
+- Nomad: `.obsidian-supernote/plugins/nomad-transcripts/` after setting **Settings → Files and links → Override config folder** to `.obsidian-supernote` and restarting Obsidian.
+
+For an existing installation, back up the plugin folder, then replace only `main.js`, `manifest.json`, and `styles.css`. Keep the folder and its `data.json` intact. Enable or reload **Supernote Transcripts** in **Settings → Community plugins**, then confirm the version shown by Obsidian. Keep updates paused while reviewing sources and settings. The release is an early prerelease; the separate Android callback/page-link helper is not published yet.
+
+## Build from source
 
 Download or clone the public [`supernote-transcripts` repository](https://github.com/ofples/supernote-transcripts). A fresh clone uses the repository's default branch. In a terminal, run:
 

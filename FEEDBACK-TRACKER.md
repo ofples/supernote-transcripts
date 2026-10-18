@@ -13,8 +13,8 @@ Source implementation, fixture checks, installed builds and live verification ar
 - [x] Run the single user-approved isolated Sol sample test: all four heading levels, strike/highlight/underline and three-column table were correctly returned. Keep output private and outside the vault; preserve the queue and record the single usage entry.
 - [x] Stage the frozen desktop 0.14.0 assets while Obsidian is closed; preserve configuration/state/auth.
 - [x] Activate the frozen 0.14.0 build on the Nomad without further recognition requests; this records asset activation and preservation checks only.
-- [ ] Inspect 0.14.0 formatting settings with a Cancel-only check; the Nomad disconnected after activation before this inspection.
-- [ ] Install the frozen Paper Sidebar 0.4.2 direct Read/Edit change on the Nomad and verify it with physical taps. Source implementation and tests are complete in the Paper repo; keep Reader scrolling settings unchanged.
+- [ ] Inspect 0.14.0 formatting settings with a Cancel-only check; this was not completed during the Sidebar verification.
+- [x] Install the frozen Paper Sidebar 0.4.2 direct Read/Edit change on the Nomad and verify both physical taps on the Satsang transcript. The initial CSS transfer read back empty and was repaired atomically before final hash and protected-state verification; see [Validation](VALIDATION.md). Reader scrolling settings were not changed, and the Scroll submenu was not inspected.
 
 ## Document page-link visibility — 0.13.2
 
