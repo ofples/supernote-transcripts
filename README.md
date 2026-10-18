@@ -2,7 +2,7 @@
 
 Supernote Transcripts is an Obsidian plugin that reads selected Supernote `.note` notebooks and creates or updates Markdown transcripts using an AI provider you configure. It keeps notebook files as read-only source material. You choose which notebooks to mirror and where to save the Markdown.
 
-Version **0.14.0** is an early prerelease. Download the manual-install ZIP from the [GitHub prerelease](https://github.com/ofples/supernote-transcripts/releases/tag/v0.14.0); there is no confirmed Community Plugins listing. The separate Android callback/page-link helper is not published yet. See [validation notes](VALIDATION.md) for build, desktop, and Nomad verification status.
+Version **0.15.0** is an early prerelease. Download the manual-install ZIP and optional **Supernote Bridge 0.4.0** APK from the [GitHub release](https://github.com/ofples/supernote-transcripts/releases/tag/v0.15.0). There is no confirmed Community Plugins listing. See [validation notes](VALIDATION.md) for build and device verification boundaries.
 
 ## Start here
 
@@ -12,6 +12,7 @@ Version **0.14.0** is an early prerelease. Download the manual-install ZIP from 
 - [Troubleshooting](docs/troubleshooting.md): common source, sync, provider, and recovery problems.
 - [Screenshots](docs/screenshots/README.md): synthetic examples of the current interface.
 - [Project history](HISTORY.md): earlier release notes and development record.
+- [Native Digest workflow](docs/native-digests.md): optional Android handoff from a selected Reader excerpt.
 
 ## Important setup choices
 
@@ -19,7 +20,7 @@ Keep original `.note` files in a local source folder. If Obsidian Sync is used, 
 
 Recognition can use paid provider capacity. Start paused, select only the notebooks you want, inspect the model, prompt, glossary, quality and estimates, then choose **Update**. Automatic catch-up is optional. The [user guide](docs/user-guide.md#review-costs-and-run-safely) explains estimates, local budgets, pausing, and retries.
 
-The plugin is independent of optional page viewers and themes. Page links can be used without an optional reader; a compatible desktop `.note` viewer may open the selected page, and otherwise Transcripts shows a read-only page preview. See [page links](PAGE_LINKS.md) and [component boundaries](INTEGRATION.md).
+The plugin is independent of optional page viewers and themes. Page links can be used without an optional reader; a compatible desktop `.note` viewer may open the selected page, and otherwise Transcripts shows a read-only page preview. See [page links](PAGE_LINKS.md), [Native Digests](docs/native-digests.md), and [component boundaries](INTEGRATION.md).
 
 ## Build from source
 
@@ -30,7 +31,7 @@ npm ci
 npm run build
 ```
 
-Copy the generated `main.js`, `manifest.json`, and `styles.css` into the Obsidian plugin folder `nomad-transcripts/`, then enable **Supernote Transcripts**. See [installation](docs/installation.md) for full steps and platform-specific notes. The Android callback/page-link helper is a separate optional Android application; it is not a Supernote PluginHost SDK package and is not required for ordinary transcript creation.
+Copy the generated `main.js`, `manifest.json`, and `styles.css` into the Obsidian plugin folder `nomad-transcripts/`, then enable **Supernote Transcripts**. See [installation](docs/installation.md) for full steps. Supernote Bridge is a separate Android app for native Notes page links and Digest capture; ordinary reading, transcription and desktop page previews work without it.
 
 ## License
 

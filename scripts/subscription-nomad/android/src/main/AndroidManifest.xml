@@ -1,12 +1,17 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
  <uses-permission android:name="android.permission.INTERNET"/>
  <uses-permission android:name="android.permission.FOREGROUND_SERVICE"/>
- <application android:label="Supernote login helper" android:allowBackup="false" android:usesCleartextTraffic="true" android:theme="@android:style/Theme.Material.Light.NoActionBar">
+ <uses-permission android:name="com.ratta.supernote.knowledge.permission.READ_KNOWLEDGE"/>
+ <uses-permission android:name="com.ratta.supernote.knowledge.permission.WRITE_KNOWLEDGE"/>
+ <application android:label="Supernote Bridge" android:allowBackup="false" android:usesCleartextTraffic="true" android:theme="@android:style/Theme.Material.Light.NoActionBar">
   <activity android:name=".LoginActivity" android:exported="true" android:excludeFromRecents="true">
    <intent-filter><action android:name="android.intent.action.VIEW"/><category android:name="android.intent.category.DEFAULT"/><category android:name="android.intent.category.BROWSABLE"/><data android:scheme="supernote-login-helper" android:host="start"/></intent-filter>
   </activity>
   <activity android:name=".OpenNoteActivity" android:exported="true" android:noHistory="true" android:excludeFromRecents="true">
    <intent-filter><action android:name="android.intent.action.VIEW"/><category android:name="android.intent.category.DEFAULT"/><category android:name="android.intent.category.BROWSABLE"/><data android:scheme="supernote-transcripts" android:host="open-note"/></intent-filter>
+  </activity>
+  <activity android:name=".DigestActivity" android:exported="true" android:excludeFromRecents="true">
+   <intent-filter><action android:name="android.intent.action.VIEW"/><category android:name="android.intent.category.DEFAULT"/><category android:name="android.intent.category.BROWSABLE"/><data android:scheme="supernote-bridge" android:host="digest"/></intent-filter>
   </activity>
   <service android:name=".CallbackService" android:exported="false"/>
  </application>

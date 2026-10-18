@@ -188,7 +188,9 @@ export async function indexNotebook(
     pages.map((p) => p.meta.PAGEID),
     pages.map((p) => p.fingerprint),
   );
-  return { pages, ids, numbers, width, height };
+  const fileId = typeof header.FILE_ID === "string" && header.FILE_ID.length > 0 &&
+    header.FILE_ID.length <= 256 && !/[\u0000-\u001f\u007f]/.test(header.FILE_ID) ? header.FILE_ID : undefined;
+  return { pages, ids, numbers, width, height, fileId };
 }
 export class AndroidReadOnlySource implements ReadOnlySource {
   constructor(
@@ -292,6 +294,7 @@ export async function openByteNotebook(
       revision,
       width: index.width,
       height: index.height,
+      ...(index.fileId ? { fileId: index.fileId } : {}),
       pages: index.pages.map((p, i) => ({
         id: index.ids[i],
         number: index.numbers[i],

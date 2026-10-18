@@ -14,6 +14,7 @@ const mocks = {
     export const editorLivePreviewField = {};
     export class MarkdownRenderChild { constructor() {} }
     export class MarkdownView {}
+    export class Notice {}
     export class TFile { static [Symbol.hasInstance](value) { return value?.isTFile === true; } }
     function inline(parent, value) {
       const pattern = /\\[([^\\]]+)\\]\\(([^)]+)\\)/g;
@@ -121,4 +122,43 @@ test("reader page chips use real DOM blocks without creating chip-only paragraph
   assert.equal(result.chipCount, 6);
   assert.equal(result.chipOnlyParagraphs, 0, JSON.stringify(result));
   assert.equal(result.inlineChip, true); assert.equal(result.listChip, true); assert.equal(result.tableChip, true); assert.equal(result.eofChip, true);
+  const provenance = await page.evaluate(async () => {
+    const lines = ["---", "nomad_transcripts: true", "---", "", "<!-- supernote-page:native%3Aa number:1 -->", "Repeated words.", "", "<!-- supernote-page:native%3Ab number:2 -->", "Repeated words.", "Continuation."];
+    let canonical = lines.join("\n");
+    const path = "Transcripts/book.md", file = { path, extension: "md", isTFile: true };
+    const calls = [];
+    const plugin = {
+      app: { vault: { getAbstractFileByPath: () => file, cachedRead: async () => canonical }, workspace: { updateOptions(){}, getLeavesOfType(){return []} } },
+      register(){}, registerEditorExtension(){}, registerMarkdownPostProcessor(){},
+    };
+    PageLinksBrowserBundle.installPageLinks(plugin, async () => {}, () => false, { resolveSelection: async (source, markers) => {
+      calls.push({source, markers}); return { path: "/storage/emulated/0/Note/book.note", page: markers[0].number, pageId: markers[0].pageId, pageIds: markers.map(x => x.pageId) };
+    } });
+    async function render(from) {
+      const element = document.createElement("div");
+      const ok = await plugin.pageLinks.renderSection({ element, sourcePath: path, markdown: lines.slice(from).join("\n"), sourceLineMap: lines.slice(from).map((_, i) => from+i), component: {}, selectionProvenance: true });
+      if (!ok) throw Error("Provenance rendering declined");
+      return element;
+    }
+    const chapter = await render(8); // mid-page chapter, no explicit marker within it
+    const moved = document.createElement("div"); moved.append(...chapter.childNodes); document.body.append(moved);
+    const text = [...moved.querySelectorAll("p")][0].lastChild;
+    const range = document.createRange(); range.setStart(text, 0); range.setEnd(text, 8);
+    const mid = await plugin.pageLinks.selectionSource({ element: moved, sourcePath:path, range });
+    const full = await render(4); document.body.append(full);
+    const paragraphs = full.querySelectorAll("p");
+    const spanning = document.createRange(); spanning.setStart(paragraphs[0].lastChild, 0); spanning.setEnd(paragraphs[1].lastChild, 8);
+    const multi = await plugin.pageLinks.selectionSource({ element:full, sourcePath:path, range:spanning });
+    const hidden = [...full.querySelectorAll(".st-digest-anchor")].every(node => node.hidden && node.getBoundingClientRect().width === 0);
+    canonical += "\nEdited";
+    let stale = false;
+    try { await plugin.pageLinks.selectionSource({ element: moved, sourcePath:path, range }); } catch { stale=true; }
+    canonical = "Ordinary Markdown";
+    const ordinary = await plugin.pageLinks.selectionSource({ element: moved, sourcePath:path, range });
+    return { mid, multi, hidden, chips:full.querySelectorAll("button.st-page-link").length, stale, ordinary, callCount:calls.length };
+  });
+  assert.deepEqual(provenance.mid.pageIds, ["native:b"]);
+  assert.deepEqual(provenance.multi.pageIds, ["native:a", "native:b"]);
+  assert.equal(provenance.hidden, true); assert.equal(provenance.chips, 0);
+  assert.equal(provenance.stale, true); assert.equal(provenance.ordinary, null); assert.equal(provenance.callCount, 2);
 });

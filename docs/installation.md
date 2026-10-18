@@ -1,6 +1,6 @@
 # Installation
 
-Supernote Transcripts is an Obsidian community plugin package. The plugin ID is `nomad-transcripts`; its manifest requires Obsidian 1.7.2 or later. Version 0.14.0 is an early prerelease available as a manual ZIP from the [GitHub prerelease](https://github.com/ofples/supernote-transcripts/releases/tag/v0.14.0). There is no confirmed Community Plugins listing, and BRAT is not a supported installation path.
+Supernote Transcripts is an Obsidian community plugin package. The plugin ID is `nomad-transcripts`; its manifest requires Obsidian 1.7.2 or later. Install version 0.15.0 from the [GitHub prerelease](https://github.com/ofples/supernote-transcripts/releases/tag/v0.15.0). There is no confirmed Community Plugins listing, and BRAT is not a supported installation path.
 
 For the complete Nomad-to-desktop setup, including the roles of both Supernote Cloud Sync and Obsidian Sync, follow the [end-to-end workflow](workflow.md) first.
 
@@ -14,12 +14,12 @@ For the complete Nomad-to-desktop setup, including the roles of both Supernote C
 
 ## Install the prerelease ZIP
 
-Download `supernote-transcripts-0.14.0.zip` from the [GitHub prerelease](https://github.com/ofples/supernote-transcripts/releases/tag/v0.14.0) and extract it. The archive contains a `nomad-transcripts` folder with the three plugin runtime files plus its license and notices. Copy that folder into the active vault configuration's `plugins` directory:
+Download `supernote-transcripts-0.15.0.zip` from the [GitHub v0.15.0 release](https://github.com/ofples/supernote-transcripts/releases/tag/v0.15.0) and extract it. The archive contains a `nomad-transcripts` folder with the three plugin runtime files plus its license and notices. Copy that folder into the active vault configuration's `plugins` directory:
 
 - Desktop: `.obsidian/plugins/nomad-transcripts/`
 - Nomad: `.obsidian-supernote/plugins/nomad-transcripts/` after setting **Settings → Files and links → Override config folder** to `.obsidian-supernote` and restarting Obsidian.
 
-For an existing installation, back up the plugin folder, then replace only `main.js`, `manifest.json`, and `styles.css`. Keep the folder and its `data.json` intact. Enable or reload **Supernote Transcripts** in **Settings → Community plugins**, then confirm the version shown by Obsidian. Keep updates paused while reviewing sources and settings. The release is an early prerelease; the separate Android callback/page-link helper is not published yet.
+For an existing installation, back up the plugin folder, then replace only `main.js`, `manifest.json`, and `styles.css`. Keep the folder and its `data.json` intact. Enable or reload **Supernote Transcripts** in **Settings → Community plugins**, then confirm the version shown by Obsidian. Keep updates paused while reviewing sources and settings. The release is an early prerelease.
 
 ## Build from source
 
@@ -40,7 +40,7 @@ manifest.json
 styles.css
 ```
 
-Do not copy source code, `node_modules`, or the separate Android helper as a substitute for those files. The Android callback/page-link helper under `scripts/subscription-nomad/android/` is an ordinary Android app, not a native Supernote PluginHost SDK plugin. It is optional and only relevant to the helper flows documented separately.
+Do not copy source code or `node_modules` as a substitute for those files. **Supernote Bridge** is a separate optional Android app, used for native Notes page links and the Reader-to-Digest handoff. Download `Supernote-Bridge-0.4.0.apk` from the same release and open it on the Nomad to install; approve sideloading if prompted. Update an existing helper in place without uninstalling it. Bridge opens from Obsidian rather than adding a launcher icon. Ordinary reading, transcription and desktop-assisted sign-in do not require it. See the [helper guide](../scripts/subscription-nomad/android/README.md) for source builds and signing compatibility.
 
 ## Install in Obsidian desktop
 
@@ -79,4 +79,4 @@ Open **Supernote Transcripts: Open mirrors**, add one small notebook, choose an 
 
 ## Optional companions
 
-Transcripts works independently. An optional compatible MD Reader can enhance page-link display; ordinary Markdown remains available without a reader. Paper and Sidebar are also optional. They are not installed or enabled by Transcripts. See [component boundaries](../INTEGRATION.md) and [page links](../PAGE_LINKS.md). This source-only installation path may be superseded if a public package or release is published later.
+Transcripts works independently. An optional compatible MD Reader can enhance page-link display and provide selected text for Native Digests; ordinary Markdown and transcription remain available without it. Supernote Bridge is an optional Android companion for the Digest handoff. Paper and Sidebar are also optional. They are not installed or enabled by Transcripts. See [component boundaries](../INTEGRATION.md), [page links](../PAGE_LINKS.md), and [Native Digests](native-digests.md).

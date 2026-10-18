@@ -34,6 +34,7 @@ function notebook({
   footerKeys,
   recognition,
   recognitionAddress = "",
+  fileId,
 } = {}) {
   const signature = new Uint8Array(24);
   signature.set(new TextEncoder().encode("noteSN_FILE_VER_20260016"));
@@ -50,7 +51,7 @@ function notebook({
     chunks.push(out);
     return a;
   };
-  const h = block(`<APPLY_EQUIPMENT:N6><FINAL_OPERATION_PAGE:${last}>`);
+  const h = block(`<APPLY_EQUIPMENT:N6><FINAL_OPERATION_PAGE:${last}>${fileId === undefined ? "" : `<FILE_ID:${fileId}>`}`);
   addresses.header = h;
   const pages = ids.map((id, i) => {
     const bitmap = block(ink[i]);
@@ -130,6 +131,18 @@ test("selective parser preserves native identity across reorder and ignores reco
   assert.equal(a.ids[0], b.ids[1]);
   assert.equal(a.pages[0].fingerprint, b.pages[1].fingerprint);
   assert.equal(a.pages[1].fingerprint, b.pages[0].fingerprint);
+});
+
+test("native file identity is optional, bounded and separate from page fingerprints", async () => {
+  const plain = await indexNotebook(streamed(notebook()));
+  const linked = await openByteNotebook("fixture.note", "1:100", streamed(notebook({ fileId: "F-fixture" })), async () => "1:100");
+  assert.equal(linked.descriptor.fileId, "F-fixture");
+  assert.equal(linked.descriptor.pages[0].fingerprint, plain.pages[0].fingerprint);
+  linked.close();
+  for (const fileId of ["", "x".repeat(257), "F\ninvalid"]) {
+    const invalid = await indexNotebook(streamed(notebook({ fileId })));
+    assert.equal(invalid.fileId, undefined);
+  }
 });
 
 test("open notebook reads bounded optional device OCR without changing page fingerprints", async () => {

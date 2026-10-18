@@ -13,6 +13,7 @@ export interface NotePageTarget {
   path: string;
   page: number;
   pageId: string;
+  fileId?: string;
 }
 export interface NavigationOptions {
   config: ConfigV1;
@@ -63,7 +64,17 @@ async function sourceForTranscript(request: PageNavigationRequest, options: Navi
 
 /** Resolve the current page ordinal without changing cached text, queue or notes. */
 export async function resolveNotePage(request: PageNavigationRequest, options: NavigationOptions): Promise<NotePageTarget> {
-  validateNavigationRequest(request);
+  return (await resolveNotePages([request], options))[0];
+}
+
+/** Resolve a selection's pages against one immutable notebook snapshot. */
+export async function resolveNotePages(requests: PageNavigationRequest[], options: NavigationOptions): Promise<NotePageTarget[]> {
+  if (!Array.isArray(requests) || !requests.length || requests.length > 100)
+    throw Error("Select an excerpt spanning no more than 100 notebook pages.");
+  for (const item of requests) validateNavigationRequest(item);
+  const request = requests[0];
+  if (requests.some(item => item.outputPath !== request.outputPath) || new Set(requests.map(item => item.pageId)).size !== requests.length)
+    throw Error("This selection does not identify one notebook unambiguously.");
   const text = await options.readTranscript(request.outputPath);
   if (!isManagedTranscript(text)) throw Error("Page links are available in generated Supernote transcripts.");
   const state = await sourceForTranscript(request, options, text);
@@ -74,16 +85,21 @@ export async function resolveNotePage(request: PageNavigationRequest, options: N
   catch { throw Error("The original notebook could not be read. Check that it still exists in the Supernote Note folder."); }
   try {
     const pages = opened.descriptor.pages;
-    const matches = pages.filter(page => page.id === request.pageId);
-    if (matches.length !== 1)
-      throw Error("This page was removed or its identity changed. Open the original notebook or refresh its transcript.");
-    const page = matches[0];
-    if (!page.id.startsWith("native:") && pages.filter(other => other.fingerprint === page.fingerprint).length > 1)
-      throw Error("Several pages have identical content, so this reference is ambiguous. Open the original notebook to choose the page.");
+    const targets: NotePageTarget[] = [];
+    for (const item of requests) {
+      const matches = pages.filter(page => page.id === item.pageId);
+      if (matches.length !== 1)
+        throw Error("This page was removed or its identity changed. Open the original notebook or refresh its transcript.");
+      const page = matches[0];
+      if (!page.id.startsWith("native:") && pages.filter(other => other.fingerprint === page.fingerprint).length > 1)
+        throw Error("Several pages have identical content, so this reference is ambiguous. Open the original notebook to choose the page.");
+      targets.push({ path, page: page.number, pageId: page.id,
+        ...(opened.descriptor.fileId ? { fileId: opened.descriptor.fileId } : {}) });
+    }
     if (await options.reader.revision(path) !== opened.descriptor.revision)
       throw Error("The notebook changed while locating the page. Save it and tap the link again.");
     // displayNumber is a label from the old transcript, never a routing fallback.
-    return { path, page: page.number, pageId: page.id };
+    return targets;
   } finally { opened.close(); }
 }
 

@@ -89,11 +89,17 @@ Generated transcripts can contain `supernote-page` metadata comments. In standar
 
 Use the page-link button beside the document's reading/editing control to show or hide those buttons for the current file. Visibility is a local reading preference; Obsidian Sync continues to sync the unchanged Markdown and page metadata normally.
 
-- On Nomad, a page link opens the matching page in native Notes. This requires the optional Android helper. There is no published APK; see the helper's [build and install instructions](../scripts/subscription-nomad/android/README.md). It is a companion app, not a Supernote PluginHost plugin, and it is not required to create or read transcripts. See [Page links](../PAGE_LINKS.md) for navigation behavior and verification limits.
+- On Nomad, a page link opens the matching page in native Notes. This requires the optional **Supernote Bridge** Android app. See [installation](installation.md) and the [source build instructions](../scripts/subscription-nomad/android/README.md). It is a companion app, not a Supernote PluginHost plugin, and is not required to create or read transcripts. See [Page links](../PAGE_LINKS.md) for navigation behavior and verification limits.
 - On desktop, Transcripts resolves the current local notebook page. If an enabled compatible `.note` viewer owns an in-vault file, it opens that viewer's page target. Otherwise Transcripts shows its read-only page preview, including when the source file lives outside the vault.
 - Page links can be used without MD Reader. A compatible reader only changes the presentation. The desktop Cloud Sync plugin's page-anchor behavior has been checked in its source, but runtime behavior in a user's vault depends on that plugin version and configuration.
 
 Older transcripts with visible page headings but no `supernote-page` metadata comments do not gain stable links automatically. See [Page links](../PAGE_LINKS.md) for navigation rules and current implementation evidence.
+
+## Save a Reader excerpt as a native Digest
+
+On Android, MD Reader 2.1.3 can send selected text to the optional Supernote Bridge app. Select text in a managed transcript, choose **Save to Supernote Digest** from Reader's selection menu, review the excerpt and source in Bridge, and confirm **Save Digest**. Return to Obsidian for the acknowledgement. Bridge uses the permissioned provider interface; it does not edit native notebook files or make AI requests. After saving, Bridge offers **Open original notebook** using the supplied source path/page as provenance; native Notes does not currently treat that metadata as a tappable Digest backlink. This flow does not require recognition to be enabled.
+
+For a managed transcript, the local `.note` source must still match the transcript's source mapping and page identities. Source anchors retain page provenance even if page chips are hidden. Ordinary Markdown selections use their vault file and nearby text as source context and do not depend on the Transcripts plugin. If a Digest was already saved, Reader reopens that same request in Bridge so its receipt can be checked without creating another Digest. If Bridge does not open, install or update its APK, then select the passage again. See [Native Digests](native-digests.md) for release and verification limits.
 
 ## Common sync problems
 

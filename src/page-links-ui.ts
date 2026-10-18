@@ -15,20 +15,63 @@ export interface ReaderPageLinkSection {
   /** One zero-based source-file line per rendered line; null marks inserted separators. */
   sourceLineMap: Array<number | null>;
   component: Component;
+  /** Retain invisible page anchors even when the reader hides page chips. */
+  selectionProvenance?: boolean;
 }
+
+export interface ReaderSelectionRequest { element: HTMLElement; sourcePath: string; range: Range }
+export interface ReaderSelectionSource { path: string; page: number; pageId: string; pageIds: string[]; fileId?: string }
 
 export interface ReaderPageLinksApi {
   /** Stable cross-plugin contract version. Additive fields do not require a version bump. */
   apiVersion: 1;
   /** Optional features exposed by this API version. */
-  capabilities: readonly ["renderSection"];
+  capabilities: readonly string[];
   enabled(sourcePath?: string): boolean;
   /** Render a reader chapter with validated chips. Returns false when it is not a managed transcript. */
   renderSection(section: ReaderPageLinkSection): Promise<boolean>;
+  /** Returns null for ordinary Markdown. Stale or unmapped transcripts fail explicitly. */
+  selectionSource?(selection: ReaderSelectionRequest): Promise<ReaderSelectionSource | null>;
 }
 
 type PluginWithReaderPageLinks = Plugin & { pageLinks?: ReaderPageLinksApi };
-type PageLinkVisibilityOptions = { storageKey?: string };
+type PageLinkVisibilityOptions = { storageKey?: string; resolveSelection?: (path: string, markers: Array<{ pageId: string; number: number }>) => Promise<ReaderSelectionSource> };
+type SelectionAnchor = { sourcePath: string; canonical: string; pageId: string; number: number };
+// Keep provenance on actual rendered nodes, so prefetch/cache DOM moves retain it.
+// DOM attributes supplied by Markdown are never trusted as page identities.
+const selectionAnchors = new WeakMap<HTMLElement, SelectionAnchor>();
+
+async function readerSelectionSource(plugin: Plugin, options: PageLinkVisibilityOptions,
+  request: ReaderSelectionRequest): Promise<ReaderSelectionSource | null> {
+  const { element, sourcePath, range } = request;
+  if (!element?.contains(range.startContainer) || !element.contains(range.endContainer) || range.collapsed)
+    throw Error("Select text inside the current reader page.");
+  const file = plugin.app.vault.getAbstractFileByPath(sourcePath);
+  if (!(file instanceof TFile)) throw Error("The source document is no longer available.");
+  const canonical = await plugin.app.vault.cachedRead(file);
+  if (!isManagedTranscript(canonical)) return null;
+  if (!element.contains(range.startContainer) || !element.contains(range.endContainer))
+    throw Error("The reader page changed. Select the excerpt again.");
+  if (!options.resolveSelection) throw Error("Notebook Digest links are unavailable on this device.");
+  const start = range.cloneRange(); start.collapse(true);
+  const candidates: SelectionAnchor[] = [];
+  let preceding: SelectionAnchor | undefined;
+  for (const node of Array.from(element.querySelectorAll<HTMLElement>(".st-page-link,.st-digest-anchor"))) {
+    const anchor = selectionAnchors.get(node);
+    if (!anchor || anchor.sourcePath !== sourcePath || anchor.canonical !== canonical)
+      throw Error("The transcript changed. Reopen it and select the excerpt again.");
+    if (start.comparePoint(node, 0) <= 0) preceding = anchor;
+    else if (range.comparePoint(node, 0) === 0) candidates.push(anchor);
+  }
+  if (!preceding) throw Error("This excerpt has no original page reference. Select text after its first notebook page marker.");
+  candidates.unshift(preceding);
+  const markers = candidates.filter((anchor, i) => candidates.findIndex(other => other.pageId === anchor.pageId) === i);
+  const target = await options.resolveSelection(sourcePath, markers);
+  if (await plugin.app.vault.cachedRead(file) !== canonical ||
+      !element.contains(range.startContainer) || !element.contains(range.endContainer))
+    throw Error("The transcript changed while locating the excerpt. Select it again.");
+  return target;
+}
 
 function memoryStorage() {
   const values = new Map<string, string>();
@@ -153,7 +196,7 @@ function addInlinePageGroup(target: HTMLElement, group: (ReturnType<typeof pageM
 
 async function renderReaderPageLinkSection(plugin: Plugin, onOpen: PageLinkOpen, enabled: (sourcePath?: string) => boolean,
   section: ReaderPageLinkSection): Promise<boolean> {
-  if (!section?.element || !section.sourcePath || !section.component || typeof section.markdown !== "string" || !enabled(section.sourcePath)) return false;
+  if (!section?.element || !section.sourcePath || !section.component || typeof section.markdown !== "string" || (!enabled(section.sourcePath) && !section.selectionProvenance)) return false;
   const parts = section.sourcePath.split("/");
   if (section.sourcePath.startsWith("/") || section.sourcePath.includes("\\") ||
       /[\u0000-\u001f]/.test(section.sourcePath) || parts.some(part => !part || part === "." || part === ".." || part.includes(":"))) return false;
@@ -163,19 +206,22 @@ async function renderReaderPageLinkSection(plugin: Plugin, onOpen: PageLinkOpen,
   if (!isManagedTranscript(canonical)) return false;
 
   const renderedLines = section.markdown.split(/\r?\n/);
+  const canonicalLineCount = canonical.split(/\r?\n/).length;
   const sourceLineMap = section.sourceLineMap;
   if (!Array.isArray(sourceLineMap) || sourceLineMap.length !== renderedLines.length) return false;
   const selectedLines = new Set<number>();
   let previousLine = -1;
   for (const line of sourceLineMap) {
     if (line === null) continue;
-    if (!Number.isSafeInteger(line) || line < 0 || line <= previousLine) return false;
+    if (!Number.isSafeInteger(line) || line < 0 || line >= canonicalLineCount || line <= previousLine) return false;
     selectedLines.add(line);
     previousLine = line;
   }
+  if (!selectedLines.size) return false;
   const markers = parsePageMarkers(section.markdown);
-  if (!markers.length) return false;
-  const canonicalMarkers = parsePageMarkers(canonical).filter(marker => selectedLines.has(marker.line));
+  const allCanonicalMarkers = parsePageMarkers(canonical);
+  if (!markers.length && !section.selectionProvenance) return false;
+  const canonicalMarkers = allCanonicalMarkers.filter(marker => selectedLines.has(marker.line));
   const renderedIdentities = markers.map(marker => {
     const sourceLine = sourceLineMap[marker.line];
     return sourceLine === null || sourceLine === undefined ? null : `${sourceLine}\u0000${marker.pageId}\u0000${marker.number}`;
@@ -219,18 +265,26 @@ async function renderReaderPageLinkSection(plugin: Plugin, onOpen: PageLinkOpen,
   const fragment = document.createElement("div");
   fragment.dataset.stPageLinksRender = "true";
   await MarkdownRenderer.render(plugin.app, rendered, fragment, section.sourcePath, section.component);
-  if (!enabled(section.sourcePath)) return false;
+  if (!enabled(section.sourcePath) && !section.selectionProvenance) return false;
+  const anchorFor = (marker: (typeof markers)[number]): HTMLElement => {
+    const node = enabled(section.sourcePath)
+      ? pageButton(marker.number, () => onOpen(section.sourcePath, marker.pageId, marker.number))
+      : document.createElement("span");
+    if (!enabled(section.sourcePath)) { node.className = "st-digest-anchor"; node.hidden = true; }
+    selectionAnchors.set(node, { sourcePath: section.sourcePath, canonical, pageId: marker.pageId, number: marker.number });
+    return node;
+  };
   for (const anchor of Array.from(fragment.querySelectorAll<HTMLAnchorElement>("a[href]"))) {
     const token = parsePageLinkToken(anchor.getAttribute("href") ?? "") ?? parsePageLinkToken(anchor.getAttribute("data-href") ?? "");
     const marker = token ? linkTokens.get(token) : undefined;
-    if (marker) anchor.replaceWith(pageButton(marker.number, () => onOpen(section.sourcePath, marker.pageId, marker.number)));
+    if (marker) anchor.replaceWith(anchorFor(marker));
   }
   // Standalone metadata must not become a paragraph of its own in a paginated
   // reader. Move chip-only paragraphs into adjacent text before it measures.
   for (const paragraph of Array.from(fragment.querySelectorAll<HTMLParagraphElement>("p"))) {
     const nodes = Array.from(paragraph.childNodes);
-    if (!nodes.length || !nodes.some(node => node instanceof HTMLElement && node.matches("button.st-page-link")) ||
-        !nodes.every(node => node.nodeType === 3 ? !node.textContent?.trim() : node instanceof HTMLElement && node.matches("button.st-page-link"))) continue;
+    if (!nodes.length || !nodes.some(node => node instanceof HTMLElement && node.matches(".st-page-link,.st-digest-anchor")) ||
+        !nodes.every(node => node.nodeType === 3 ? !node.textContent?.trim() : node instanceof HTMLElement && node.matches(".st-page-link,.st-digest-anchor"))) continue;
     const next = paragraph.nextElementSibling as HTMLElement | null;
     const previous = paragraph.previousElementSibling as HTMLElement | null;
     const adjacent = next ?? previous;
@@ -243,6 +297,17 @@ async function renderReaderPageLinkSection(plugin: Plugin, onOpen: PageLinkOpen,
       target.insertBefore(wrapper,checkbox?checkbox.nextSibling:target.firstChild);
     } else target.append(wrapper);
     paragraph.remove();
+  }
+  if (section.selectionProvenance) {
+    // A packed chapter may start in the middle of an original notebook page.
+    const firstLine = selectedLines.values().next().value ?? Infinity;
+    const before = allCanonicalMarkers.filter(marker => marker.line < firstLine);
+    const preceding = before[before.length - 1];
+    if (preceding) {
+      const anchor = document.createElement("span"); anchor.className = "st-digest-anchor"; anchor.hidden = true;
+      selectionAnchors.set(anchor, { sourcePath: section.sourcePath, canonical, pageId: preceding.pageId, number: preceding.number });
+      fragment.insertBefore(anchor, fragment.firstChild);
+    }
   }
   section.element.replaceChildren(...Array.from(fragment.childNodes));
   return true;
@@ -334,9 +399,10 @@ export function installPageLinks(plugin: Plugin, onOpen: PageLinkOpen, enabled: 
 
   const integration: ReaderPageLinksApi = {
     apiVersion: 1,
-    capabilities: ["renderSection"],
+    capabilities: ["renderSection", "selectionProvenance"],
     enabled: isEnabled,
     renderSection: section => renderReaderPageLinkSection(plugin, onOpen, isEnabled, section),
+    selectionSource: selection => readerSelectionSource(plugin, options, selection),
   };
   const pluginWithApi = plugin as PluginWithReaderPageLinks;
   const notifyReader = () => {

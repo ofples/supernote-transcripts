@@ -149,6 +149,15 @@ test("reader rendering rechecks the document toggle after its asynchronous rende
   enabled = true;
 });
 
+test("selection provenance cannot assign an inserted-only or out-of-file chapter to the last page", async () => {
+  enabled = false;
+  for (const sourceLineMap of [[null], [9999]]) {
+    assert.equal(await plugin.pageLinks.renderSection({ element: new FakeNode(), sourcePath: "Transcripts/book.md",
+      markdown: "Inserted text", sourceLineMap, component: {}, selectionProvenance: true }), false);
+  }
+  enabled = true;
+});
+
 test("view header toggle appears only for a document with page links and refreshes its state", () => {
   const actions = [];
   const toggleSource = { value: source };
@@ -247,9 +256,10 @@ test("reader chips open the validated stable page and plugin unload removes the 
 test("pageLinks publishes a versioned, capability-described contract", () => {
   installPageLinks(plugin, async () => {}, () => enabled);
   assert.equal(plugin.pageLinks.apiVersion, 1);
-  assert.deepEqual(plugin.pageLinks.capabilities, ["renderSection"]);
+  assert.deepEqual(plugin.pageLinks.capabilities, ["renderSection", "selectionProvenance"]);
   assert.equal(typeof plugin.pageLinks.enabled, "function");
   assert.equal(typeof plugin.pageLinks.renderSection, "function");
+  assert.equal(typeof plugin.pageLinks.selectionSource, "function");
 });
 
 test("page-link refresh works without a reader or with an upstream reader lacking the optional hook", () => {

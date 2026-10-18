@@ -20,7 +20,7 @@ An enabled provider exposes `app.plugins.plugins['nomad-transcripts'].pageLinks`
 ```ts
 interface ReaderPageLinksV1 {
   apiVersion: 1;
-  capabilities: readonly ['renderSection'];
+  capabilities: readonly ('renderSection' | 'selectionProvenance')[];
   enabled(sourcePath?: string): boolean;
   renderSection(section: {
     element: HTMLElement;
@@ -28,11 +28,27 @@ interface ReaderPageLinksV1 {
     markdown: string;            // exact chapter before rendering
     sourceLineMap: (number | null)[]; // zero-based canonical file lines
     component: Component;        // reader-owned Obsidian render lifecycle
+    selectionProvenance?: boolean; // request selected-range source mapping
   }): Promise<boolean>;
+  // Available only when `selectionProvenance` is listed above. Returns null
+  // for ordinary Markdown, or validated notebook/page provenance.
+  selectionSource?(request: {
+    element: HTMLElement;
+    sourcePath: string;          // vault-relative Markdown file
+    range: Range;                // cloned selected range
+  }): Promise<null | {
+    path: string;                // current local .note path
+    page: number;                // one-based page
+    pageId: string;
+    pageIds: string[];
+    fileId?: string;             // native notebook FILE_ID when available
+  }>;
 }
 ```
 
 The provider validates the managed transcript and canonical source mapping before adding chips. The reader does not parse device paths, call recognition, own credentials or write transcript metadata. Page chips retain inline placement and are applied before pagination, including prefetched chapters.
+
+For Digest selection, Reader requests `selectionProvenance: true` while rendering and calls `selectionSource` only when the provider advertises that capability. Transcripts verifies that a managed transcript's current local notebook and selected text's page identities match its canonical source. The native notebook `FILE_ID` and `PAGEID` values are carried as provenance where available. An adapter that is absent, lacks this capability, or fails cannot supply managed-transcript provenance; Reader must explain how to enable or update Transcripts instead of treating that selection as ordinary Markdown. A `null` result means the file is ordinary Markdown and may use its vault-relative file and quote context without Transcripts. Provenance is available independently of page-chip visibility.
 
 The optional `sourcePath` argument returns effective visibility for that document. Without an argument, `enabled()` remains a compatibility precheck: it is true if the default or a document override enables links. `renderSection` always checks its own document's preference. The provider owns a contextual header button in core Markdown and compatible reader views, beside the optional Sidebar mode control when present. This integration does not require a Sidebar or theme change.
 

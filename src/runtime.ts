@@ -35,7 +35,7 @@ import { PublicationReceipts, canAdvancePublication, canAdoptPublication, type R
 import { hydratePublicationCache } from "./publication-cache";
 import { installUI } from "./ui";
 import { installPageLinks } from "./page-links-ui";
-import { resolveNotePage, notePageUrl, isManagedTranscript } from "./page-navigation";
+import { resolveNotePage, resolveNotePages, notePageUrl, isManagedTranscript } from "./page-navigation";
 import { OriginalPagePreview } from "./page-preview";
 import { responseText, pagesFromRange, selectedPageNumbers, documentText } from "./core.mjs";
 import { BudgetBlocked, CostBook, priceFor, endpointKey, recognitionOutputAllowance } from "./cost";
@@ -594,7 +594,16 @@ export default class SupernoteTranscripts extends Plugin implements Controller {
       try { await this.openNotebookPage(outputPath, pageId, displayNumber); }
       catch (error) { new Notice(readable(error)); }
     }, () => localStorage.getItem(`${this.devicePrefix}:page-links`) !== "false",
-    { storageKey: `${this.devicePrefix}:page-links-files` });
+    { storageKey: `${this.devicePrefix}:page-links-files`, resolveSelection: async (outputPath, markers) => {
+      if (this.initializing || this.disposed || this.platform !== "nomad") throw Error("Native Digest capture is available on a connected Nomad.");
+      const targets = await resolveNotePages(markers.map(marker => ({ outputPath, pageId: marker.pageId, displayNumber: marker.number })), {
+        config: this.config, store: this.store, reader: this.reader(false), platform: this.platform,
+        readTranscript: path => this.app.vault.adapter.read(path), sharedIO: this.sharedIO(),
+      });
+      if (!targets[0].fileId || targets.some(target => !target.pageId.startsWith("native:")))
+        throw Error("This notebook does not expose the native file and page IDs required for a linked Digest.");
+      return { ...targets[0], pageIds: targets.map(target => target.pageId) };
+    } });
     this.addCommand({
       id: "toggle-page-links", name: "Show or hide notebook page links by default",
       callback: () => {

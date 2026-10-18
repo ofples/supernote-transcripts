@@ -1,6 +1,12 @@
 # Interface examples
 
-These are captures of the plugin UI rendered from synthetic fixtures. The notebook labels, paths and OCR excerpts are synthetic; no notebook contents, account data, tokens, settings profiles, or reading positions are included. Screenshots establish layout only, not live-device or provider acceptance.
+The plugin screens below use synthetic fixtures. The notebook labels, paths and OCR excerpts are synthetic; no personal notebook contents, account data, tokens, settings profiles, or reading positions are included. Fixture screenshots establish layout only, not live-device or provider acceptance.
+
+## Bridge confirmation on Nomad
+
+This is an actual Nomad capture using a temporary synthetic Markdown excerpt. The selected word is shown for review before a separate **Save Digest** action. The live **Cancel** check returned to Reader without a provider write.
+
+<img src="bridge-digest-confirmation.png" width="400" alt="Supernote Bridge confirmation with a synthetic excerpt">
 
 ## Sources overview
 

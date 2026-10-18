@@ -123,6 +123,22 @@ See [the readiness findings](PRODUCTION-READINESS.md) for severity, fixes and re
 - [x] Standalone Transcripts, canonical MD Reader and optional Paper/Sidebar boundaries documented and source-checked.
 - [x] Paper packages a pinned, hash-verified canonical Reader artifact with an offline build.
 - [x] MIT selected and applied to original Paper/Sidebar code; Reader MIT, font OFL and Transcripts GPL notices retained.
-- [ ] Native Digests remains an open feasibility enhancement: static inspection found a candidate Android provider route, but no native creation/backlink test or implementation exists. See the [reader enhancement](https://github.com/ofples/obsidian-md-reader/issues/1).
+- [ ] Native Digest-to-notebook source jumps remain an open enhancement. Manual Entry capture is implemented in the current pass below; native jumps require an embedded notebook reference and are not advertised. See the [reader enhancement](https://github.com/ofples/obsidian-md-reader/issues/1).
 
 No publication, visibility change, release tag or device installation is implied by a checked source item.
+
+## Native Digest integration — current implementation pass
+
+- [x] Rename the optional Android helper to **Supernote Bridge**, retaining its package, signing identity and existing sign-in/page routes.
+- [x] Verify the native Knowledge provider's permissions and fixed insert/known-ID read routes on Nomad; record the acknowledged labelled synthetic test separately from any unidentified UI records.
+- [x] Verify the same test record appears in the native Digest UI; preserve notes and pause recognition throughout.
+- [x] Establish the native backlink requirement: the native Digest app requires an embedded notebook Digest reference. Keep that enhancement deferred and retain source provenance without notebook modification.
+- [x] Add a Reader selection action with explicit Bridge confirmation, bounded provenance and durable duplicate prevention.
+- [x] Keep ordinary Markdown capture independent from Transcripts, Paper and Sidebar; use optional Transcripts provenance for notebook excerpts.
+- [x] Keep page provenance usable with hidden chips, chapter packing, repeated text and changed source pages.
+- [x] Verify actual Reader-to-Bridge confirmation/Cancel for ordinary and managed Markdown; test acknowledgement and uncertain outcomes with fixtures and document live-test boundaries.
+- [ ] Exercise a second disposable Digest through the production Save/acknowledgement/Open-original sequence after user authorization.
+- [x] Install verified Bridge 0.4.0, Reader 2.1.3 and Transcripts 0.15.0 artifacts on Nomad; preserve configuration, auth, recognition state and accounting, and leave recognition paused.
+- [x] Remove the known native test record, temporary Markdown fixture and disposable probe app; leave an unidentified same-text Manual Entry untouched. Restore the original Reader view and document the cleanup boundary.
+- [x] Update illustrated installation and Digest guides with the native-backlink limitation and separate live verification evidence.
+- [ ] Publish the source and preview releases.

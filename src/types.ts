@@ -63,6 +63,8 @@ export interface NotebookDescriptor {
   pages: PageDescriptor[];
   width: number;
   height: number;
+  /** Native file identity, when present in the current .note header. */
+  fileId?: string;
 }
 export interface OpenNotebook {
   descriptor: NotebookDescriptor;

@@ -6,7 +6,7 @@ const bundle = await build({
   entryPoints: ["src/page-navigation.ts"], bundle: true, platform: "node", format: "esm", write: false,
 });
 const load = (file) => import("data:text/javascript;base64," + Buffer.from(file.text).toString("base64"));
-const { resolveNotePage, notePageUrl, isManagedTranscript } = await load(bundle.outputFiles[0]);
+const { resolveNotePage, resolveNotePages, notePageUrl, isManagedTranscript } = await load(bundle.outputFiles[0]);
 
 const source = "/storage/emulated/0/Note/Research/notes +%# one.note";
 const output = "Transcripts/notes +%# one.md";
@@ -43,6 +43,33 @@ test("stable page id follows current ordinal after insert and reorder", async ()
   assert.deepEqual(result, { path: source, page: 2, pageId: "native:target" });
   assert.equal(f.opened.closeCount, 1);
   assert.deepEqual(f.calls.read, [output]);
+});
+
+test("excerpt pages resolve together, reuse one snapshot and follow stable identities", async () => {
+  const f = fixture({ descriptors: [
+    { id: "native:a", number: 2, fingerprint: "a" },
+    { id: "native:b", number: 4, fingerprint: "b" },
+  ] });
+  const requests = ["native:a", "native:b"].map(pageId => ({ outputPath: output, pageId, displayNumber: 1 }));
+  assert.deepEqual(await resolveNotePages(requests, f.options), [
+    { path: source, page: 2, pageId: "native:a" }, { path: source, page: 4, pageId: "native:b" },
+  ]);
+  assert.equal(f.calls.open.length, 1); assert.equal(f.opened.closeCount, 1);
+  assert.equal(f.calls.revision.length, 1);
+});
+
+test("excerpt fails as a whole if a later page disappeared or its notebook changed", async () => {
+  for (const nextRevision of ["r1", "r2"]) {
+    const f = fixture({ descriptors: [{ id: "native:a", number: 1, fingerprint: "a" }], nextRevision });
+    await assert.rejects(resolveNotePages(["native:a", "native:missing"].map(pageId => ({ outputPath: output, pageId, displayNumber: 1 })), f.options));
+    assert.equal(f.opened.closeCount, 1);
+  }
+  const f = fixture();
+  for (const requests of [[], Array(101).fill({ outputPath: output, pageId: "a", displayNumber: 1 }),
+    [{ outputPath: output, pageId: "a", displayNumber: 1 }, { outputPath: "Other.md", pageId: "b", displayNumber: 2 }],
+    [{ outputPath: output, pageId: "a", displayNumber: 1 }, { outputPath: output, pageId: "a", displayNumber: 2 }]])
+    await assert.rejects(resolveNotePages(requests, f.options));
+  assert.equal(f.calls.open.length, 0);
 });
 
 test("desktop mode validates an absolute local notebook source", async () => {
