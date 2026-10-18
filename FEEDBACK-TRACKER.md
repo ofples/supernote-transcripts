@@ -12,7 +12,7 @@ Source implementation, fixture checks, installed builds and live verification ar
 - [x] Open a context menu when saved highlighted text is tapped, with Copy, Remove highlight, applicable Digest actions, and a receipt-checked route to the native Digest Edit screen; preserve long-press selection and overlapping excerpts.
 - [x] Verify source tests, real Chromium selection/layout regressions, and the helper protocol/build/signature checks.
 - [x] Verify all four actions together on the active Nomad build, including first-use and subsequent quick saves, a detailed note/list save, duplicate prevention, and synthetic cleanup.
-- [ ] Publish the matching Reader and optional Bridge releases and update the optional Paper bundle.
+- [x] Publish Reader 2.2.0 and Bridge 0.6.0 with verified public download hashes; update the optional Paper 0.5.13 bundle with Sidebar 0.4.3 and the exact released Reader runtime.
 
 Native Digest-to-notebook backlinks remain unsupported: the workflow does not alter `.note` files. The separate existing page-link and Bridge Open original notebook routes are documented independently.
 
