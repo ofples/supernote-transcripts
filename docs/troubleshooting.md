@@ -42,7 +42,7 @@ The update inventory step refreshes changed notebook metadata before AI work: up
 
 ## A page link has no enhanced view
 
-Page links are optional and work without an MD Reader enhancement. Confirm the source identity and saved page ID still match the local notebook. On Nomad, native Notes navigation requires the separate Supernote login helper app version 0.2.0 or later; check that it is installed if the link does not open Notes. On desktop, a compatible enabled `.note` viewer may handle in-vault notebooks; otherwise Transcripts uses its own read-only page preview, including for external local sources.
+Page links are optional and work without an MD Reader enhancement. Confirm the source identity and saved page ID still match the local notebook. On Nomad, native Notes navigation requires the separate Supernote Bridge Android app; install or update to [version 0.6.0](installation.md#optional-companions) if the link does not open Notes. On desktop, a compatible enabled `.note` viewer may handle in-vault notebooks; otherwise Transcripts uses its own read-only page preview, including for external local sources.
 
 ## Restore last version is unavailable or the notebook stays paused
 
