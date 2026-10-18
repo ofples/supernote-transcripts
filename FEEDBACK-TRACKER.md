@@ -141,4 +141,4 @@ No publication, visibility change, release tag or device installation is implied
 - [x] Install verified Bridge 0.4.0, Reader 2.1.3 and Transcripts 0.15.0 artifacts on Nomad; preserve configuration, auth, recognition state and accounting, and leave recognition paused.
 - [x] Remove the known native test record, temporary Markdown fixture and disposable probe app; leave an unidentified same-text Manual Entry untouched. Restore the original Reader view and document the cleanup boundary.
 - [x] Update illustrated installation and Digest guides with the native-backlink limitation and separate live verification evidence.
-- [ ] Publish the source and preview releases.
+- [x] Publish the source and preview releases: Transcripts 0.15.0 with Bridge 0.4.0, and Reader 2.1.3. Anonymous ZIP downloads and GitHub asset digests match the frozen builds; Paper's optional bundle update is coordinated separately.
