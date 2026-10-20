@@ -10,6 +10,7 @@ const makeState = (source: string, ruleId: string, total: number, ready: number,
   const pages = Object.fromEntries(desired.slice(0, ready).map((page) => [page.id, { fingerprint: page.fingerprint, text: `Synthetic transcript for page ${page.number}.`, recipe: "fixture", number: page.number }]));
   return {
     id: `state-${source}`, source, ruleId, output: `Fixture Output/${source.split("/").at(-1)?.replace(/\.note$/i, "")}.md`, revision: "fixture-revision", order: desired.map((page) => page.id), desired, pages, status, paused,
+    lastAutomaticCheck: "2026-10-18T10:00:00.000Z", lastFullCheck: "2026-10-17T10:00:00.000Z",
     ...(issue ? { pageIssues: { [desired.at(-1)!.id]: { fingerprint: desired.at(-1)!.fingerprint, number: desired.at(-1)!.number, status: "failed", kind: "incomplete", reason: "The synthetic response stopped before the page finished.", attempts: 1, updatedAt: "2026-10-15T00:00:00.000Z" } } } : {}),
   };
 };
@@ -62,8 +63,10 @@ export default class StreamlinedUIFixture {
     };
     const listeners = new Set<() => void>();
     const emit = () => listeners.forEach((listener) => listener());
+    let storagePrefs = { hideInExplorer: true, excludeFromSearch: true };
     const counters: any = {
       saveConfig: 0, saveCostSettings: 0, update: 0, pause: 0, resume: 0,
+      recognitionNow: [] as Array<{ source?: string; ruleId?: string }>,
       prioritize: [] as string[], sourcePause: [] as { id: string; paused: boolean }[],
       notebookPause: [] as { source: string; paused: boolean }[], retry: [] as string[],
       retryPage: [] as { source: string; pageId: string }[], skipPage: [] as { source: string; pageId: string }[],
@@ -72,6 +75,7 @@ export default class StreamlinedUIFixture {
       startSubscriptionPairing: 0, stopSubscriptionPairing: 0,
       pairSubscriptionDesktop: [] as { address: string; code: string }[],
       discoverSubscriptionDesktops: 0,
+      setStoragePreferences: 0,
     };
     const actionOrder = () => [...store.queue].sort((a: any, b: any) => (b.priority ?? 0) - (a.priority ?? 0));
     const controller: any = {
@@ -101,6 +105,12 @@ export default class StreamlinedUIFixture {
       },
       subscriptionAccount: { tokens: { accessToken: "fixture-access", refreshToken: "fixture-refresh" }, config: copy(config) },
       actionCounters: counters,
+      storagePreferences() { return copy(storagePrefs); },
+      setStoragePreferences: async (next: { hideInExplorer: boolean; excludeFromSearch: boolean }) => {
+        counters.setStoragePreferences++;
+        storagePrefs = copy(next);
+        emit();
+      },
       notify: emit,
       setProvider(provider: "api" | "subscription") { controller.provider = provider; emit(); },
       connectSubscription: async () => { counters.connectSubscription++; emit(); },
@@ -182,6 +192,25 @@ export default class StreamlinedUIFixture {
       setNotebookPaused: async (source: string, paused: boolean) => {
         counters.notebookPause.push({ source, paused });
         if (store.notebooks[source]) store.notebooks[source].paused = paused;
+        emit();
+      },
+      requestRecognitionNow: async (target: { source?: string; ruleId?: string }) => {
+        counters.recognitionNow.push(copy(target));
+        let source = target.source;
+        if (!source && target.ruleId) {
+          const rule = config.rules.find((item: any) => item.id === target.ruleId);
+          if (rule) source = rule.source.toLowerCase().endsWith(".note") ? rule.source : `${rule.source}/New fixture notebook.note`;
+        }
+        if (source) {
+          const rule = config.rules.find((item: any) => item.id === target.ruleId) ??
+            (store.notebooks[source]?.ruleId && config.rules.find((item: any) => item.id === store.notebooks[source].ruleId)) ??
+            config.rules.find((item: any) => item.source === source || (item.recursive && source!.startsWith(`${item.source}/`)));
+          if (rule && !store.notebooks[source]) store.notebooks[source] = makeState(source, rule.id, 2, 0, "queued");
+          const task = store.queue.find((item: any) => item.source === source);
+          if (task) task.manual = true;
+          else store.queue.push({ source, force: false, manual: true, priority: 10 });
+          controller.progress.manualSources = [...new Set([...(controller.progress.manualSources ?? []), source])];
+        }
         emit();
       },
       excludeNotebook: async () => { throw new Error("Excluded in synthetic fixture."); },

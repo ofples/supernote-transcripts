@@ -80,7 +80,7 @@
   await wait();
   click("Choose this folder");
   assert(
-    field("Output folder").value === "Supernote Transcripts/Transcripts",
+    field("Output folder").value === "Supernote Transcripts",
     "New default path wrong",
   );
   click("Cancel");

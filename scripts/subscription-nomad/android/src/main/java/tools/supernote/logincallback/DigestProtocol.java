@@ -27,6 +27,7 @@ final class DigestProtocol {
     static final int MAX_DECODED_JSON_LENGTH = 40 * 1024;
     static final int MAX_TEXT_LENGTH = 15000;
     static final int MAX_METADATA_LENGTH = 16 * 1024;
+    static final int MAX_DELIVERY_JSON_LENGTH = 1024;
     static final String NOTE_ROOT = "/storage/emulated/0/Note";
 
     private static final String DIGEST_SCHEME = "supernote-bridge";
@@ -67,7 +68,8 @@ final class DigestProtocol {
             for (String key : query.keySet()) if (!"payload".equals(key) && !"mode".equals(key)) throw invalid("review envelope field");
         } else {
             for (String key : query.keySet()) if (!"payload".equals(key) && !"mode".equals(key)
-                    && !"client".equals(key) && !"time".equals(key) && !"signature".equals(key) && !"setup".equals(key)) throw invalid("quick envelope field");
+                    && !"client".equals(key) && !"time".equals(key) && !"signature".equals(key) && !"setup".equals(key)
+                    && !"delivery".equals(key)) throw invalid("quick envelope field");
         }
         String json = strictDecodeComponent(query.get("payload"));
         if (json.length() > MAX_DECODED_JSON_LENGTH) throw invalid("JSON length");
@@ -87,6 +89,13 @@ final class DigestProtocol {
         Origin origin = parseOrigin(object(object.get("origin")));
         Note note = object.containsKey("note") ? parseNote(object(object.get("note"))) : null;
         DigestPayload payload = new DigestPayload(json, requestId, text, origin, note);
+        String deliveryJson = null;
+        DeliveryOptions delivery = null;
+        if (query.containsKey("delivery")) {
+            deliveryJson = strictDecodeComponent(query.get("delivery"));
+            if (deliveryJson.length() > MAX_DELIVERY_JSON_LENGTH) throw invalid("delivery length");
+            delivery = parseDelivery(deliveryJson);
+        }
         String client = query.get("client"), timeText = query.get("time"), signature = query.get("signature"), setup = query.get("setup");
         long time = -1;
         if (mode == RequestMode.QUICK) {
@@ -95,14 +104,14 @@ final class DigestProtocol {
                     || (setup != null && !setup.matches("[0-9a-f]{64}"))) throw invalid("quick signature fields");
             try { time = Long.parseLong(timeText); } catch (NumberFormatException ignored) { throw invalid("quick timestamp"); }
         }
-        return new RequestEnvelope(payload, mode, client, time, signature, setup);
+        return new RequestEnvelope(payload, mode, client, time, signature, setup, delivery, deliveryJson);
     }
 
     private static Map<String, String> parseQuery(String raw) throws InvalidPayloadException {
         if (raw == null || raw.isEmpty()) throw invalid("URI query");
         Map<String, String> result = new LinkedHashMap<>();
         String[] parts = raw.split("&", -1);
-        if (parts.length > 6) throw invalid("URI query count");
+        if (parts.length > 7) throw invalid("URI query count");
         for (String part : parts) {
             int equals = part.indexOf('=');
             if (equals <= 0 || equals != part.lastIndexOf('=')) throw invalid("URI query pair");
@@ -114,19 +123,48 @@ final class DigestProtocol {
     }
 
     static String quickSignature(String client, long time, String rawJson, byte[] secret) throws Exception {
+        return quickSignature(client, time, rawJson, secret, null);
+    }
+
+    static String quickSignature(String client, long time, String rawJson, byte[] secret, String rawDeliveryJson) throws Exception {
         if (client == null || !client.matches("[0-9a-f]{32}") || time < 0 || rawJson == null || secret == null || secret.length != 32)
             throw new IllegalArgumentException("quick signature input");
+        if (rawDeliveryJson != null && rawDeliveryJson.length() > MAX_DELIVERY_JSON_LENGTH)
+            throw new IllegalArgumentException("quick delivery input");
         Mac mac = Mac.getInstance("HmacSHA256");
         mac.init(new SecretKeySpec(secret, "HmacSHA256"));
-        byte[] digest = mac.doFinal((QUICK_MAC_PREFIX + client + "\n" + time + "\n" + rawJson).getBytes(StandardCharsets.UTF_8));
+        String message = QUICK_MAC_PREFIX + client + "\n" + time + "\n" + rawJson;
+        if (rawDeliveryJson != null) message += "\ndelivery-v1:" + sha256Hex(rawDeliveryJson);
+        byte[] digest = mac.doFinal(message.getBytes(StandardCharsets.UTF_8));
         StringBuilder out = new StringBuilder(64);
         for (byte b : digest) out.append(String.format(Locale.ROOT, "%02x", b & 0xff));
         return out.toString();
     }
 
     static boolean quickSignatureMatches(String client, long time, String rawJson, byte[] secret, String supplied) {
-        try { return supplied != null && MessageDigest.isEqual(quickSignature(client, time, rawJson, secret).getBytes(StandardCharsets.US_ASCII), supplied.getBytes(StandardCharsets.US_ASCII)); }
+        return quickSignatureMatches(client, time, rawJson, secret, null, supplied);
+    }
+
+    static boolean quickSignatureMatches(String client, long time, String rawJson, byte[] secret, String rawDeliveryJson, String supplied) {
+        try { return supplied != null && MessageDigest.isEqual(quickSignature(client, time, rawJson, secret, rawDeliveryJson).getBytes(StandardCharsets.US_ASCII), supplied.getBytes(StandardCharsets.US_ASCII)); }
         catch (Exception ignored) { return false; }
+    }
+
+    private static String sha256Hex(String value) throws Exception {
+        byte[] digest = MessageDigest.getInstance("SHA-256").digest(value.getBytes(StandardCharsets.UTF_8));
+        StringBuilder out = new StringBuilder(64);
+        for (byte b : digest) out.append(String.format(Locale.ROOT, "%02x", b & 0xff));
+        return out.toString();
+    }
+
+    private static DeliveryOptions parseDelivery(String rawJson) throws InvalidPayloadException {
+        Map<String, Object> object = object(new JsonParser(rawJson).parse());
+        requireOnlyKeys(object, "openNative", "categoryName");
+        requireKeys(object, "openNative");
+        Object openNativeValue = object.get("openNative");
+        if (!(openNativeValue instanceof Boolean)) throw invalid("delivery openNative");
+        String categoryName = object.containsKey("categoryName") ? boundedString(object.get("categoryName"), 0, 256, false) : null;
+        return new DeliveryOptions((Boolean) openNativeValue, categoryName);
     }
 
     static byte[] parseHexSecret(String hex) throws InvalidPayloadException {
@@ -278,15 +316,37 @@ final class DigestProtocol {
 
     static String manualComment(DigestPayload payload, String userNote) throws InvalidPayloadException {
         if (userNote == null) userNote = "";
+        StringBuilder comment = new StringBuilder();
+        if (!userNote.trim().isEmpty()) comment.append("Note: ").append(userNote.trim()).append("\n\n");
+        if (payload.note != null) {
+            String relativePath = payload.note.path.substring((NOTE_ROOT + "/").length());
+            if (relativePath.toLowerCase(Locale.ROOT).endsWith(".note"))
+                relativePath = relativePath.substring(0, relativePath.length() - 5);
+            comment.append(relativePath).append(" | Page ").append(payload.note.page);
+        } else {
+            String source = payload.origin.file.substring(0, payload.origin.file.length() - 3);
+            comment.append("Source: ").append(source);
+            if (payload.origin.heading != null && !payload.origin.heading.isEmpty())
+                comment.append(" | Heading: ").append(payload.origin.heading);
+        }
+        if (comment.length() > 2000) throw invalid("comment length");
+        return comment.toString();
+    }
+
+    /** Exact pre-notebook-provenance format for SAVED ledger rows without saved_comment. */
+    static String legacyManualComment(DigestPayload payload) throws InvalidPayloadException {
         String uri = "obsidian://open?vault=" + encodeQuery(payload.origin.vault)
                 + "&file=" + encodeQuery(payload.origin.file);
         StringBuilder comment = new StringBuilder();
-        if (!userNote.trim().isEmpty()) comment.append("Note: ").append(userNote.trim()).append("\n\n");
-        if (payload.note != null) comment.append("Supernote: ").append(fileName(payload.note.path))
+        if (payload.note != null) comment.append("Supernote: ").append(payload.note.path.substring(payload.note.path.lastIndexOf('/') + 1))
                 .append(" · page ").append(payload.note.page).append('\n');
         comment.append("Obsidian: ").append(payload.origin.file).append('\n').append(uri);
         if (comment.length() > 2000) throw invalid("comment length");
         return comment.toString();
+    }
+
+    static String savedReceiptComment(DigestPayload payload, String storedComment) throws InvalidPayloadException {
+        return storedComment == null ? legacyManualComment(payload) : storedComment;
     }
 
     static String metadataJson(DigestPayload payload) throws InvalidPayloadException {
@@ -315,9 +375,11 @@ final class DigestProtocol {
         return out.toString();
     }
 
-    private static String fileName(String path) {
+    private static String displayName(String path, String extension) {
         int slash = path.lastIndexOf('/');
-        return slash >= 0 ? path.substring(slash + 1) : path;
+        String name = slash >= 0 ? path.substring(slash + 1) : path;
+        if (name.toLowerCase(Locale.ROOT).endsWith(extension)) return name.substring(0, name.length() - extension.length());
+        return name;
     }
 
     /** Compares every expected field; only a provider-generated root unique_identifier may be added. */
@@ -528,10 +590,24 @@ final class DigestProtocol {
         final RequestMode mode;
         final String client, signature, setupHex;
         final long time;
-        RequestEnvelope(DigestPayload payload, RequestMode mode, String client, long time, String signature, String setupHex) {
+        final DeliveryOptions delivery;
+        final String rawDeliveryJson;
+        RequestEnvelope(DigestPayload payload, RequestMode mode, String client, long time, String signature, String setupHex,
+                DeliveryOptions delivery, String rawDeliveryJson) {
             this.payload = payload; this.mode = mode; this.client = client; this.time = time; this.signature = signature; this.setupHex = setupHex;
+            this.delivery = delivery; this.rawDeliveryJson = rawDeliveryJson;
         }
         boolean isQuick() { return mode == RequestMode.QUICK; }
+        boolean shouldOpenNative() { return delivery == null || delivery.openNative; }
+        String categoryName() { return delivery == null ? null : delivery.categoryName; }
+    }
+
+    static final class DeliveryOptions {
+        final boolean openNative;
+        final String categoryName;
+        DeliveryOptions(boolean openNative, String categoryName) {
+            this.openNative = openNative; this.categoryName = categoryName;
+        }
     }
 
     static final class ListDisplayName {

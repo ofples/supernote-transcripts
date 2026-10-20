@@ -52,6 +52,19 @@ test("close errors remain isolated and callbacks run after handles close", async
   assert.match(result.get("0").error.message, /close failed/);
 });
 
+test("retention is opt-in, bounded, and limited to readers with verified fork capability",async()=>{
+  const originals=[],closed=[];
+  const result=await inventoryNotebooks(entries,{async open(path){
+    const opened={descriptor:descriptor(path),render:async()=>"",close(){closed.push(path);}};
+    if(Number(path)<6)opened.fork=async()=>({...opened,close(){}});
+    originals.push(opened);return opened;
+  }},{platform:"nomad",retain:true});
+  assert.equal([...result.values()].filter(item=>item.reusable).length,4);
+  assert.equal(closed.length,5);
+  for(const item of result.values())item.reusable?.close();
+  assert.equal(closed.length,9);
+});
+
 test("fresh queue projection preserves publication baseline and matches reused fingerprints", () => {
   const oldPage = { id: "old", number: 1, fingerprint: "same" };
   const state = { desired: [oldPage], order: ["old"], pages: { old: { ...oldPage, text: "saved", recipe: "previous-model" } },

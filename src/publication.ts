@@ -7,7 +7,8 @@ type Inventory={id:string;fingerprint:string}[];
 type PublishedResult={id:string;fingerprint:string;textHash:string;recipe:string};
 type PresentationCleanup={updatedAt:string;inputHash:string;outputHash:string;model:string;quality:"careful";provider:"api"|"subscription";basePages:PageDescriptor[];stale?:boolean};
 type CleanedPage={fingerprint:string;baseText:string;text:string};
-export interface ReceiptPresentation { cleanedPages:Record<string,CleanedPage>; cleanup:PresentationCleanup }
+export interface ReceiptPresentation { cleanedPages:Record<string,CleanedPage>; cleanup?:PresentationCleanup;
+  editedPages?:NotebookState["editedPages"]; editConflicts?:NotebookState["editConflicts"] }
 export interface Receipt {
   version:2;
   notebookId:string;
@@ -35,7 +36,7 @@ function cleanInventory(pages:unknown):PageDescriptor[] {
 function presentation(value:unknown, pages:Inventory):ReceiptPresentation {
   if(!value||typeof value!=="object"||Array.isArray(value))throw Error("Invalid publication presentation.");
   const v=value as any;
-  if(!v.cleanedPages||typeof v.cleanedPages!=="object"||Array.isArray(v.cleanedPages)||!v.cleanup||typeof v.cleanup!=="object"||Array.isArray(v.cleanup))throw Error("Invalid publication presentation.");
+  if(!v.cleanedPages||typeof v.cleanedPages!=="object"||Array.isArray(v.cleanedPages))throw Error("Invalid publication presentation.");
   const current=new Map(pages.map(p=>[p.id,p.fingerprint]));
   const cleanedPages:Record<string,CleanedPage>={};
   for(const [id,p] of Object.entries(v.cleanedPages) as [string,any][]) {
@@ -43,11 +44,38 @@ function presentation(value:unknown, pages:Inventory):ReceiptPresentation {
       throw Error("Invalid cleaned page presentation.");
     cleanedPages[id]={fingerprint:p.fingerprint,baseText:p.baseText,text:p.text};
   }
+  const result:ReceiptPresentation={cleanedPages};
+  if(v.cleanup!==undefined){
   const c=v.cleanup;
+  if(!c||typeof c!=="object"||Array.isArray(c))throw Error("Invalid document cleanup presentation.");
   if(typeof c.updatedAt!=="string"||!Number.isFinite(Date.parse(c.updatedAt))||typeof c.inputHash!=="string"||!HASH.test(c.inputHash)||typeof c.outputHash!=="string"||!HASH.test(c.outputHash)||typeof c.model!=="string"||!c.model.trim()||c.model.length>200||/[\u0000-\u001f]/.test(c.model)||c.quality!=="careful"||!["api","subscription"].includes(c.provider)||!Array.isArray(c.basePages)||c.basePages.length>20000||(c.stale!==undefined&&typeof c.stale!=="boolean"))throw Error("Invalid document cleanup presentation.");
   const cleanup:PresentationCleanup={updatedAt:c.updatedAt,inputHash:c.inputHash,outputHash:c.outputHash,model:c.model,quality:"careful",provider:c.provider,basePages:cleanInventory(c.basePages)};
   if(c.stale!==undefined)cleanup.stale=c.stale;
-  return {cleanedPages,cleanup};
+  result.cleanup=cleanup;
+  }
+  for(const field of ["editedPages","editConflicts"] as const){
+    if(v[field]===undefined)continue;
+    if(!v[field]||typeof v[field]!=="object"||Array.isArray(v[field]))throw Error("Invalid page edit presentation.");
+    const values:Record<string,any>={};
+    for(const [id,p] of Object.entries(v[field]) as [string,any][]){
+      if(["__proto__","prototype","constructor"].includes(id)||!current.has(id)||!p||typeof p!=="object"||Array.isArray(p)||
+        typeof p.fingerprint!=="string"||!p.fingerprint||typeof p.baseText!=="string"||p.baseText.length>1_000_000)
+        throw Error("Invalid page edit presentation.");
+      if(field==="editedPages"){
+        if(typeof p.text!=="string"||p.text.length>1_000_000)throw Error("Invalid edited page text.");
+        values[id]={fingerprint:p.fingerprint,baseText:p.baseText,text:p.text};
+      }else{
+        if(p.fingerprint!==current.get(id)||!Number.isSafeInteger(p.number)||p.number<1||
+          [p.editedText,p.recognizedText].some(t=>typeof t!=="string"||t.length>1_000_000)||
+          typeof p.reason!=="string"||!p.reason.trim()||p.reason.length>4000||
+          (p.proposedText!==undefined&&(typeof p.proposedText!=="string"||p.proposedText.length>1_000_000)))throw Error("Invalid page reconciliation conflict.");
+        values[id]={fingerprint:p.fingerprint,number:p.number,baseText:p.baseText,editedText:p.editedText,
+          recognizedText:p.recognizedText,reason:p.reason,...(p.proposedText===undefined?{}:{proposedText:p.proposedText})};
+      }
+    }
+    result[field]=values;
+  }
+  return result;
 }
 function payload(r:Omit<Receipt,"recordId">){
   const base={version:2,notebookId:r.notebookId,textHash:r.textHash,pages:r.pages,results:r.results,createdAt:r.createdAt,supersedes:r.supersedes};
@@ -58,10 +86,15 @@ const lexical=(a:string,b:string)=>a<b?-1:a>b?1:0;
 function same(a:Inventory,b:Inventory){return a.length===b.length&&a.every((p,i)=>p.id===b[i].id&&p.fingerprint===b[i].fingerprint);}
 
 export class PublicationReceipts {
-  constructor(private io:SharedIO,private now:()=>number=Date.now){}
+  private now:()=>number;
+  private sharedRoot:string;
+  constructor(private io:SharedIO,sharedRootOrNow:string|(()=>number)=SHARED_ROOT,now:()=>number=Date.now){
+    this.sharedRoot=typeof sharedRootOrNow==="string"?sharedRootOrNow:SHARED_ROOT;
+    this.now=typeof sharedRootOrNow==="function"?sharedRootOrNow:now;
+  }
   private folder(id:string,h:string){
     if(!HASH.test(id)||!HASH.test(h))throw Error("Invalid publication identity.");
-    return `${SHARED_ROOT}/${id}/publications/${h}`;
+    return `${this.sharedRoot}/${id}/publications/${h}`;
   }
   private async received(id:string,h:string):Promise<{tips:Receipt[];invalid:boolean}>{
     const folder=this.folder(id,h);

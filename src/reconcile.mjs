@@ -1,5 +1,6 @@
 import { CONTINUE_PAGE_TEXT, EMPTY_PAGE_TEXT } from "./prompts.mjs";
 import { displayedPageText } from "./provenance.mjs";
+import { validateReconciledText } from "./edit-reconciliation.mjs";
 const pathParts = (value) => value.split("/");
 export function validateSource(value, platform) {
   const path = value.trim().replace(/\\/g, "/").replace(/\/+$/, "");
@@ -240,7 +241,21 @@ export function parseRecognitionGroup(raw, targets, { allowLegacy = false, avail
     while (text.startsWith(CONTINUE_PAGE_TEXT)) text = text.slice(CONTINUE_PAGE_TEXT.length).trimStart();
     if (!text) continue;
     if (text !== EMPTY_PAGE_TEXT && entry.joinPrevious && (!availablePages || availablePages.includes(page.number - 1))) text = `${CONTINUE_PAGE_TEXT}\n${text}`;
-    results.push({ page, text });
+    let reconciliation;
+    if (Object.hasOwn(entry, "reconciliation")) {
+      const candidate = entry.reconciliation;
+      if (candidate && candidate.status === "conflict") {
+        reconciliation = { status: "conflict", reason: typeof candidate.reason === "string" && candidate.reason.trim() ? candidate.reason.slice(0, 1000) : "The transcription model could not safely reconcile this page." };
+      } else if (candidate && candidate.status === "merged" && typeof candidate.text === "string") {
+        // Structural safety can be checked here. The caller that supplied the edit must
+        // additionally validate the proposal against that exact user-edited text.
+        const structural = validateReconciledText("", candidate.text);
+        reconciliation = structural.valid
+          ? { status: "merged", text: candidate.text }
+          : { status: "conflict", reason: structural.reason };
+      } else reconciliation = { status: "conflict", reason: "The transcription response contained malformed reconciliation data." };
+    }
+    results.push({ page, text, ...(reconciliation ? { reconciliation } : {}) });
   }
   for (const page of targets) {
     if (failures.some((failure) => failure.page === page)) continue;

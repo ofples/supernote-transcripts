@@ -8,7 +8,7 @@ import { visibleSequence } from "./reader-support/visibility";
 // @ts-ignore JavaScript helper is kept directly executable by node:test.
 import { extractDeviceOcr, MAX_RECOGNITION_BLOCK_BYTES } from "./reader-support/device-ocr.mjs";
 import { excludedRelative } from "./reconcile.mjs";
-import type { ReadOnlySource, OpenNotebook } from "./types";
+import type { ReadOnlySource, OpenNotebook, NotebookCheckOptions } from "./types";
 import {
   StreamingFile,
   pairs,
@@ -53,7 +53,7 @@ async function records(source: ByteSource, addresses: number[], hashes?: Map<num
 interface IndexedPage {
   meta: Record<string, string>;
   sequence: string[];
-  bitmaps: { name: string; address: number; layerName: string; hash?:string }[];
+  bitmaps: { name: string; address: number; layerName: string; hash?:string; length?:number }[];
   checks: [number,string][];
   width: number;
   height: number;
@@ -65,6 +65,7 @@ export async function indexNotebook(
   source: ByteSource,
   onStage: (detail: string) => void = () => {},
   previewPage?: number,
+  checkOptions?: NotebookCheckOptions,
 ) {
   onStage("Checking file signature");
   if (source.size < 28) throw new Error("Notebook is too short.");
@@ -77,8 +78,10 @@ export async function indexNotebook(
     true,
   );
   let footer: Record<string, string> = {};
+  const metadataHashes = new Map<number,string>();
   onStage("Reading current page inventory");
-  await source.scan([footerAddress], (_a, b) => {
+  await source.scan([footerAddress], async (a, b) => {
+    metadataHashes.set(a, await sha(b));
     for (const m of new TextDecoder()
       .decode(b)
       .matchAll(/<([^:<>]+):([^:<>]+)>/g)) {
@@ -109,7 +112,6 @@ export async function indexNotebook(
   if (previewPage !== undefined) entries = [entries[previewPage - 1]];
   onStage("Reading page metadata");
   const headerAddress = address(footer.FILE_FEATURE) || 24;
-  const metadataHashes = new Map<number,string>();
   const metadata = await records(source, [
     headerAddress,
     ...entries.map((k) => address(footer[k])),
@@ -161,16 +163,52 @@ export async function indexNotebook(
       }),
     };
   });
+  let ids = identities(pages.map((p) => p.meta.PAGEID), pages.map(() => ""));
+  let selectedIndexes = pages.map((_, i) => i);
+  let checkMode: "new" | "recent" | "all" = "all";
+  const partialAutomatic = !!checkOptions && previewPage === undefined &&
+    checkOptions.mode !== "all" && checkOptions.previous.length > 0;
+  if (partialAutomatic && checkOptions) {
+    const unavailable = () => {
+      const error = new Error("Automatic check requires unique native page IDs. Run Update to check this notebook.");
+      error.name = "AutomaticCheckUnavailableError";
+      return error;
+    };
+    const current = pages.map((p) => p.meta.PAGEID ? `native:${p.meta.PAGEID}` : "");
+    const previous = checkOptions.previous.map((p) => p.id);
+    if (current.some((id) => !id) || new Set(current).size !== current.length ||
+        previous.some((id) => !id.startsWith("native:")) || new Set(previous).size !== previous.length)
+      throw unavailable();
+    ids = current;
+    const oldIds = new Set(previous);
+    const isNew = (id: string) => !oldIds.has(id);
+    const currentIds = new Set(current);
+    const pendingIds = new Set((checkOptions.pendingPageIds || []).filter((id) => currentIds.has(id)));
+    const newIndexes = pages.flatMap((_, i) => isNew(ids[i]) || pendingIds.has(ids[i]) ? [i] : []);
+    const recentStart = Math.max(0, pages.length - Math.max(0, Math.floor(checkOptions.recentPages || 0)));
+    selectedIndexes = checkOptions.mode === "new"
+      ? newIndexes
+      : pages.flatMap((_, i) => isNew(ids[i]) || pendingIds.has(ids[i]) || i >= recentStart ? [i] : []);
+    checkMode = checkOptions.mode;
+  }
   onStage("Fingerprinting current page bitmaps");
   const bitmapHashes = new Map<number, string>();
+  const bitmapLengths = new Map<number, number>();
   await source.scan(
-    pages.flatMap((p) => p.bitmaps.map((b) => b.address)),
+    selectedIndexes.flatMap((i) => pages[i].bitmaps.map((b) => b.address)),
     async (a, b) => {
       bitmapHashes.set(a, await sha(b));
+      bitmapLengths.set(a, b.length);
     },
   );
-  for(const p of pages)for(const b of p.bitmaps)b.hash=bitmapHashes.get(b.address);
-  for (const p of pages)
+  for(const p of pages)for(const b of p.bitmaps){b.hash=bitmapHashes.get(b.address);b.length=bitmapLengths.get(b.address);}
+  const previousById = new Map((checkOptions?.previous || []).map((p) => [p.id, p.fingerprint]));
+  for (let pageIndex = 0; pageIndex < pages.length; pageIndex++) {
+    const p = pages[pageIndex];
+    if (!selectedIndexes.includes(pageIndex)) {
+      p.fingerprint = previousById.get(ids[pageIndex]) || "";
+      continue;
+    }
     p.fingerprint = await sha(
       JSON.stringify({
         renderer: "snt-0.7.1-native-1",
@@ -184,13 +222,13 @@ export async function indexNotebook(
         ]),
       }),
     );
-  const ids = identities(
-    pages.map((p) => p.meta.PAGEID),
-    pages.map((p) => p.fingerprint),
-  );
+  }
+  if (!partialAutomatic)
+    ids = identities(pages.map((p) => p.meta.PAGEID), pages.map((p) => p.fingerprint));
   const fileId = typeof header.FILE_ID === "string" && header.FILE_ID.length > 0 &&
     header.FILE_ID.length <= 256 && !/[\u0000-\u001f\u007f]/.test(header.FILE_ID) ? header.FILE_ID : undefined;
-  return { pages, ids, numbers, width, height, fileId };
+  return { pages, ids, numbers, width, height, fileId, signature, footerAddress, checks: [...metadataHashes],
+    checkMode, checkedPageIds: selectedIndexes.map((i) => ids[i]) };
 }
 export class AndroidReadOnlySource implements ReadOnlySource {
   constructor(
@@ -237,14 +275,14 @@ export class AndroidReadOnlySource implements ReadOnlySource {
     const s = await this.fs.stat(sourcePath(path));
     return `${s.mtime}:${s.size}`;
   }
-  async open(path: string): Promise<OpenNotebook> {
-    return this.openInternal(path);
+  async open(path: string, options?: NotebookCheckOptions): Promise<OpenNotebook> {
+    return this.openInternal(path, undefined, options);
   }
   async preview(path: string, page: number): Promise<string> {
     const opened = await this.openInternal(path, page);
     try { return await opened.render(page); } finally { opened.close(); }
   }
-  private async openInternal(path: string, previewPage?: number): Promise<OpenNotebook> {
+  private async openInternal(path: string, previewPage?: number, checkOptions?: NotebookCheckOptions): Promise<OpenNotebook> {
     path = sourcePath(path);
     const before = await this.fs.stat(path);
     const revision = `${before.mtime}:${before.size}`;
@@ -264,7 +302,7 @@ export class AndroidReadOnlySource implements ReadOnlySource {
           `${name} - ${pass}: ${(Math.min(read, size) / 1048576) | 0} / ${Math.ceil(size / 1048576)} MB`,
         ),
     );
-    return openByteNotebook(path, revision, source, () => this.revision(path), this.progress, report, previewPage);
+    return openByteNotebook(path, revision, source, () => this.revision(path), this.progress, report, previewPage, checkOptions);
   }
 }
 
@@ -279,15 +317,94 @@ export async function openByteNotebook(
   report: (detail: string) => void = (detail) =>
     progress?.("Reading notebook", `${path.split("/").pop()} - ${detail}`),
   previewPage?: number,
+  checkOptions?: NotebookCheckOptions,
 ): Promise<OpenNotebook> {
   const name = path.split("/").pop();
-  const index = await indexNotebook(source, report, previewPage);
+  const index = await indexNotebook(source, report, previewPage, checkOptions);
   if ((await readRevision()) !== revision)
     throw new Error(
       "Notebook changed while checking. Close it in Notes and retry.",
     );
+  let references = 1;
+  const release = () => {
+    references--;
+    if (references === 0) index.pages.length = 0;
+  };
+  const validateFork = async () => {
+    if ((await readRevision()) !== revision)
+      throw new Error("Notebook changed while checking. Close it in Notes and retry.");
+    const signature = new TextDecoder().decode(await source.head());
+    if (signature !== index.signature) {
+      const error = new Error("Notebook content changed after indexing. Save it in Notes and retry this notebook.");
+      error.name = "SourceChangedError";
+      throw error;
+    }
+    const footerAddress = new DataView((await source.tail()).buffer).getUint32(0, true);
+    if (footerAddress !== index.footerAddress) {
+      const error = new Error("Notebook content changed after indexing. Save it in Notes and retry this notebook.");
+      error.name = "SourceChangedError";
+      throw error;
+    }
+    const expected = new Map<number, string>(index.checks);
+    await source.scan([...expected.keys()], async (a, bytes) => {
+      if ((await sha(bytes)) !== expected.get(a)) {
+        const error = new Error("Notebook content changed after indexing. Save it in Notes and retry this notebook.");
+        error.name = "SourceChangedError";
+        throw error;
+      }
+    });
+    if ((await readRevision()) !== revision)
+      throw new Error("Notebook changed while checking. Close it in Notes and retry.");
+  };
+  const create = (): OpenNotebook => {
   let closed = false;
   let tail: Promise<unknown> = Promise.resolve();
+  const renderPage = async (number: number, supplied?: Map<number,Uint8Array>) => {
+    if (closed) throw new Error("Notebook was closed.");
+    const p = index.pages[index.numbers.indexOf(number)];
+    if (!p || !Number.isInteger(number))
+      throw new Error("Page number is outside this notebook.");
+    if ((await readRevision()) !== revision)
+      throw new Error("Notebook changed before rendering.");
+    let buffers = supplied;
+    if (!buffers) {
+      report(`Reading bitmap blocks for page ${number}`);
+      buffers = new Map<number, Uint8Array>();
+      const expected = new Map<number,string>([...p.checks,...p.bitmaps.filter(b=>b.hash).map(b=>[b.address,b.hash!] as [number,string])]);
+      await source.scan(
+        [...expected.keys(),...p.bitmaps.map((b) => b.address)],
+        async (a, b) => {
+          const hash = await sha(b);
+          if(expected.has(a) && hash!==expected.get(a)){
+            const error=new Error("Notebook content changed after indexing. Save it in Notes and retry this notebook.");
+            error.name="SourceChangedError";throw error;
+          }
+          for (const bitmap of p.bitmaps) if (bitmap.address === a) {
+            if (bitmap.hash && bitmap.hash !== hash) {
+              const error=new Error("Notebook content changed after indexing. Save it in Notes and retry this notebook.");
+              error.name="SourceChangedError";throw error;
+            }
+            bitmap.hash = hash;
+            bitmap.length = b.length;
+          }
+          buffers!.set(a, b);
+        },
+      );
+    }
+    if (p.sequence.length && !p.bitmaps.some((b) => buffers!.get(b.address)?.length))
+      throw new Error("Notebook page contains no renderable bitmap.");
+    const page: IRenderablePage = { PAGESTYLE: p.meta.PAGESTYLE || "0", LAYERSEQ: p.sequence as any };
+    for (const b of p.bitmaps)
+      (page as any)[b.name] = { LAYERNAME: b.layerName, bitmapBuffer: buffers.get(b.address) || null };
+    progress?.("Rendering", `${name} - rendering page ${number} at ${p.width} x ${p.height}`);
+    const rendered = p.sequence.length
+      ? (await toImage({ pageWidth: p.width, pageHeight: p.height, pages: [page] }, [1]))[0]
+      : new Image(p.width, p.height, { colorModel: ImageColorModel.GREY }).fill(255);
+    const image = encodeDataURL(flattenToWhite(rendered));
+    if ((await readRevision()) !== revision)
+      throw new Error("Notebook changed while rendering.");
+    return image;
+  };
   return {
     descriptor: {
       path,
@@ -300,60 +417,111 @@ export async function openByteNotebook(
         number: index.numbers[i],
         fingerprint: p.fingerprint,
       })),
+      checkedPageIds: index.checkedPageIds,
+      checkMode: index.checkMode,
+    },
+    fork: async () => {
+      if (closed) throw new Error("Notebook was closed.");
+      references++;
+      let transferred = false;
+      try {
+        await validateFork();
+        if (closed) throw new Error("Notebook was closed.");
+        transferred = true;
+        return create();
+      } finally {
+        if (!transferred) release();
+      }
     },
     render: (number: number) => {
+      const job = tail.then(() => renderPage(number));
+      tail = job.catch(() => {});
+      return job;
+    },
+    renderMany: (numbers: number[]) => {
       const job = tail.then(async () => {
         if (closed) throw new Error("Notebook was closed.");
-        const p = index.pages[index.numbers.indexOf(number)];
-        if (!p || !Number.isInteger(number))
-          throw new Error("Page number is outside this notebook.");
-        if ((await readRevision()) !== revision)
-          throw new Error("Notebook changed before rendering.");
-        report(`Reading bitmap blocks for page ${number}`);
-        const buffers = new Map<number, Uint8Array>();
-        const expected = new Map<number,string>([...p.checks,...p.bitmaps.filter(b=>b.hash).map(b=>[b.address,b.hash!] as [number,string])]);
-        await source.scan(
-          [...expected.keys(),...p.bitmaps.map((b) => b.address)],
-          async (a, b) => {
-            if(expected.has(a) && await sha(b)!==expected.get(a)){
-              const error=new Error("Notebook content changed after indexing. Save it in Notes and retry this notebook.");
-              error.name="SourceChangedError";throw error;
-            }
-            buffers.set(a, b);
-          },
-        );
-        const page: IRenderablePage = {
-          PAGESTYLE: p.meta.PAGESTYLE || "0",
-          LAYERSEQ: p.sequence as any,
+        const selected = numbers.map(number => {
+          const page = index.pages[index.numbers.indexOf(number)];
+          if (!page || !Number.isInteger(number)) throw new Error("Page number is outside this notebook.");
+          return { number, page };
+        });
+        const knownBytes = selected.reduce((total, { page }) => {
+          const pageBytes = page.bitmaps.reduce((sum, bitmap) => sum + (bitmap.length ?? 0), 0);
+          return total + pageBytes;
+        }, 0);
+        if (selected.length > 8 || knownBytes > 16 * 1024 * 1024) {
+          const images: string[] = [];
+          for (const { number } of selected) images.push(await renderPage(number));
+          return images;
+        }
+        const expected = new Map<number,string>();
+        const bitmapRefs = new Map<number, IndexedPage["bitmaps"]>();
+        const rememberExpected = (address: number, hash: string) => {
+          const previousHash = expected.get(address);
+          if (previousHash && previousHash !== hash) {
+            const error = new Error("Notebook content changed after indexing. Save it in Notes and retry this notebook.");
+            error.name = "SourceChangedError";
+            throw error;
+          }
+          expected.set(address, hash);
         };
-        for (const b of p.bitmaps)
-          (page as any)[b.name] = {
-            LAYERNAME: b.layerName,
-            bitmapBuffer: buffers.get(b.address) || null,
-          };
-        if (
-          p.sequence.length &&
-          !p.bitmaps.some((b) => buffers.get(b.address)?.length)
-        )
-          throw new Error("Notebook page contains no renderable bitmap.");
-        progress?.(
-          "Rendering",
-          `${name} - rendering page ${number} at ${p.width} x ${p.height}`,
-        );
-        const rendered = p.sequence.length
-          ? (
-              await toImage(
-                { pageWidth: p.width, pageHeight: p.height, pages: [page] },
-                [1],
-              )
-            )[0]
-          : new Image(p.width, p.height, {
-              colorModel: ImageColorModel.GREY,
-            }).fill(255);
-        const image = encodeDataURL(flattenToWhite(rendered));
-        if ((await readRevision()) !== revision)
-          throw new Error("Notebook changed while rendering.");
-        return image;
+        for (const { page } of selected) {
+          for (const [address, hash] of page.checks) rememberExpected(address, hash);
+          for (const bitmap of page.bitmaps) {
+            const refs = bitmapRefs.get(bitmap.address) ?? [];
+            refs.push(bitmap);
+            bitmapRefs.set(bitmap.address, refs);
+            if (bitmap.hash) rememberExpected(bitmap.address, bitmap.hash);
+          }
+        }
+        const buffers = new Map<number,Uint8Array>();
+        let retainedBytes = 0;
+        report(`Reading bitmap blocks for pages ${numbers.join(", ")}`);
+        try {
+          await source.scan([...expected.keys(), ...selected.flatMap(({ page }) => page.bitmaps.map(bitmap => bitmap.address))], async (address, bytes) => {
+            const hash = await sha(bytes);
+            if (expected.has(address) && hash !== expected.get(address)) {
+              const error = new Error("Notebook content changed after indexing. Save it in Notes and retry this notebook.");
+              error.name = "SourceChangedError";
+              throw error;
+            }
+            for (const bitmap of bitmapRefs.get(address) ?? []) {
+              if (bitmap.hash && bitmap.hash !== hash) {
+                const error = new Error("Notebook content changed after indexing. Save it in Notes and retry this notebook.");
+                error.name = "SourceChangedError";
+                throw error;
+              }
+              bitmap.hash = hash;
+              bitmap.length = bytes.length;
+            }
+            if (!buffers.has(address)) {
+              if (retainedBytes + bytes.length > 16 * 1024 * 1024) {
+                const error = new Error("Render batch exceeded its memory limit.");
+                error.name = "RenderBatchLimitError";
+                throw error;
+              }
+              retainedBytes += bytes.length;
+            }
+            buffers.set(address, bytes);
+          });
+        } catch (error) {
+          if ((error as Error)?.name !== "RenderBatchLimitError") throw error;
+          buffers.clear();
+          const images: string[] = [];
+          for (const { number } of selected) images.push(await renderPage(number));
+          return images;
+        }
+        const images: string[] = [];
+        for (const { number, page } of selected) {
+          const pageBuffers = new Map<number,Uint8Array>();
+          for (const bitmap of page.bitmaps) {
+            const bytes = buffers.get(bitmap.address);
+            if (bytes) pageBuffers.set(bitmap.address, bytes);
+          }
+          images.push(await renderPage(number, pageBuffers));
+        }
+        return images;
       });
       tail = job.catch(() => {});
       return job;
@@ -376,6 +544,7 @@ export async function openByteNotebook(
         if (ocrAddress < 24 || ocrAddress + 4 > source.size) return undefined;
         let text: string | undefined;
         const expected = new Map<number, string>(p.checks);
+        report("Reading device OCR text");
         try {
           await source.scan([...expected.keys(), ocrAddress], async (a, bytes) => {
             if (expected.has(a) && (await sha(bytes)) !== expected.get(a)) {
@@ -399,11 +568,61 @@ export async function openByteNotebook(
       tail = job.catch(() => {});
       return job;
     },
+    readOcrMany: (numbers: number[]) => {
+      const job = tail.then(async () => {
+        if (closed) throw new Error("Notebook was closed.");
+        const selected = numbers.map(number => {
+          const page = index.pages[index.numbers.indexOf(number)];
+          if (!page || !Number.isInteger(number)) throw new Error("Page number is outside this notebook.");
+          let ocrAddress = 0;
+          try { ocrAddress = address(page.meta.RECOGNTEXT); } catch { /* malformed OCR is page-local */ }
+          if (ocrAddress < 24 || ocrAddress + 4 > source.size) ocrAddress = 0;
+          return { page, ocrAddress };
+        });
+        if ((await readRevision()) !== revision)
+          throw new Error("Notebook changed before reading recognition text.");
+        const texts: (string | undefined)[] = selected.map(() => undefined);
+        const pagesByAddress = new Map<number, number[]>();
+        selected.forEach(({ ocrAddress }, i) => {
+          if (!ocrAddress) return;
+          const indexes = pagesByAddress.get(ocrAddress) ?? [];
+          indexes.push(i);
+          pagesByAddress.set(ocrAddress, indexes);
+        });
+        if (pagesByAddress.size) {
+          report("Reading device OCR text");
+          const expected = new Map<number,string>();
+          for (const { page, ocrAddress } of selected) {
+            if (!ocrAddress) continue;
+            for (const [a, hash] of page.checks) expected.set(a, hash);
+          }
+          await source.scan([...expected.keys(), ...pagesByAddress.keys()], async (a, bytes) => {
+            if (expected.has(a) && (await sha(bytes)) !== expected.get(a)) {
+              const error = new Error("Notebook content changed after indexing. Save it in Notes and retry this notebook.");
+              error.name = "SourceChangedError";
+              throw error;
+            }
+            const indexes = pagesByAddress.get(a);
+            if (!indexes || bytes.length > MAX_RECOGNITION_BLOCK_BYTES) return;
+            const text = extractDeviceOcr(bytes);
+            for (const i of indexes) texts[i] = text;
+          });
+        }
+        if ((await readRevision()) !== revision)
+          throw new Error("Notebook changed while reading recognition text.");
+        return texts;
+      });
+      tail = job.catch(() => {});
+      return job;
+    },
     close: () => {
+      if (closed) return;
       closed = true;
-      index.pages.length = 0;
+      release();
     },
   };
+  };
+  return create();
 }
 
 /** A selected-page render without indexing unrelated handwriting. */

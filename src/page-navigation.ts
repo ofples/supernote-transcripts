@@ -1,6 +1,6 @@
 import type { ConfigV1, NotebookState, ReadOnlySource, Store } from "./types";
 import type { SharedIO } from "./shared";
-import { notebookIdentity } from "./shared";
+import { notebookIdentityFor } from "./notebook-identity";
 import { PublicationReceipts } from "./publication";
 import { relativeToRule, validateDestination, validateSource } from "./reconcile.mjs";
 
@@ -21,6 +21,7 @@ export interface NavigationOptions {
   reader: ReadOnlySource;
   readTranscript: (path: string) => Promise<string>;
   sharedIO?: SharedIO;
+  sharedRoot?: string;
   platform?: "nomad" | "desktop";
 }
 
@@ -46,13 +47,13 @@ async function sourceForTranscript(request: PageNavigationRequest, options: Navi
   // shared publication receipt can bind it to the same logical local notebook.
   const candidates: NotebookState[] = [];
   if (options.sharedIO) {
-    const receipts = new PublicationReceipts(options.sharedIO);
+    const receipts = new PublicationReceipts(options.sharedIO, options.sharedRoot);
     for (const state of all) {
       const rule = options.config.rules.find(rule => rule.id === state.ruleId);
       if (!rule) continue;
       let relative: string;
       try { relative = relativeToRule(state.source, rule); } catch { continue; }
-      const id = await notebookIdentity(rule.sharedId ?? rule.id, relative);
+      const id = await notebookIdentityFor(rule, state.source);
       const receipt = await receipts.find(id, text);
       if (receipt && receipt.pages.some(page => page.id === request.pageId)) candidates.push(state);
     }

@@ -114,6 +114,20 @@ test("reorder preserves page identities and edits during open prevent stale rend
   old.close(); reordered.close();
 });
 
+test("desktop reader accepts automatic check options and reports its explicit bitmap coverage", async (t) => {
+  const root = await fixture(t), path = root + "/one.note";
+  await fs.writeFile(path, notebook());
+  const source = new DesktopReadOnlySource(fs);
+  const baseline = await source.open(path, { mode: "new", recentPages: 0, previous: [] });
+  assert.equal(baseline.descriptor.checkMode, "all");
+  assert.equal(baseline.descriptor.checkedPageIds.length, 2);
+  const next = await source.open(path, { mode: "new", recentPages: 0, previous: baseline.descriptor.pages });
+  assert.equal(next.descriptor.checkMode, "new");
+  assert.deepEqual(next.descriptor.checkedPageIds, []);
+  assert.deepEqual(next.descriptor.pages.map(p => p.fingerprint), baseline.descriptor.pages.map(p => p.fingerprint));
+  baseline.close(); next.close();
+});
+
 test("range reader skips notebook history and closes read handles on malformed blocks", async (t) => {
   const root = await fixture(t), path = root + "/large.note";
   const handle = await fs.open(path, "w");

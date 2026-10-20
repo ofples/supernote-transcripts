@@ -52,9 +52,12 @@ function notebook(v: any, source: string): boolean {
       optional(p.legacyRenderHash, nonempty) && optional(p.blank, x => typeof x === "boolean"))) return false;
   if (!["paused", "profileOutdated", "legacy"].every(key => optional(v[key], x => typeof x === "boolean")) ||
       !["error", "historyRevision", "legacyPageFailure"].every(key => optional(v[key], text)) ||
-      !optional(v.lastSaved, date) || !optional(v.publishedHash, hash) || !optional(v.publishedPages, descriptors) ||
+      !optional(v.lastSaved, date) || !optional(v.lastAutomaticCheck, date) || !optional(v.lastFullCheck, date) ||
+      !optional(v.lastFullCheckRevision, text) || !optional(v.lastCheckMode, x => ["new", "recent", "all"].includes(x)) ||
+      !optional(v.lastAutomaticPolicy, text) ||
+      !optional(v.publishedHash, hash) || !optional(v.publishedPages, descriptors) ||
       !optional(v.outputOverride, x => path(x) && /\.md$/i.test(x)) ||
-      !["forcePending", "priorityPages"].every(key => optional(v[key], strings))) return false;
+      !["forcePending", "priorityPages", "automaticPending"].every(key => optional(v[key], strings))) return false;
   if (!optional(v.pageIssues, issues => record(issues) && Object.values(issues).every((p: any) => record(p) &&
       nonempty(p.fingerprint) && integer(p.number, 1) && ["failed", "skipped"].includes(p.status) &&
       nonempty(p.kind) && nonempty(p.reason) && integer(p.attempts) && date(p.updatedAt) && optional(p.force, x => typeof x === "boolean"))) ||
@@ -65,6 +68,14 @@ function notebook(v: any, source: string): boolean {
   if (!optional(v.deviceOcr, pages => keyedPageText(pages, v.desired, false)) ||
       !optional(v.cleanedPages, pages => keyedPageText(pages, v.desired, true)) ||
       !optional(v.cleanup, cleanup)) return false;
+  if (!optional(v.publishedText, value => text(value) && value.length <= 16 * 1024 * 1024) ||
+      !optional(v.editedPages, pages => record(pages) && Object.entries(pages).every(([id,p]:[string,any]) =>
+        v.order.includes(id) && record(p) && nonempty(p.fingerprint) && text(p.baseText) && p.baseText.length<=1_000_000 &&
+        text(p.text) && p.text.length<=1_000_000)) ||
+      !optional(v.editConflicts, pages => record(pages) && Object.entries(pages).every(([id,p]:[string,any]) =>
+        v.desired.some((d:any)=>d.id===id && d.fingerprint===p?.fingerprint && d.number===p.number) && record(p) &&
+        [p.baseText,p.editedText,p.recognizedText].every(t=>text(t)&&t.length<=1_000_000) && boundedText(p.reason,4000) &&
+        optional(p.proposedText,t=>text(t)&&t.length<=1_000_000)))) return false;
   if (v.pages && !Object.values(v.pages).every((p: any) => optional(p.recognition, value => validRecognition(value)))) return false;
   return true;
 }
@@ -78,7 +89,7 @@ export function validateStateSnapshot(value: unknown): StateSnapshot {
   const tasks = new Set<string>();
   for (const t of v.store.queue) {
     if (!record(t) || !path(t.source, true) || !v.store.notebooks[t.source] || tasks.has(t.source) ||
-        typeof t.force !== "boolean" || !optional(t.priority, x => Number.isFinite(x)) ||
+        typeof t.force !== "boolean" || !optional(t.manual,x => typeof x === "boolean") || !optional(t.priority, x => Number.isFinite(x)) ||
         !optional(t.modified, x => Number.isFinite(x)) || !optional(t.pageIds, strings)) throw Error("Invalid notebook queue snapshot.");
     tasks.add(t.source);
   }

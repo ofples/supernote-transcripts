@@ -131,7 +131,7 @@ for (const platform of ["desktop", "nomad"]) {
       assert(visibleHeadings.some((text) => /^advanced$/i.test(text.trim())), `${platform}: source Advanced section is missing: ${JSON.stringify(visibleHeadings)}`);
       assert(await sourceAdvanced.count() === 1 && !(await sourceAdvanced.evaluate((element) => element.open)), `${platform}: source Advanced disclosure missing or open by default`);
       assert(await sourceAdvanced.locator("details").count() === 0, `${platform}: source Advanced contains a nested disclosure`);
-      for (const label of ["Automatically recognize new and changed pages", "Use source-specific recognition settings", "Instructions and reference files", "Output folder"]) {
+      for (const label of ["Automatic updates", "Use source-specific recognition settings", "Instructions and reference files", "Output folder"]) {
         assert(await sourceForm.getByText(label, { exact: true }).count() === 1, `${platform}: source editor routine setting missing: ${label}`);
         assert(await sourceForm.getByText(label, { exact: true }).evaluate((node) => !node.closest("details")), `${platform}: source editor routine setting is hidden in a disclosure: ${label}`);
       }

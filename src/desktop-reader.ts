@@ -3,7 +3,7 @@ import type { Stats } from "fs";
 import { excludedRelative } from "./reconcile.mjs";
 import { openByteNotebook } from "./reader";
 import type { ByteSource } from "./reader-support/stream";
-import type { OpenNotebook, ReadOnlySource } from "./types";
+import type { NotebookCheckOptions, OpenNotebook, ReadOnlySource } from "./types";
 
 /** Only read operations are exposed to this adapter. Node is loaded when the
  * desktop source is constructed, so mobile plugin loading does not load fs. */
@@ -144,14 +144,14 @@ export class DesktopReadOnlySource implements ReadOnlySource {
     return revisionOf(stat);
   }
 
-  async open(path: string): Promise<OpenNotebook> {
-    return this.openInternal(path);
+  async open(path: string, options?: NotebookCheckOptions): Promise<OpenNotebook> {
+    return this.openInternal(path, undefined, options);
   }
   async preview(path: string, page: number): Promise<string> {
     const opened = await this.openInternal(path, page);
     try { return await opened.render(page); } finally { opened.close(); }
   }
-  private async openInternal(path: string, previewPage?: number): Promise<OpenNotebook> {
+  private async openInternal(path: string, previewPage?: number, checkOptions?: NotebookCheckOptions): Promise<OpenNotebook> {
     path = normalizeDesktopSource(path);
     if (!path.toLowerCase().endsWith(".note"))
       throw new Error("Selected source is not a notebook.");
@@ -166,6 +166,6 @@ export class DesktopReadOnlySource implements ReadOnlySource {
     };
     const bytes = new DesktopRangeFile(stat.size, path, this.fs, revision, (read) =>
       this.progress?.("Reading notebook", `${name} - ${pass}: ${(read / 1048576).toFixed(1)} MB read`));
-    return openByteNotebook(path, revision, bytes, () => this.revision(path), this.progress, report, previewPage);
+    return openByteNotebook(path, revision, bytes, () => this.revision(path), this.progress, report, previewPage, checkOptions);
   }
 }

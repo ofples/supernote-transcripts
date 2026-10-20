@@ -4,6 +4,7 @@ import { RangeSetBuilder, StateEffect, StateField, type EditorState } from "@cod
 import { pageMarkerGroups, pageMarkerTableAnchor, parsePageLinkToken, parsePageMarkers } from "./page-links.mjs";
 import { createPageLinkVisibility } from "./page-link-visibility.mjs";
 import { isManagedTranscript } from "./page-navigation";
+import type { DigestPreferences } from "./digest-preferences";
 
 export type PageLinkOpen = (outputPath: string, pageId: string, displayNumber: number) => Promise<void>;
 const refreshPageLinks = StateEffect.define<void>();
@@ -32,10 +33,13 @@ export interface ReaderPageLinksApi {
   renderSection(section: ReaderPageLinkSection): Promise<boolean>;
   /** Returns null for ordinary Markdown. Stale or unmapped transcripts fail explicitly. */
   selectionSource?(selection: ReaderSelectionRequest): Promise<ReaderSelectionSource | null>;
+  /** Optional category override for an owned transcript; null inherits Reader. */
+  digestPreferences?(sourcePath: string): Promise<DigestPreferences | null>;
 }
 
 type PluginWithReaderPageLinks = Plugin & { pageLinks?: ReaderPageLinksApi };
-type PageLinkVisibilityOptions = { storageKey?: string; resolveSelection?: (path: string, markers: Array<{ pageId: string; number: number }>) => Promise<ReaderSelectionSource> };
+type PageLinkVisibilityOptions = { storageKey?: string; resolveSelection?: (path: string, markers: Array<{ pageId: string; number: number }>) => Promise<ReaderSelectionSource>;
+  resolveDigestPreferences?: (sourcePath: string) => Promise<DigestPreferences | null> };
 type SelectionAnchor = { sourcePath: string; canonical: string; pageId: string; number: number };
 // Keep provenance on actual rendered nodes, so prefetch/cache DOM moves retain it.
 // DOM attributes supplied by Markdown are never trusted as page identities.
@@ -399,10 +403,11 @@ export function installPageLinks(plugin: Plugin, onOpen: PageLinkOpen, enabled: 
 
   const integration: ReaderPageLinksApi = {
     apiVersion: 1,
-    capabilities: ["renderSection", "selectionProvenance"],
+    capabilities: ["renderSection", "selectionProvenance", ...(options.resolveDigestPreferences ? ["digestPreferences"] : [])],
     enabled: isEnabled,
     renderSection: section => renderReaderPageLinkSection(plugin, onOpen, isEnabled, section),
     selectionSource: selection => readerSelectionSource(plugin, options, selection),
+    ...(options.resolveDigestPreferences ? { digestPreferences: (sourcePath: string) => options.resolveDigestPreferences!(sourcePath) } : {}),
   };
   const pluginWithApi = plugin as PluginWithReaderPageLinks;
   const notifyReader = () => {

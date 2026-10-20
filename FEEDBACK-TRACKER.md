@@ -3,6 +3,102 @@
 This checklist is cumulative. Later feedback does not replace earlier requests.
 Source implementation, fixture checks, installed builds and live verification are separate states.
 
+## Shared recognition result hydration — 2610 Reflection 2
+
+- [x] Adopt an exact current shared success for a skipped page during automatic discovery, even when the page is outside the automatic recognition depth. Respect forced retries and excluded sources; preserve the existing edit-conflict guard. Four focused runtime tests pass; TypeScript check and build pass.
+- [x] Activate the final bundle on Vedas desktop and verify Nomad's page 58 shared result arrived through normal Sync. Source-only adoption produced 106/106 cached pages, cleared the issue, kept the notebook current, retained both pause states and the six-item queue byte-for-byte, and made zero provider calls or attempts. See [Validation](VALIDATION.md) and `private/investigations/recognition-sync-reflection2.md`.
+
+## Storage paths and folder consolidation — active on desktop and Nomad
+
+- [x] Move plugin support data into `_supernote/Shared Data`, `_supernote/History`, `_supernote/Archive`, and `_supernote/Glossaries`; keep default transcript output directly under `Supernote Transcripts/`.
+- [x] Preflight known legacy-path moves, stop on different-content collisions before mutating files, and allow safe retry after interruption. Preserve page edits, caches, publication hashes, notebook identities, and the agreed shared-settings baseline.
+- [x] Exclude `_supernote/` from Obsidian Search and Quick Switcher while retaining Sync eligibility. Document folder-consolidation exclusions for existing notebooks, retaining their transcripts and cached results.
+- [x] Pass 632 tests, TypeScript checking, and production build on main `d66db9931ee02f016d70068120405f05639c02ed88aa5fb22d44546f8f658156`. Startup handles an absent legacy config setting as unset; migration refuses legacy output moves when affected Reader v1 highlights exist, preventing silent orphaning.
+- [x] Preserve paid recognition through support-folder changes, resumable local moves and delayed Sync; protect conflicting copies, late old-root results and archived outputs. Pass 648 unit/mock tests plus TypeScript checking/build on unpublished main `97cbacab…99ce668`.
+- [x] Organize settings into Connection, Recognition, Updates, and Storage tabs using the same shared underline style as Sources/Queue with one draft and shared Save/Cancel; add support-folder location/picker and device-local File Explorer/Search/Quick Switcher visibility controls. Keep Costs on the existing `$` action.
+- [x] Pass **1,073 synthetic browser assertions** across desktop, narrow desktop, and Nomad-sized views. Verify tab order and keyboard focus/scroll reset, storage picker/toggles/save/cancel, and the two-column Update/Notebook tools button grids with unwrapped labels. No production Obsidian or config was used, with zero external requests and zero recognition calls.
+- [x] Install matching-tab final build on desktop and Nomad; verify actual tab styling and hashes. Reflection outputs now use `Supernote Transcripts/Reflections/` on both, retaining transcript bytes, cached recognition and Nomad Reader positions. No provider calls or GitHub publication.
+- [x] Install and activate the same v0.15.0 main hash on desktop and Nomad; move the four support folders under `_supernote/` and flatten transcript output. Five readable transcripts remain (four at root, one in Satsang); no `.note` file was modified.
+- [x] Consolidate Reflection notebooks into one `reflections` source with a 30-ID map, 4 allowed and 26 excluded. Verify the two original shared identities against the pre-migration IDs, unchanged Nomad cache fields (122/122 current; 61/97 queued), unchanged desktop cache (54 pages / 84 desired), and unchanged queue counts (3 Nomad, 1 desktop).
+- [x] Confirm `_supernote/` Sync transport with a temporary unique marker: it arrived on desktop and its deletion replicated. Sync was enabled, ready and error-free on both devices.
+- [x] Preserve guard settings: Nomad AI enabled, automatic updates off, unpaused; desktop AI enabled, automatic updates off, pre-existing pause retained. No provider AI, discovery, recognition, or publication.
+- [x] Complete final acceptance checks and restore Notes foreground. Desktop Quick Switcher search returned a regular Reflection transcript and no `_supernote/` suggestions. On Nomad, the hook and core command invoked `getSuggestions` without sync errors, but result-level search is unverified because modal queries returned unclassified CDP `Uncaught` errors. Six source hash checks matched their baselines except the canonical desktop mirror, intentionally updated for the consolidated folder map; the current mirror hashes match between devices. The temporary Sync marker replicated and was removed from both vaults. Guard settings were preserved, port forwarding was removed, and there were no provider or recognition calls. The canonical mirror file was copied byte-for-byte from Nomad to desktop with `app.vault.create` after it did not arrive automatically in the bounded window; this copy is not evidence of automatic Sync. Evidence: `private/device-evidence/2026-10-19/cleanup-inventory/final-acceptance-summary.json` and supporting hash checks.
+
+## Sync-record warning — diagnosis still open
+
+- [ ] Identify why the live notebook reports "Shared publication receipt is damaged." The validator currently uses this wording for an invalid/unreadable sync record; it does not establish damage to the original notebook. Read-only device diagnostic attempts did not return the underlying validation failure.
+- [x] Preserve the existing records, notebooks and transcripts while investigating; no recovery/deletion was performed and no AI request was made.
+- [x] Keep the friendly attention explanation and recovery controls visible directly on the notebook details page, with technical diagnostics optional. Keep source rows compact.
+- [x] Let an explicit **Check & update** retry this hold after Sync has caught up, while still rejecting an invalid record and preserving all evidence; mocked regression verifies zero repeated AI calls.
+- [ ] Verify the friendly warning and recovery controls on a live attention state. The checked Nomad Details screen had no attention item; the underlying sync-record cause is still unknown.
+
+## Automatic update check modes — source and synthetic UI verified
+
+- [x] Add the global **Automatic checks** slider under Settings → Updates with New pages, Recent edits, and All changes, including the Recent pages count.
+- [x] Add source inheritance and per-source overrides; keep them in the normal source draft so Cancel discards them and Save syncs them.
+- [x] Document limits in contextual help and show automatic/full check timestamps in notebook Details when available.
+- [x] Integrate runtime scan behavior and finish synthetic UI checks for slider positions, inheritance, recent count, save/cancel, timestamps, and help.
+- [x] Check notebook-detail action groups, one-shot Check & update targeting, pause controls, and the friendly sync-record attention message in the mocked UI.
+- [x] Pass 607 unit/mock tests, TypeScript checking and production build; pass 1,034 synthetic UI assertions across desktop, narrow desktop and Nomad-sized layouts with no external requests or recognition calls.
+- [x] Install hash-verified final assets locally on desktop Vedas and Nomad; protected data and queue-state hashes are unchanged. Evidence: `private/device-evidence/2026-10-19/automatic-check-update/installation-evidence.json`.
+- [x] Activate the approved v0.15.0 bundle on Nomad and physically verify global slider positions/count, source inheritance/override visibility, Cancel, and the notebook Details action groups and button sizes. No detail action was invoked. Evidence: `private/device-evidence/2026-10-19/automatic-check-live-test/summary.json` and adjacent check JSON files.
+- [x] Restore runtime settings after the guarded UI check: AI enabled, automatic updates disabled, unpaused and idle; queue count 3, zero recognition calls, unchanged config and closed forms. Protected data hashes remained unchanged; CDP block was cleared and original Notes activity restored.
+- [ ] Activate v0.15.0 by reopening/reloading desktop Obsidian. The sync-record warning was not live-verified because the inspected Details screen had no attention item. No provider AI request or GitHub publication was made.
+
+## Bitmap reading and page order — source verified and installed locally
+
+- [x] Trace repeated Android bitmap progress: each local stream scan starts at byte zero, and inventory previously discarded its index before processing opened the notebook again.
+- [x] Identify the misleading repeated bitmap label: per-page device OCR reads reused the previous stage text and rescanned the file for each page after a notebook revision changed.
+- [x] Reuse up to four compact page indexes on Nomad and eight on desktop within an update; retain no whole-notebook bitmap buffer or persistent bitmap cache. Reuse validates revision, signature, current footer pointer and metadata hashes; rendering still validates bitmap bytes.
+- [x] Read nearby target/context images together where the batch fits eight pages and 16 MiB; preserve individual bitmap and metadata validation and page-local fallback.
+- [x] Read device OCR for the selected pages in a combined scan and show the correct OCR-reading status.
+- [x] Verify insertion, deletion and reordering reuse records by native page ID and bitmap fingerprint rather than page number.
+- [x] Stop higher-priority notebooks waiting on shared claims from starving another notebook through repeated opens. Retire a one-shot request that cannot make progress while preserving its ordinary queue entry.
+- [x] Pass 582 unit/mock tests, TypeScript checking and production build on the final source revision.
+- [x] Run final source checks and install hash-verified assets on desktop and Nomad, preserving `data.json`, `state-a.json` and `state-b.json` byte-for-byte.
+- [ ] Activate by reopening/reloading Obsidian and measure the reported Experiments notebook on device. Anki was left in the foreground; neither desktop nor Nomad Obsidian was reloaded during installation. No real recognition request was made.
+
+OCR is a provisional text aid, not a change fingerprint: it can be absent, stale, or unchanged after a visual edit. No trustworthy per-page modification timestamp was found in the pinned parser's page metadata. File metadata is a freshness hint; actual bitmap hashes remain the content check. Android's streaming fallback can still read a large file prefix, so these changes reduce repeated work without promising true random-access reads.
+
+## One-shot recognition and queue controls — source and synthetic UI verified
+
+- [x] Add a **Recognize now** action for notebook rows and source folders, with exact notebook/folder targeting and duplicate suppression while queued or active.
+- [x] Keep one-shot work independent of automatic catch-up and saved pause preferences; show Pause during manual work and preserve pause scope.
+- [x] Expand the **Working now** card from its text or caret; keep progress visible while details are collapsed and isolate pause/caret actions.
+- [x] Use the standard **?** help control for estimates, keep **Needs attention** always visible, and place Review/Force update together under source progress.
+- [x] Remove the duplicate divider when a progress line already separates rows and sections.
+- [x] Pass type checking, 582 unit/mock tests, and 966 synthetic Playwright assertions across desktop, narrow desktop, and Nomad-sized mocks, including a fresh synthetic pass against the final combined build.
+- [ ] Complete the separate operator’s desktop and Nomad UI verification after the final runtime/build is frozen.
+
+Synthetic screenshot evidence is in `private/ux-streamline/evidence/current-ui/`, including the desktop/Nomad Queue views and expanded Working now card. No live device interaction or recognition request was performed in this UI task.
+
+Final assets were subsequently installed locally on both devices with protected data hashes unchanged; runtime activation and live interaction remain pending. Installation evidence: `private/device-evidence/2026-10-19/manual-queue-update/installation-evidence.json`. No GitHub publication was made.
+
+## Transcript page edit reconciliation — source and local activation complete
+
+- [x] Show an affected-page count in notebook details and provide a dedicated review view.
+- [x] Compare the current edited text with new handwriting recognition and an optional proposed edit.
+- [x] Require an explicit per-page choice; refresh stale comparisons before another choice.
+- [x] Verify the focused runtime tests and synthetic browser layouts.
+- [x] Activate the local plugin in desktop Vedas and Nomad while preserving existing state.
+- [ ] Exercise an actual in-app page conflict and user choice on device.
+
+Appending pages are kept automatically and only those pages are sent for recognition. Existing Markdown corrections and `==highlight==` markup stay separate from the raw recognition cache. When an existing page image changes, its recognition request includes the old recognition and edited text in that same request; this adds input tokens but starts no extra automatic request and remains within existing budgets and output caps. Unsafe or missing page metadata, or removal of a page with edits, uses the backed-up **Resolve edits** or **Force update** recovery flow. The page review itself makes no AI calls and saves a restore point before each explicit choice.
+
+Source verification: 558 unit/mock tests pass; type checking and build pass; the synthetic browser checker passes 882 assertions, and Reader's browser suite passes 63 checks. Transcripts 0.15.0 is active locally in desktop Vedas and on Nomad: `main.js` SHA-256 `6d43b4c162e6101bb1211b3ba279fb82d5ca3bf06d0add80e176a7e802efa1bb`, `styles.css` SHA-256 `15a09c2a685521e0f1bb81e4188c8849f10e8b6e3802c96a98e18d421b31c82b`; the manifest was unchanged. Reader main SHA `f8df3cb69a815e73d5e9243d3096d703c46b232b0fe68907267ac8246f41c452` is active on Nomad; Reader is not installed on desktop. Protected settings and `data.json`, `state-a`, and `state-b` were preserved byte-for-byte during activation; both Transcripts copies remained paused and idle with zero AI calls and no open forms. On Nomad, the Satsang page 15 Markdown, anchors and screen position were preserved. No in-app conflict choice was performed, and no real-provider semantic reconciliation was tested; the 882 assertions are synthetic browser checks. Private activation evidence: `private/device-evidence/2026-10-18/reconciliation-update-activation/desktop-activation-evidence.json` and `private/device-evidence/2026-10-18/reconciliation-update-activation/nomad-activation-evidence.json`. No GitHub push, release, tag, or commit was made.
+
+## Reader selection responsiveness — current follow-up
+
+- [x] Wait for pen/pointer-up before showing Reader selection controls.
+- [x] Keep one selection surface visible at a time; hide the selection dock while its context menu is open.
+- [x] Avoid text/range work during an active drag, and do not use a chapter index when no highlight records exist.
+
+Status: source fix complete. Node syntax and Digest fixtures pass. Browser verification: 62 Chromium reading checks pass, including held-pen controls remaining hidden with zero snapshots until pointer-up, one snapshot after pointer-up, cancellation clearing the range, context-menu/dock exclusivity, and no text-index walk when there are no highlight records. Local Nomad activation and simulated DOM PointerEvent checks passed on active Reader main SHA `7e4545f8e5e9f29829c919e1e7b0a62b124348d3a9f2660d8f472fbfd691de41`; manifest and styles remained unchanged. On-device simulation showed the dock hidden while the pen gesture was held, four actions after pointer-up, and the dock hidden with the context menu open. Source/settings/reading position were preserved, Transcripts stayed paused and idle with zero AI calls, Native Notes was restored to foreground, and the ADB forward was removed. This was a simulated DOM-pointer check, not a physical stylus test; native Android popup behavior remains unverified. See [Validation](VALIDATION.md) and its private evidence reference.
+
+## Publication boundary
+
+Nomad local installation and testing are authorized. Do not push to GitHub, create tags or releases, or deploy until the user explicitly asks for publication in a later request.
+
 ## Reader selection actions and native Digest lists — Reader 2.2 / Bridge 0.6.0
 
 - [x] Provide four clear selection actions: Digest, Digest with note, Highlight, and Copy; keep Save quote to Obsidian secondary.
@@ -158,3 +254,18 @@ No publication, visibility change, release tag or device installation is implied
 - [x] Remove the known native test record, temporary Markdown fixture and disposable probe app; leave an unidentified same-text Manual Entry untouched. Restore the original Reader view and document the cleanup boundary.
 - [x] Update illustrated installation and Digest guides with the native-backlink limitation and separate live verification evidence.
 - [x] Publish the source and preview releases: Transcripts 0.15.0 with Bridge 0.4.0, and Reader 2.1.3. Anonymous ZIP downloads and GitHub asset digests match the frozen builds; Paper's optional bundle update is coordinated separately.
+
+## Digest highlights and category defaults — 2026-10-20 local pass
+
+- [x] Give saved Reader highlights their own darker background, independent of theme highlight variables; confirm real screenshot pixels and persistence after reopening.
+- [x] Restore **Quick Digest** without opening the native Digest app; keep **Create Digest** for saving and opening native Details.
+- [x] Keep the capture identity stable across delivery/category choices; verify repeated Quick saves do not insert another entry.
+- [x] Add the default category in MD Reader settings and optional source overrides in Transcripts. Share names through the source catalog, with explicit Uncategorized and inherited defaults kept distinct.
+- [x] Reject missing/ambiguous categories before inserting. Verify missing-category feedback and successful correction using the same request and Highlight.
+- [x] Install and verify the matching local Reader, Transcripts and Bridge candidates on Nomad; also finish the pending Paper/Sidebar update. Preserve reading positions, auth/trust and existing ledger records; leave recognition paused without AI calls.
+- [x] Stage the matching Transcripts files in the existing desktop vault with its configuration preserved. Desktop reload and active-runtime verification remain pending; no running desktop window was interrupted.
+- [x] Remove the three owned native test Digests, Highlight files, temporary source/folder and Reader test state. Keep Bridge's audit receipts; restore the original Reader location and position map.
+- [ ] Native Digest-to-notebook navigation remains open. Knowledge 1.00.153 requires a reachable type-100 `.note` Digest reference keyed by the provider UID; notebook/page provenance alone does not enable its source action. The offline parser and in-memory append prototype pass 11 tests over three public fixtures, including malformed input and append-safety cases. A native-created N6 before/after pair now exists from a disposable note; its baseline Source action works, and Digest creation changed several TOTALPATH objects and raster data. A guarded exact-donor-only candidate was built and installed on a disposable closed note with original bitmap pointers preserved. Its native Source action and save/reopen survival are still under test; candidate success is not established. No production writer has been built, and original notes remain unchanged. See the [offline reference experiment](experiments/native-digest-reference/README.md).
+- [ ] Live nondefault category selection and category-setting propagation between devices remain unverified. Source/catalog fixtures cover override, inheritance and conflicts.
+
+These are unpublished local candidates. No GitHub push, tag or release was made in this pass. See [Native Digests](docs/native-digests.md) for verification boundaries.

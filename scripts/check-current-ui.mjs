@@ -100,6 +100,7 @@ async function seedReviewCases(page, root, platform) {
         fingerprint: page.fingerprint, text: `Synthetic reflection page ${page.number}.`,
         recipe: "fixture", number: page.number,
       }])), status: "current", paused: false,
+      lastAutomaticCheck: "2026-10-18T10:00:00.000Z", lastFullCheck: "2026-10-17T10:00:00.000Z",
       cleanup: { updatedAt: "2026-10-10T12:00:00.000Z", inputHash: "synthetic-cleanup-input", outputHash: "synthetic-cleanup-output", model: "gpt-5.6-sol", quality: "careful", provider: "api", basePages: desired.map((page) => ({ ...page })), stale: true },
     };
     c.aiEnabled = true;
@@ -377,6 +378,7 @@ async function inspectViewport(platform, viewport, label) {
   await root.locator(".st-folder-contents .st-notebook-child").filter({ hasText: "Reflection" }).first().waitFor();
 
   // Queue navigation and status view.
+  await page.evaluate(() => { const c = window.__streamlinedFixture.controller; c.progress.running = true; c.progress.paused = false; c.progress.activeSource = window.__streamlinedFixture.paths.working; c.progress.activePage = { source: window.__streamlinedFixture.paths.working, number: 3, total: 6 }; c.progress.manualSources = []; c.notify(); });
   await root.getByRole("button", { name: "Queue", exact: true }).click();
   await root.getByText(/Waiting|Working|paused|attention|No pending/i).first().waitFor();
   await assertLayout("Queue");
@@ -387,8 +389,37 @@ async function inspectViewport(platform, viewport, label) {
   check(queuedCompletedSources.length === 0, `${label}: completed notebooks remain in the mocked waiting queue: ${JSON.stringify(queuedCompletedSources)}`);
   await screenshot("queue");
   const estimateInfo = root.locator(".st-queue-estimate-info");
-  await estimateInfo.locator("summary").click();
-  check(await estimateInfo.locator("p").first().innerText().then((text) => /after you press Update or Resume\. Individually paused or blocked notebooks are excluded/i.test(text)), `${label}: total estimate scope does not distinguish eligible work from paused or blocked sources`);
+  const estimateHelp = estimateInfo.getByRole("button", { name: "Help: About this estimate", exact: true });
+  check(await estimateHelp.innerText() === "?" && await estimateHelp.getAttribute("aria-expanded") === "false" && await estimateInfo.locator(".st-help-text").isHidden(), `${label}: estimate help is not collapsed behind the standard ? control`);
+  await estimateHelp.click();
+  check(await estimateHelp.innerText() === "?" && await estimateHelp.getAttribute("aria-expanded") === "true", `${label}: eligible-work estimate does not use the standard contextual help control`);
+  check(await estimateInfo.locator(".st-help-text p").first().innerText().then((text) => /after you press Update or Resume\. Individually paused or blocked notebooks are excluded/i.test(text)), `${label}: total estimate scope does not distinguish eligible work from paused or blocked sources`);
+  await estimateHelp.click();
+  const workingCard = root.locator(".st-working");
+  if (await workingCard.count()) {
+    const workingDisclosure = workingCard.locator(".st-working-disclosure");
+    check(await workingCard.getAttribute("aria-expanded") === "false" && await workingCard.locator(".st-working-details").isHidden(), `${label}: Working now details are not collapsed in the card`);
+    check(await workingCard.locator(".st-working-progress").isVisible(), `${label}: Working now progress is hidden with the details`);
+    const pauseBounds = await workingCard.getByRole("button", { name: /Pause: Reflection/ }).boundingBox();
+    const caretBounds = await workingDisclosure.boundingBox();
+    check(!!pauseBounds && !!caretBounds && caretBounds.x > pauseBounds.x, `${label}: Working now caret is not to the right of Pause`);
+    await workingCard.focus();
+    await page.keyboard.press("Enter");
+    check(await workingCard.getAttribute("aria-expanded") === "true", `${label}: keyboard Enter did not expand the Working now card`);
+    await page.keyboard.press("Space");
+    check(await workingCard.getAttribute("aria-expanded") === "false", `${label}: keyboard Space did not collapse the Working now card`);
+    await workingDisclosure.click();
+    check(await workingCard.getAttribute("aria-expanded") === "true" && await workingCard.locator(".st-working-details").isVisible(), `${label}: adjacent caret did not expand Working now details`);
+    await screenshot("queue-working-expanded");
+    await workingCard.locator(".st-queue-copy").click();
+    check(await workingCard.getAttribute("aria-expanded") === "false", `${label}: tapping Working now copy did not toggle the card back closed`);
+    const pauseWorking = workingCard.getByRole("button", { name: /Pause: Reflection/ });
+    const stateSource = await page.evaluate(() => window.__streamlinedFixture.paths.working);
+    await pauseWorking.click();
+    check(await workingCard.getAttribute("aria-expanded") === "false", `${label}: pause action click expanded Working now`);
+    await page.evaluate((source) => { const c = window.__streamlinedFixture.controller; c.store.notebooks[source].paused = false; c.actionCounters.notebookPause.pop(); c.notify(); }, stateSource);
+  }
+  await page.evaluate(() => { const c = window.__streamlinedFixture.controller; c.progress.running = false; c.progress.activeSource = undefined; c.progress.activePage = undefined; c.notify(); });
   const aggregateEstimate = root.locator(".st-queue-overview .st-queue-estimate");
   const eligiblePages = await page.evaluate(() => {
     const c = window.__streamlinedFixture.controller;
@@ -409,6 +440,7 @@ async function inspectViewport(platform, viewport, label) {
   const aggregateText = await aggregateEstimate.innerText();
   check(/Eligible work estimate/.test(aggregateText), `${label}: total estimate is not labeled as eligible work`);
   check(new RegExp(`\\b${eligiblePages} pages?\\b`).test(aggregateText), `${label}: aggregate estimate does not match ${eligiblePages} eligible remaining pages: ${aggregateText}`);
+  await estimateHelp.click();
   await screenshot("queue-estimate-explained");
 
   // A budget block can stop eligible work while the selected-work estimate remains useful.
@@ -425,7 +457,8 @@ async function inspectViewport(platform, viewport, label) {
   const reviewCostsBounds = await reviewCosts.boundingBox();
   check(reviewCostsBounds && reviewCostsBounds.y >= 0 && reviewCostsBounds.y + reviewCostsBounds.height <= viewport.height, `${label}: Review Costs action is below the visible area in a budget-blocked queue: ${JSON.stringify(reviewCostsBounds)}`);
   check(await root.locator(".st-update").isDisabled(), `${label}: Update remains enabled while spending is blocked`);
-  check(await estimateInfo.locator("p").first().innerText().then((text) => /spending or execution limits can still stop requests/i.test(text)), `${label}: budget-blocked state hides the estimate scope explanation`);
+  if (await estimateHelp.getAttribute("aria-expanded") === "false") await estimateHelp.click();
+  check(await estimateInfo.locator(".st-help-text p").first().innerText().then((text) => /spending or execution limits can still stop requests/i.test(text)), `${label}: budget-blocked state hides the estimate scope explanation`);
   await assertLayout("Budget-blocked queue");
   await screenshot("queue-spending-paused");
   await page.evaluate(() => {
@@ -448,9 +481,28 @@ async function inspectViewport(platform, viewport, label) {
     c.notify();
   });
   await root.getByRole("button", { name: "Sources", exact: true }).click();
+  const satsangDisclosure = root.getByRole("button", { name: "Expand Satsang", exact: true });
+  if (await satsangDisclosure.count()) await satsangDisclosure.click();
+  const failedSourceRow = root.locator(".st-notebook-child").filter({ hasText: "Failed" });
+  const sourceActionRow = failedSourceRow.locator(".st-source-actions");
+  if (await failedSourceRow.count()) {
+    check(await sourceActionRow.getByRole("button", { name: "Review pages", exact: true }).isVisible() && await sourceActionRow.getByRole("button", { name: /Force update Failed/ }).isVisible(), `${label}: Review pages and Force update are not grouped below the page progress`);
+    const actionLayout = await sourceActionRow.evaluate((node) => ({ display: getComputedStyle(node).display, review: node.querySelector("button.st-review-pages")?.getBoundingClientRect(), force: node.querySelector("button.st-force-update-action")?.getBoundingClientRect() }));
+    check(actionLayout.display === "flex" && actionLayout.review && actionLayout.force && Math.abs(actionLayout.review.y - actionLayout.force.y) <= 2, `${label}: Review pages and Force update are not side by side: ${JSON.stringify(actionLayout)}`);
+    const progressBottom = await failedSourceRow.locator(".st-progress").evaluate((node) => node.getBoundingClientRect().bottom);
+    check(!!actionLayout.review && actionLayout.review.y >= progressBottom, `${label}: source actions are not beneath the progress bar`);
+    check(await failedSourceRow.evaluate((node) => getComputedStyle(node).borderBottomWidth) === "0px", `${label}: the page-progress line is doubled with a second bottom divider`);
+  }
   await root.getByRole("button", { name: "Queue", exact: true }).click();
-  await root.locator('details[data-queue-section="Needs attention"] summary').click();
-  const forceRow = root.locator(".st-queue-collapsed[open] .st-queue-row").filter({ hasText: "Failed" });
+  const attentionSection = root.locator(".st-queue-attention");
+  const forceRow = attentionSection.locator(".st-queue-row").filter({ hasText: "Failed" });
+  check(await attentionSection.locator("h2").innerText().then((text) => /Needs attention/.test(text)) && await forceRow.isVisible(), `${label}: Needs attention is not a continuously visible section`);
+  check(await root.locator(".st-queue-live hr").count() === 0 && await attentionSection.evaluate((node) => getComputedStyle(node).borderTopWidth) === "0px", `${label}: a duplicate horizontal rule separates the prior queue row from Needs attention`);
+  const attentionPrevious = await attentionSection.evaluate((node) => {
+    const previous = node.previousElementSibling;
+    return { className: previous?.className ?? "", borderBottom: previous?.matches(".st-queue-row") ? getComputedStyle(previous).borderBottomWidth : "not-a-row", progress: !!previous?.querySelector(".st-progress") };
+  });
+  if (attentionPrevious.progress) check(attentionPrevious.borderBottom === "0px", `${label}: the progress line before Needs attention is doubled by an adjacent row divider`);
   const forceAction = forceRow.getByRole("button", { name: /Force update Failed/ });
   check(await forceAction.isVisible() && !(await forceAction.isDisabled()), `${label}: eligible sync conflict has no enabled Force update action in Queue; state=${await page.evaluate(() => { const c = window.__streamlinedFixture.controller; const s = c.store.notebooks[Object.keys(c.store.notebooks).find((source) => source.endsWith("/Failed.note"))]; return JSON.stringify({status:s?.status,error:s?.error,hasMethod:!!c.forceUpdate}); })}; rows=${await root.locator(".st-queue-collapsed[open] .st-queue-row").allInnerTexts().then((items) => JSON.stringify(items))}; buttons=${await root.locator(".st-queue-collapsed[open] .st-queue-row button").evaluateAll((items) => JSON.stringify(items.map((item) => [item.textContent, item.getAttribute("aria-label")])))}`);
   await forceAction.click();
@@ -481,11 +533,27 @@ async function inspectViewport(platform, viewport, label) {
   await root.getByRole("button", { name: "Settings", exact: true }).click();
   await root.locator(".st-settings-section").first().waitFor();
   await assertLayout("Settings");
+  const settingsTabs = root.getByRole("tablist", { name: "Settings sections" });
+  check((await settingsTabs.getByRole("tab").allTextContents()).join("|") === "Connection|Recognition|Updates|Storage", `${label}: settings tabs are missing or out of order`);
+  check(await settingsTabs.getByRole("tab", { name: "Connection" }).getAttribute("aria-selected") === "true", `${label}: settings did not open on Connection`);
+  await settingsTabs.getByRole("tab", { name: "Connection" }).focus();
+  await page.keyboard.press("ArrowRight");
+  check(await settingsTabs.getByRole("tab", { name: "Recognition" }).getAttribute("aria-selected") === "true" && await page.evaluate(() => document.activeElement?.getAttribute("data-settings-tab")) === "recognition", `${label}: Right Arrow did not select and focus the next settings tab`);
+  await root.locator(".st-body").evaluate((body) => { body.scrollTop = 120; });
+  await page.keyboard.press("End");
+  check(await settingsTabs.getByRole("tab", { name: "Storage" }).getAttribute("aria-selected") === "true" && await page.evaluate(() => document.activeElement?.getAttribute("data-settings-tab")) === "storage" && await root.locator(".st-body").evaluate((body) => body.scrollTop) === 0, `${label}: End did not select/focus Storage and reset the tab scroll position`);
+  await page.keyboard.press("Home");
+  check(await settingsTabs.getByRole("tab", { name: "Connection" }).getAttribute("aria-selected") === "true" && await page.evaluate(() => document.activeElement?.getAttribute("data-settings-tab")) === "connection", `${label}: Home did not return focus to the first settings tab`);
+  await settingsTabs.getByRole("tab", { name: "Recognition" }).click();
   const defaultCleanupInstructions = root.getByLabel("Default cleanup instructions", { exact: true });
   check((await defaultCleanupInstructions.inputValue()).trim().length > 0, `${label}: editable default cleanup instructions do not display the built-in default`);
   check(await page.evaluate(() => window.__streamlinedFixture.controller.config.cleanupPrompt) === undefined, `${label}: merely opening Settings wrote the default cleanup prompt into saved config`);
   await root.locator(".st-cleanup-defaults").scrollIntoViewIfNeeded();
   await screenshot("cleanup-defaults-settings");
+  await settingsTabs.getByRole("tab", { name: "Storage" }).click();
+  const supportFolder = root.getByLabel("Support folder", { exact: true });
+  check(await supportFolder.inputValue() === "_supernote", `${label}: Storage did not show the default support folder`);
+  check(await root.getByLabel("Hide support folder in File Explorer", { exact: true }).isChecked() && await root.getByLabel("Exclude support files from Search and Quick Switcher", { exact: true }).isChecked(), `${label}: storage visibility defaults are not enabled`);
   await root.getByRole("button", { name: "Review storage", exact: true }).click();
   const storage = root.locator(".st-storage-screen");
   await storage.waitFor();
@@ -500,7 +568,7 @@ async function inspectViewport(platform, viewport, label) {
   await pruneStorage.click();
   check(await page.evaluate(() => window.__streamlinedFixture.controller.workflowCapture.pruneCalls.length) === 1, `${label}: manual storage cleanup did not call its controller action`);
   await root.getByRole("button", { name: "Back", exact: true }).click();
-  await root.locator(".st-settings-section").first().waitFor();
+  await root.locator(".st-settings-storage").waitFor({ state: "visible" });
   const assertOneSettingsLabel = async (step) => {
     const label = root.locator(".st-head-action .st-icon-button-label");
     const count = await label.count();
@@ -512,8 +580,64 @@ async function inspectViewport(platform, viewport, label) {
     check(count === 1 && text === "Settings", `${label}: header Settings label is not exactly one after ${step}; found ${count}, text=${text}`);
   };
   await assertOneSettingsLabel("opening settings");
+  const activeTabs = root.getByRole("tablist", { name: "Settings sections" });
+  await activeTabs.getByRole("tab", { name: "Storage" }).click();
+  const storagePathDraft = root.getByLabel("Support folder", { exact: true });
+  await storagePathDraft.fill("Typed support folder");
+  await root.getByRole("button", { name: "Choose folder", exact: true }).click();
+  const supportBrowser = root.locator(".st-output-browser");
+  await supportBrowser.waitFor();
+  check(await root.getByRole("heading", { name: "Choose support folder", exact: true }).isVisible(), `${label}: support folder picker has the wrong screen title`);
+  await supportBrowser.locator(".st-browser-entry").filter({ hasText: "Reference" }).click();
+  await root.getByRole("button", { name: "Use this folder", exact: true }).click();
+  check(await root.getByLabel("Support folder", { exact: true }).inputValue() === "Reference", `${label}: choosing a support folder did not update the draft`);
+  await root.getByLabel("Hide support folder in File Explorer", { exact: true }).uncheck();
+  await root.getByLabel("Exclude support files from Search and Quick Switcher", { exact: true }).uncheck();
+  await activeTabs.getByRole("tab", { name: "Updates" }).click();
+  const automaticChecks = root.locator(".st-automatic-check-control").first();
+  const automaticSlider = automaticChecks.locator('input[type="range"]');
+  const automaticLabels = await automaticChecks.locator(".st-automatic-check-labels span").allTextContents();
+  check(automaticLabels.join("|") === "New pages|Recent edits|All changes", `${label}: automatic check slider labels are missing or out of order: ${JSON.stringify(automaticLabels)}`);
+  check(await automaticSlider.inputValue() === "0" && await automaticChecks.locator(".st-automatic-check-summary").innerText().then((text) => /new pages and page-order/i.test(text)), `${label}: default automatic check position or summary is incorrect`);
+  const setAutomaticPosition = async (position) => automaticSlider.evaluate((input, value) => { input.value = String(value); input.dispatchEvent(new Event("input", { bubbles: true })); }, position);
+  await setAutomaticPosition(1);
+  const globalRecentCount = automaticChecks.locator(".st-automatic-check-recent-pages");
+  const globalRecentVisible = await globalRecentCount.isVisible();
+  const globalRecentValue = await globalRecentCount.inputValue();
+  check(globalRecentVisible && globalRecentValue === "5" && await automaticChecks.locator(".st-automatic-check-count-field").isVisible(), `${label}: Recent edits does not reveal the default five-page count: visible=${globalRecentVisible}, value=${globalRecentValue}`);
+  await globalRecentCount.fill("8");
+  await setAutomaticPosition(2);
+  check(await globalRecentCount.isHidden() && await automaticChecks.locator(".st-automatic-check-count-field").isHidden() && await automaticChecks.locator(".st-automatic-check-summary").innerText().then((text) => /all page content/i.test(text)), `${label}: All changes did not hide the count row or update its summary`);
+  await activeTabs.getByRole("tab", { name: "Storage" }).click();
+  check(await root.getByLabel("Support folder", { exact: true }).inputValue() === "Reference" && !(await root.getByLabel("Hide support folder in File Explorer", { exact: true }).isChecked()) && !(await root.getByLabel("Exclude support files from Search and Quick Switcher", { exact: true }).isChecked()), `${label}: changing settings tabs discarded the storage draft`);
+  await activeTabs.getByRole("tab", { name: "Updates" }).click();
+  const autoHelpButton = automaticChecks.getByRole("button", { name: "Help: Automatic checks", exact: true });
+  await autoHelpButton.click();
+  check(await root.locator(`#${await autoHelpButton.getAttribute("aria-controls")}`).innerText().then((text) => /older pages/i.test(text) && /ambiguous/i.test(text) && /Manual Update/i.test(text)), `${label}: automatic check help omits limits or manual fallback`);
+  await root.getByRole("button", { name: "Cancel", exact: true }).click();
+  check(await page.evaluate(() => { const c = window.__streamlinedFixture.controller; return !c.config.automaticCheck && !c.config.automaticCheckRecentPages && !c.config.supportFolder && c.storagePreferences().hideInExplorer && c.storagePreferences().excludeFromSearch && c.actionCounters.saveConfig === 0 && c.actionCounters.setStoragePreferences === 0; }), `${label}: cancelling settings changed saved defaults, storage preferences, or config`);
+  await root.getByRole("button", { name: "Settings", exact: true }).click();
+  await root.getByRole("tab", { name: "Updates" }).click();
+  const saveChecks = root.locator(".st-automatic-check-control").first();
+  const saveSlider = saveChecks.locator('input[type="range"]');
+  await saveSlider.evaluate((input) => { input.value = "1"; input.dispatchEvent(new Event("input", { bubbles: true })); });
+  await saveChecks.locator(".st-automatic-check-recent-pages").fill("8");
+  await root.getByRole("tab", { name: "Storage" }).click();
+  await root.getByLabel("Support folder", { exact: true }).fill("Reference");
+  await root.getByLabel("Hide support folder in File Explorer", { exact: true }).uncheck();
+  await root.getByLabel("Exclude support files from Search and Quick Switcher", { exact: true }).uncheck();
+  await root.getByRole("button", { name: "Save", exact: true }).click();
+  await page.waitForFunction(() => { const c = window.__streamlinedFixture.controller; return c.config.automaticCheck === "recent" && c.config.automaticCheckRecentPages === 8 && c.config.supportFolder === "Reference" && !c.storagePreferences().hideInExplorer && !c.storagePreferences().excludeFromSearch; });
+  check(await page.evaluate(() => window.__streamlinedFixture.controller.actionCounters.saveConfig) === 1, `${label}: saving global automatic check defaults did not save exactly once`);
+  check(await page.evaluate(() => window.__streamlinedFixture.controller.actionCounters.setStoragePreferences) === 1, `${label}: saving storage visibility preferences did not call its setter exactly once`);
+  await page.evaluate(() => { window.__streamlinedFixture.controller.actionCounters.saveConfig = 0; });
+  await page.evaluate(() => { window.__streamlinedFixture.controller.actionCounters.setStoragePreferences = 0; });
+  await root.getByRole("button", { name: "Settings", exact: true }).click();
+  await root.getByRole("tab", { name: "Updates" }).click();
+  check(await root.locator(".st-automatic-check-control").first().locator('input[type="range"]').inputValue() === "1" && await root.locator(".st-automatic-check-control").first().locator(".st-automatic-check-recent-pages").inputValue() === "8", `${label}: saved automatic check defaults did not reload in settings`);
   if (platform === "desktop" || platform === "nomad") {
     for (const fieldName of ["API key", "Simultaneous requests", "Check interval (minutes)"]) {
+      await root.getByRole("tab", { name: fieldName === "API key" ? "Connection" : "Updates" }).click();
       const label = root.locator(".st-settings-section label").filter({ hasText: new RegExp(`^${fieldName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}$`) });
       const geometry = await label.evaluate((element) => {
         const field = element.closest(".st-field");
@@ -530,7 +654,7 @@ async function inspectViewport(platform, viewport, label) {
       const labelHelpTopDelta = Math.abs(helpBounds.y - labelBounds.y);
       check(inputBounds.y > labelBounds.y + labelBounds.height - 2 && labelHelpTopDelta <= 8, `${label}: ${fieldName} label, control, and help do not use the aligned label-above-control layout: ${JSON.stringify({ labelBounds, inputBounds, helpBounds })}`);
     }
-    const settingsToggles = await root.locator(".st-settings-section .st-check-row").evaluateAll((rows) => rows.map((row) => {
+    const settingsToggles = await root.locator(".st-settings-panel-updates .st-settings-section .st-check-row").evaluateAll((rows) => rows.map((row) => {
       const checkbox = row.querySelector('input[type="checkbox"]')?.getBoundingClientRect();
       const help = row.querySelector(".st-help-button")?.getBoundingClientRect();
       return { checkboxX: checkbox ? checkbox.x + checkbox.width / 2 : null, helpRight: help?.right ?? null };
@@ -540,7 +664,7 @@ async function inspectViewport(platform, viewport, label) {
     const settingsHelpRights = settingsToggles.map((item) => item.helpRight).filter((right) => right !== null);
     check(settingsHelpRights.length > 0 && Math.max(...settingsHelpRights) - Math.min(...settingsHelpRights) <= 2, `${label}: settings toggle help buttons do not share a right rail: ${JSON.stringify(settingsToggles)}`);
   }
-  const helpButton = root.locator("button.st-help-button").first();
+  const helpButton = root.locator(".st-settings-panel-updates button.st-help-button").first();
   check(await helpButton.count() === 1, `${label}: settings help button missing`);
   check(await helpButton.innerText() === "?", `${label}: help is rendered as inline explanation text`);
   await helpButton.focus();
@@ -554,6 +678,7 @@ async function inspectViewport(platform, viewport, label) {
   await screenshot("settings");
 
   // Subscription connection actions are direct siblings with a visible gap.
+  await root.getByRole("tab", { name: "Connection" }).click();
   await root.locator(".st-settings-connection select").selectOption("subscription");
   await assertOneSettingsLabel("changing provider");
   check(await root.getByText("Manage subscription usage", { exact: true }).count() === 0, `${label}: subscription settings still expose the removed Manage subscription usage link`);
@@ -577,7 +702,8 @@ async function inspectViewport(platform, viewport, label) {
   await assertLayout("Subscription settings");
   await screenshot("subscription-settings");
   if (platform === "desktop" || platform === "nomad") {
-    const quality = root.locator(".st-quality-control");
+    await root.getByRole("tab", { name: "Recognition" }).click();
+    const quality = root.locator(".st-quality-control:not(.st-automatic-check-control)").first();
     const trackBounds = await quality.locator('input[type="range"]').boundingBox();
     const labelsBounds = await quality.locator(".st-quality-labels").boundingBox();
     check(trackBounds && labelsBounds && Math.abs(trackBounds.x - labelsBounds.x) <= 2 && Math.abs(trackBounds.width - labelsBounds.width) <= 2, `${label}: quality slider track and labels have different widths or alignment: ${JSON.stringify({ trackBounds, labelsBounds })}`);
@@ -602,6 +728,30 @@ async function inspectViewport(platform, viewport, label) {
     check(editorHeadings.includes(heading), `${label}: source editor is missing the ${heading} section heading: ${JSON.stringify(editorHeadings)}`);
   }
   check(await root.locator(".st-form .st-source-advanced").count() === 0, `${label}: single-note editor still has a Source Advanced disclosure`);
+  const autoRecognition = root.locator(".st-form").getByLabel("Automatic updates", { exact: true });
+  await autoRecognition.uncheck();
+  check(await root.locator(".st-form .st-automatic-check-control").count() === 0 && await root.locator(".st-form").getByLabel("Use default automatic checks", { exact: true }).count() === 0, `${label}: automatic check slider or inheritance control stayed visible with source automatic recognition disabled`);
+  await root.locator(".st-form").getByLabel("Automatic updates", { exact: true }).check();
+  const automaticInherit = root.locator(".st-form").getByLabel("Use default automatic checks", { exact: true });
+  check(await automaticInherit.isChecked(), `${label}: new source does not inherit the global automatic check default`);
+  await automaticInherit.uncheck();
+  let sourceAutomatic = root.locator(".st-form .st-automatic-check-control");
+  check(await sourceAutomatic.locator('input[type="range"]').inputValue() === "1" && await sourceAutomatic.locator(".st-automatic-check-recent-pages").inputValue() === "8", `${label}: source override did not initialize from global Recent edits defaults`);
+  await sourceAutomatic.locator(".st-automatic-check-recent-pages").fill("12");
+  await sourceAutomatic.locator('input[type="range"]').evaluate((input) => { input.value = "2"; input.dispatchEvent(new Event("input", { bubbles: true })); });
+  check(await sourceAutomatic.getByLabel("Last N pages", { exact: true }).isHidden(), `${label}: source All changes still shows Recent pages count`);
+  await sourceAutomatic.locator('input[type="range"]').evaluate((input) => { input.value = "1"; input.dispatchEvent(new Event("input", { bubbles: true })); });
+  await root.getByRole("button", { name: "Save", exact: true }).click();
+  await page.waitForFunction(() => { const rule = window.__streamlinedFixture.controller.config.rules.find((item) => item.id === "reflection-single"); return rule.automaticCheck === "recent" && rule.automaticCheckRecentPages === 12; });
+  await page.evaluate(() => { window.__streamlinedFixture.controller.actionCounters.saveConfig = 0; });
+  await soloConfigure.click();
+  await root.locator(".st-form").waitFor();
+  check(!(await root.locator(".st-form").getByLabel("Use default automatic checks", { exact: true }).isChecked()) && await root.locator(".st-form .st-automatic-check-control").locator(".st-automatic-check-recent-pages").inputValue() === "12", `${label}: saved source-specific automatic check override did not reload`);
+  await root.locator(".st-form").getByLabel("Use default automatic checks", { exact: true }).check();
+  await root.getByRole("button", { name: "Cancel", exact: true }).click();
+  check(await page.evaluate(() => { const c = window.__streamlinedFixture.controller; const rule = c.config.rules.find((item) => item.id === "reflection-single"); return rule.automaticCheck === "recent" && rule.automaticCheckRecentPages === 12 && c.actionCounters.saveConfig === 0; }), `${label}: cancelling source inheritance draft changed the saved override or wrote config`);
+  await soloConfigure.click();
+  await root.locator(".st-form").waitFor();
   const outputRail = await root.locator(".st-form .st-output-folder-field").evaluate((field) => {
     const bounds = (node) => {
       const r = node?.getBoundingClientRect();
@@ -652,7 +802,7 @@ async function inspectViewport(platform, viewport, label) {
   await mirrorHelp.focus();
   await page.keyboard.press("Enter");
   const mirrorHelpText = root.locator(`#${await mirrorHelp.getAttribute("aria-controls")}`);
-  check(await mirrorHelpText.innerText().then((text) => /configuration folder separate/i.test(text) && /queue state/i.test(text) && /Shared Data and Markdown transcripts/i.test(text)), `${label}: Shared mirror help omits separate device configuration guidance`);
+  check(await mirrorHelpText.innerText().then((text) => /configuration folder separate/i.test(text) && /queue state/i.test(text) && /shared data is stored in reference/i.test(text) && /markdown transcripts stay under supernote transcripts/i.test(text) && /exclude that folder from Search/i.test(text)), `${label}: Shared mirror help omits configuration, storage or Search guidance`);
   await screenshot("reflection-editor-shared-mirror-help");
   await page.keyboard.press("Space");
   const chooseFolder = root.getByRole("button", { name: "Choose folder", exact: true });
@@ -729,16 +879,146 @@ async function inspectViewport(platform, viewport, label) {
   // Open standalone notebook detail, then inspect cleanup and reprocess in dedicated workflows.
   const standaloneDetails = root.locator('article.st-rule-row .st-notebook-details-action[aria-label="Notebook details: Reflection"]').last();
   check(await standaloneDetails.isVisible() && await standaloneDetails.getAttribute("title") === "Notebook details: Reflection", `${label}: standalone notebook does not use the same accessible details icon action as folder children`);
+  await page.evaluate(() => {
+    const c = window.__streamlinedFixture.controller;
+    c.reconciliationCapture = {
+      items: [
+        { pageId: "fixture-page-2", number: 2, reason: "This page has both local edits and a new recognition.", editedText: "Synthetic edited text for page two.", recognizedText: "Synthetic new recognition for page two.", fingerprint: "fixture-fingerprint-2" },
+        { pageId: "fixture-page-4", number: 4, reason: "The page changed after the comparison was prepared.", editedText: "Synthetic edited text for page four.", recognizedText: "Synthetic new recognition for page four.", proposedText: "Synthetic proposal for page four.", fingerprint: "fixture-fingerprint-4-old" },
+      ],
+      calls: [],
+      staleInjected: false,
+    };
+    c.getReconciliationConflicts = () => structuredClone(c.reconciliationCapture.items);
+    c.resolveReconciliationConflict = async (source, pageId, choice, fingerprint, editedText) => {
+      const capture = c.reconciliationCapture;
+      capture.calls.push({ source, pageId, choice, fingerprint, editedText });
+      const current = capture.items.find((item) => item.pageId === pageId);
+      if (!current || current.fingerprint !== fingerprint || current.editedText !== editedText) {
+        if (pageId === "fixture-page-4" && !capture.staleInjected) {
+          capture.staleInjected = true;
+          capture.items = capture.items.map((item) => item.pageId === pageId
+            ? { ...item, editedText: "Updated edited content after concurrent change.", recognizedText: "Updated recognition after concurrent change.", proposedText: "Updated proposal after concurrent change.", fingerprint: "fixture-fingerprint-4-new" }
+            : item);
+        }
+        throw new Error("Stale page values");
+      }
+      capture.items = capture.items.filter((item) => item.pageId !== pageId);
+    };
+  });
   await standaloneDetails.click();
   await root.locator(".st-detail-controls").waitFor();
   const detail = root.locator(".st-detail-controls");
+  const reconciliationSummary = root.locator(".st-reconciliation-summary");
+  await reconciliationSummary.getByRole("button", { name: "Review changes", exact: true }).waitFor();
+  check(await reconciliationSummary.getByText("2 pages have edits that differ from the new recognition.", { exact: true }).isVisible(), `${label}: detail did not show the independent page conflict count`);
+  await reconciliationSummary.getByRole("button", { name: "Review changes", exact: true }).click();
+  const reconciliation = root.locator(".st-page-reconciliation");
+  await reconciliation.waitFor();
+  check(await reconciliation.getByText("Synthetic edited text for page two.", { exact: true }).isVisible() && await reconciliation.getByText("Synthetic new recognition for page two.", { exact: true }).isVisible(), `${label}: page comparison omitted either edited or recognized text`);
+  check(await reconciliation.getByText("This page has both local edits and a new recognition.", { exact: true }).isVisible(), `${label}: page comparison omitted its reason`);
+  const firstConflict = reconciliation.locator(".st-page-conflict").filter({ hasText: "Page 2" });
+  check(await firstConflict.getByRole("button", { name: "Keep my edits", exact: true }).isVisible() && await firstConflict.getByRole("button", { name: "Use updated handwriting", exact: true }).isVisible() && await firstConflict.getByRole("button", { name: "Use proposed edit", exact: true }).count() === 0, `${label}: standard conflict choices are missing or a proposal action appeared without a proposal`);
+  const proposedConflict = reconciliation.locator(".st-page-conflict").filter({ hasText: "Page 4" });
+  check(await proposedConflict.getByText("Synthetic proposal for page four.", { exact: true }).isVisible() && await proposedConflict.getByRole("button", { name: "Use proposed edit", exact: true }).isVisible(), `${label}: provided proposal was not shown as an optional explicit choice`);
+  check(await page.evaluate(() => window.__streamlinedFixture.controller.reconciliationCapture.calls.length) === 0, `${label}: opening the review automatically resolved a page conflict`);
+  await firstConflict.getByRole("button", { name: "Keep my edits", exact: true }).click();
+  await reconciliation.locator(".st-page-conflict").filter({ hasText: "Page 2" }).waitFor({ state: "detached" });
+  const firstResolution = await page.evaluate(() => window.__streamlinedFixture.controller.reconciliationCapture.calls[0]);
+  check(firstResolution.choice === "keep-edits" && firstResolution.fingerprint === "fixture-fingerprint-2" && firstResolution.editedText === "Synthetic edited text for page two.", `${label}: the keep choice did not pass the exact page fingerprint and reviewed edited text`);
+  await page.evaluate(() => {
+    const capture = window.__streamlinedFixture.controller.reconciliationCapture;
+    capture.items = capture.items.map((item) => item.pageId === "fixture-page-4"
+      ? { ...item, fingerprint: "fixture-fingerprint-4-concurrently-changed" }
+      : item);
+  });
+  await reconciliation.locator(".st-page-conflict").filter({ hasText: "Page 4" }).getByRole("button", { name: "Use proposed edit", exact: true }).click();
+  await reconciliation.getByText(/may have changed/).waitFor();
+  check(await reconciliation.getByText("Updated edited content after concurrent change.", { exact: true }).isVisible() && await reconciliation.getByText("Updated proposal after concurrent change.", { exact: true }).isVisible(), `${label}: stale conflict did not refresh to the current page values`);
+  await reconciliation.locator(".st-page-conflict").filter({ hasText: "Page 4" }).getByRole("button", { name: "Use proposed edit", exact: true }).click();
+  await reconciliation.getByText("No page changes need review.", { exact: true }).waitFor();
+  const resolutions = await page.evaluate(() => window.__streamlinedFixture.controller.reconciliationCapture.calls);
+  const retriedResolution = resolutions.at(-1);
+  check(retriedResolution.choice === "use-proposal" && retriedResolution.fingerprint === "fixture-fingerprint-4-new" && retriedResolution.editedText === "Updated edited content after concurrent change.", `${label}: retry did not use the refreshed expected fingerprint and edited text`);
+  await root.getByRole("button", { name: "Back to notebook", exact: true }).click();
+  await root.locator(".st-detail-controls").waitFor();
   check(await detail.locator(".st-notebook-advanced").count() === 0, `${label}: single-note detail still has a separate Advanced disclosure`);
-  const documentToolbar = detail.locator(".st-document-action-toolbar");
-  check(await documentToolbar.count() === 1 && await documentToolbar.locator(".st-cleanup-open, .st-reprocess-open, .st-history-details, .st-exclude-open").count() === 4 && await documentToolbar.locator(".st-history-details").getAttribute("aria-expanded") === "false", `${label}: compact notebook toolbar is missing Cleanup, Re-recognize, History, or Exclude`);
-  const toolbarButtonTops = await documentToolbar.locator(".st-cleanup-open, .st-reprocess-open, .st-history-details, .st-exclude-open").evaluateAll((buttons) => buttons.map((button) => ({ label: (button.textContent || "").trim(), top: button.getBoundingClientRect().top })));
-  if (platform === "desktop" && viewport.width > 700)
-    check(toolbarButtonTops.length === 4 && Math.max(...toolbarButtonTops.map((button) => button.top)) - Math.min(...toolbarButtonTops.map((button) => button.top)) <= 1, `${label}: notebook action toolbar buttons are vertically misaligned: ${JSON.stringify(toolbarButtonTops)}`);
+  await page.evaluate(() => {
+    const c = window.__streamlinedFixture.controller;
+    const state = Object.values(c.store.notebooks).find((item) => item.ruleId === "reflection-single");
+    state.status = "conflict";
+    state.error = "Shared publication receipt is damaged. Diagnostic frames and internal details follow.\n at synthetic stack frame";
+  });
+  await root.locator(".st-body > .st-field select").dispatchEvent("change");
+  const visibleAttentionReason = root.locator(".st-detail-live .st-attention-reason");
+  const visibleAttentionReasonText = await visibleAttentionReason.innerText().catch(() => "missing");
+  check(await visibleAttentionReason.isVisible() && visibleAttentionReasonText === "Could not verify this transcript’s sync record. It links the saved Markdown to the original note; this check did not modify the notebook. Check Sync, then use Check & update.", `${label}: notebook details do not show a concise blocking reason without opening diagnostics: ${visibleAttentionReasonText}`);
+  check(await root.locator(".st-notebook-diagnostics").count() === 1 && !(await root.locator(".st-notebook-diagnostics").evaluate((details) => details.open)), `${label}: verbose notebook diagnostics are not kept in a collapsed technical section`);
+  check(await root.locator(".st-update-controls").getByRole("button", { name: "Force update", exact: true }).isVisible(), `${label}: blocking notebook reason has no visible recovery action`);
+  await page.evaluate(() => {
+    const c = window.__streamlinedFixture.controller;
+    const state = Object.values(c.store.notebooks).find((item) => item.ruleId === "reflection-single");
+    state.status = "current";
+    delete state.error;
+  });
+  await root.locator(".st-body > .st-field select").dispatchEvent("change");
+  const updateControls = detail.locator(".st-update-controls");
+  const notebookTools = detail.locator(".st-notebook-tools");
+  check(await updateControls.count() === 1 && await notebookTools.count() === 1 && await updateControls.locator("h2").innerText() === "Update" && await notebookTools.locator("h2").innerText() === "Notebook tools", `${label}: notebook details do not separate Update controls from Notebook tools`);
+  check(await updateControls.getByRole("button", { name: "Check & update", exact: true }).isVisible() && await updateControls.getByRole("button", { name: "Pause recognition", exact: true }).isVisible() && await updateControls.getByRole("button", { name: "Exclude notebook", exact: true }).isVisible(), `${label}: Update controls are missing Check & update, Pause recognition, or Exclude notebook`);
+  check(await notebookTools.locator(".st-cleanup-open, .st-reprocess-open, .st-history-details").count() === 3 && await notebookTools.locator(".st-history-details").getAttribute("aria-expanded") === "false", `${label}: Notebook tools are missing Clean up, Re-recognize, or History`);
+  const detailActions = detail.locator(".st-detail-action-grid > button");
+  const actionHeights = await detailActions.evaluateAll((buttons) => buttons.map((button) => ({ label: (button.textContent || "").trim(), height: button.getBoundingClientRect().height })));
+  check(actionHeights.length >= 6 && actionHeights.every((item) => item.height >= 48), `${label}: notebook detail actions are not full-sized buttons: ${JSON.stringify(actionHeights)}`);
+  const actionGridLayout = await detail.locator(".st-detail-action-grid").evaluateAll((grids) => grids.map((grid) => {
+    const style = getComputedStyle(grid);
+    const buttons = [...grid.querySelectorAll("button")];
+    return {
+      columns: style.gridTemplateColumns.split(" ").length,
+      buttons: buttons.map((button) => ({
+        label: (button.textContent || "").trim(),
+        width: button.clientWidth,
+        scrollWidth: button.scrollWidth,
+        whiteSpace: getComputedStyle(button).whiteSpace,
+        y: button.getBoundingClientRect().y,
+        x: button.getBoundingClientRect().x,
+      })),
+    };
+  }));
+  check(actionGridLayout.length === 2 && actionGridLayout.every((grid) => grid.columns === 2 && grid.buttons.length >= 3), `${label}: Update and Notebook tools actions are not arranged in two columns: ${JSON.stringify(actionGridLayout)}`);
+  check(actionGridLayout.every((grid) => grid.buttons.every((button) => button.whiteSpace === "nowrap" && button.scrollWidth <= button.width + 1)), `${label}: a notebook action label wraps or overflows its button: ${JSON.stringify(actionGridLayout)}`);
   check(!(await detail.locator(".st-notebook-details").evaluate((details) => details.open)), `${label}: technical notebook details are expanded by default`);
+  await detail.locator(".st-notebook-details > summary").click();
+  check(await detail.locator(".st-check-timestamps").innerText().then((text) => /Automatic check .* · full check /.test(text)), `${label}: notebook details do not show automatic and full check timestamps`);
+  await detail.locator(".st-notebook-details > summary").click();
+  const checkAndUpdate = updateControls.getByRole("button", { name: "Check & update", exact: true });
+  const previousRecognitionRequests = await page.evaluate(() => window.__streamlinedFixture.controller.actionCounters.recognitionNow.length);
+  await checkAndUpdate.click();
+  await page.waitForFunction((previous) => window.__streamlinedFixture.controller.actionCounters.recognitionNow.length === previous + 1, previousRecognitionRequests);
+  check(await page.evaluate(() => {
+    const c = window.__streamlinedFixture.controller;
+    const source = Object.keys(c.store.notebooks).find((path) => c.store.notebooks[path].ruleId === "reflection-single");
+    return JSON.stringify(c.actionCounters.recognitionNow.at(-1)) === JSON.stringify({ source });
+  }), `${label}: Check & update did not request a full one-shot notebook update`);
+  await page.evaluate(() => {
+    const c = window.__streamlinedFixture.controller;
+    const source = Object.keys(c.store.notebooks).find((path) => c.store.notebooks[path].ruleId === "reflection-single");
+    c.store.queue = c.store.queue.filter((task) => task.source !== source);
+    c.progress.manualSources = (c.progress.manualSources || []).filter((item) => item !== source);
+    c.actionCounters.recognitionNow.pop();
+    c.notify();
+  });
+  const pauseAction = updateControls.getByRole("button", { name: "Pause recognition", exact: true });
+  await pauseAction.click();
+  await page.waitForFunction(() => window.__streamlinedFixture.controller.actionCounters.notebookPause.at(-1)?.paused === true);
+  await updateControls.getByRole("button", { name: "Resume recognition", exact: true }).click();
+  await page.waitForFunction(() => window.__streamlinedFixture.controller.actionCounters.notebookPause.at(-1)?.paused === false);
+  await page.evaluate(() => { window.__streamlinedFixture.controller.actionCounters.notebookPause = []; });
+  await updateControls.getByRole("button", { name: "Exclude notebook", exact: true }).click();
+  await root.locator(".st-exclude-confirmation").waitFor();
+  check(await root.locator(".st-exclude-confirmation").getByText("This stops mirroring the notebook from this source.").isVisible(), `${label}: Exclude notebook skipped its existing confirmation`);
+  await root.getByRole("button", { name: "Cancel", exact: true }).click();
+  await detail.waitFor();
   const cleanup = detail.getByRole("button", { name: "Clean up document", exact: true });
   const reprocess = detail.getByRole("button", { name: "Re-recognize pages", exact: true });
   check(await cleanup.isVisible() && await reprocess.isVisible(), `${label}: detail action launch buttons are missing`);
@@ -1027,6 +1307,56 @@ async function inspectViewport(platform, viewport, label) {
   check(await mirrorToggle.isChecked(), `${label}: enabling an excluded standalone notebook did not draft it as included`);
   await root.getByRole("button", { name: "Cancel", exact: true }).click();
   check(await page.evaluate(() => JSON.stringify(window.__streamlinedFixture.controller.config)) === excludedConfig, `${label}: cancelling the re-include draft changed the saved exclusion`);
+
+  // One-shot recognition remains distinct from the saved pause preference.
+  const manualFolder = await page.evaluate(() => {
+    const c = window.__streamlinedFixture.controller;
+    const base = window.__streamlinedFixture.paths.working.replace(/\/Journal\/Reflection\.note$/i, "");
+    const rule = { id: "manual-fixture-folder", enabled: true, source: `${base}/Manual fixture`, output: "Fixture Output/Manual fixture", recursive: true, exclude: [], profileId: "general", paused: false };
+    c.config.rules.push(rule);
+    c.notify();
+    return rule;
+  });
+  const folderPlay = root.getByRole("button", { name: "Recognize now: Manual fixture", exact: true });
+  check(await folderPlay.isVisible() && await folderPlay.isEnabled(), `${label}: source folder without notebook state has no manual recognition action`);
+  await folderPlay.click();
+  await page.waitForTimeout(30);
+  const folderPlayState = await root.locator("button.st-recognize-now").evaluateAll((buttons) => buttons.map((button) => [button.getAttribute("aria-label"), button.disabled]));
+  const queuedFolderPlay = root.getByRole("button", { name: /^(Queued|Recognizing): Manual fixture$/ });
+  check(await queuedFolderPlay.count() === 1 && await queuedFolderPlay.isDisabled(), `${label}: queued folder request can be submitted again (buttons=${JSON.stringify(folderPlayState)})`);
+  check(JSON.stringify(await page.evaluate(() => window.__streamlinedFixture.controller.actionCounters.recognitionNow.at(-1))) === JSON.stringify({ ruleId: "manual-fixture-folder" }), `${label}: folder action did not send the exact ruleId target`);
+  await root.getByRole("button", { name: /Pause manual recognition: Manual fixture/ }).click();
+  check(await page.evaluate(() => window.__streamlinedFixture.controller.actionCounters.sourcePause.at(-1)?.paused) === true, `${label}: folder pause control did not cancel manual work at folder scope`);
+  await page.evaluate(() => {
+    const c = window.__streamlinedFixture.controller;
+    const rule = c.config.rules.find((item) => item.id === "manual-fixture-folder");
+    const source = `${rule.source}/Second fixture notebook.note`;
+    const template = Object.values(c.store.notebooks)[0];
+    c.store.notebooks[source] = { ...JSON.parse(JSON.stringify(template)), source, id: "manual-child-fixture", ruleId: rule.id, status: "queued", paused: false };
+    c.notify();
+  });
+  const folderDisclosure = root.getByRole("button", { name: "Expand Manual fixture", exact: true });
+  await folderDisclosure.click();
+  const manualChild = root.locator(".st-folder-contents[data-rule-id='manual-fixture-folder'] .st-notebook-child");
+  const childRow = manualChild.filter({ hasText: "Second fixture notebook" });
+  await childRow.waitFor();
+  const childPlay = childRow.getByRole("button", { name: "Recognize now: Second fixture notebook", exact: true });
+  check(await childPlay.isEnabled(), `${label}: notebook child manual recognition action is disabled by the automatic pause`);
+  await childPlay.click();
+  const queuedChild = childRow.locator("button.st-recognize-now");
+  check(await queuedChild.isVisible() && await queuedChild.isDisabled(), `${label}: repeated notebook child request is not blocked while queued`);
+  const childRequest = await page.evaluate(() => window.__streamlinedFixture.controller.actionCounters.recognitionNow.at(-1));
+  check(JSON.stringify(childRequest) === JSON.stringify({ source: manualFolder.source + "/Second fixture notebook.note" }), `${label}: child action did not send the exact notebook source target: ${JSON.stringify(childRequest)}`);
+  await childRow.getByRole("button", { name: /Pause manual recognition: Second fixture notebook/ }).click();
+  check(await page.evaluate(() => window.__streamlinedFixture.controller.actionCounters.notebookPause.at(-1)?.paused) === true, `${label}: child pause control did not cancel manual work at notebook scope`);
+  const mainPause = root.getByRole("button", { name: "Pause", exact: true });
+  check(await mainPause.isVisible(), `${label}: main action does not present Pause while manual work is active`);
+  check(await root.locator(".st-summary-title").innerText() === "Manual request queued", `${label}: main status still reports saved global pause instead of manual work`);
+  const priorGlobalPauses = await page.evaluate(() => window.__streamlinedFixture.controller.actionCounters.pause);
+  const priorFolderPaused = await page.evaluate(() => window.__streamlinedFixture.controller.config.rules.find((rule) => rule.id === "manual-fixture-folder").paused);
+  await mainPause.click();
+  const mainPauseResult = await page.evaluate(() => ({ pause: window.__streamlinedFixture.controller.actionCounters.pause, resume: window.__streamlinedFixture.controller.actionCounters.resume, update: window.__streamlinedFixture.controller.actionCounters.update, folderPaused: window.__streamlinedFixture.controller.config.rules.find((rule) => rule.id === "manual-fixture-folder").paused }));
+  check(mainPauseResult.pause === priorGlobalPauses + 1 && mainPauseResult.resume === 0 && mainPauseResult.update === 0 && mainPauseResult.folderPaused === priorFolderPaused, `${label}: main Pause resumed/updated or changed source-level pause preferences during manual work`);
 
   const finalCounters = await page.evaluate(() => ({ ...window.__streamlinedFixture.controller.actionCounters }));
   check(finalCounters.cleanupDocument === 0 && finalCounters.reprocessPages === 0 && finalCounters.update === 0, `${label}: fixture action counters changed unexpectedly: ${JSON.stringify(finalCounters)}`);

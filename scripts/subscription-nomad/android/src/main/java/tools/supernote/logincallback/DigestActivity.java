@@ -1,6 +1,7 @@
 package tools.supernote.logincallback;
 
 import android.app.Activity;
+import android.app.AlertDialog;
 import android.content.ComponentName;
 import android.content.ContentValues;
 import android.content.Intent;
@@ -22,6 +23,7 @@ import android.widget.LinearLayout;
 import android.widget.ScrollView;
 import android.widget.Spinner;
 import android.widget.TextView;
+import android.widget.Toast;
 
 import java.io.File;
 import java.security.MessageDigest;
@@ -37,6 +39,7 @@ import java.util.concurrent.Executors;
 public final class DigestActivity extends Activity {
     private static final String AUTHORITY = "com.ratta.supernote.knowledge.provider";
     private static final String KNOWLEDGE_PACKAGE = "com.ratta.supernote.knowledge";
+    private static final String KNOWLEDGE_HOME_ACTIVITY = "com.ratta.supernote.knowledge.activity.KnowledgeActivity";
     private static final String PROVIDER_CLASS = "com.ratta.supernote.knowledge.provider.KnowledgeContentProvider";
     private static final String KNOWLEDGE_DETAIL_ACTIVITY = "com.ratta.supernote.knowledge.activity.KnowledgeDetailWrapperActivity";
     private static final String READ_PERMISSION = "com.ratta.supernote.knowledge.permission.READ_KNOWLEDGE";
@@ -56,7 +59,7 @@ public final class DigestActivity extends Activity {
     private DigestProtocol.RequestEnvelope envelope;
     private DigestReceiptRoute.Request receiptRequest;
     private DigestProtocol.DigestPayload payload;
-    private String payloadSha, userNote = "", loadError, listWarning, receiptErrorMessage;
+    private String payloadSha, loadError, listWarning, receiptErrorMessage, quickAuthError, userNote = "";
     private TextView status, details, noteCounter;
     private Spinner listSpinner;
     private EditText noteInput;
@@ -66,9 +69,10 @@ public final class DigestActivity extends Activity {
     private Button doneButton;
     private LinearLayout trustedClientsContainer;
     private boolean settingsMode, receiptMode, busy, cancelled, hasSaved, uncertain, blocked, listsReady;
-    private boolean quickAuthorized, quickSetupPending, autoQuickPending;
+    private boolean quickAuthorized, quickSetupPending, quickAuthenticated;
     private long savedId = -1;
     private String requestBlockMessage;
+    private String outcomeReason;
     private final List<Button> revokeButtons = new ArrayList<>();
 
     @Override protected void onCreate(Bundle state) {
@@ -110,16 +114,23 @@ public final class DigestActivity extends Activity {
             payload = null; envelope = null;
         }
 
-        if (settingsMode) buildSettingsScreen();
-        else if (receiptMode) buildReceiptScreen();
-        else buildDigestScreen();
-        if (settingsMode || payload != null) loadListsAndPriorState();
-        else if (receiptMode) {
-            if (receiptRequest == null) setStatus(receiptErrorMessage == null ? "This saved Digest link is invalid. Nothing was opened." : receiptErrorMessage);
+        if (settingsMode) { openKnowledgeHome(); return; }
+        if (receiptMode) {
+            if (receiptRequest == null) finishWithToast("This saved Digest link is invalid. Nothing was opened.");
             else openSavedDigestReceipt();
+            return;
         }
-        else setStatus(requestBlockMessage == null ? "This Digest link is invalid or exceeds supported limits. No provider operation was made." : requestBlockMessage);
-        updateButtons();
+        if (payload == null) {
+            finishWithToast(requestBlockMessage == null
+                    ? "This Digest request is invalid or unsupported. Reconnect Reader and try again."
+                    : requestBlockMessage);
+            return;
+        }
+        if (envelope == null || !envelope.isQuick()) {
+            routeLegacyReviewToKnowledgeHome();
+            return;
+        }
+        loadListsAndPriorState();
     }
 
     private boolean isSettingsUri(Uri uri) {
@@ -131,17 +142,7 @@ public final class DigestActivity extends Activity {
         return uri != null && "supernote-bridge".equals(uri.getScheme()) && "digest-receipt".equals(uri.getAuthority());
     }
 
-    private void buildReceiptScreen() {
-        LinearLayout content = screenContent("Open Digest");
-        status = addText(content, "", 16, 12, 8);
-        addText(content, "This opens the saved entry in the native Digest app. Use its Edit control to make changes.", 16, 4, 8);
-        button(content, "Done", v -> finish());
-        ScrollView scroll = new ScrollView(this); scroll.addView(content); setContentView(scroll);
-    }
-
     private void openSavedDigestReceipt() {
-        busy = true;
-        setStatus("Checking saved Digest…");
         worker.execute(() -> {
             long authorizedId = -1L;
             String failure = null;
@@ -151,7 +152,7 @@ public final class DigestActivity extends Activity {
                     if (entry == null || !DigestRequestStore.SAVED.equals(entry.status) || entry.savedId <= 0) {
                         failure = "This Digest was saved on another device, or its local receipt is unavailable. Nothing was opened.";
                     }
-                    else {
+                else {
                         authorizedId = DigestReceiptRoute.authorizedSavedId(entry.status, entry.savedId, receiptRequest.assertedId);
                         if (authorizedId <= 0) failure = "This Open Digest link does not match the saved entry. Nothing was opened.";
                     }
@@ -169,25 +170,48 @@ public final class DigestActivity extends Activity {
             final String error = failure;
             runOnUiThread(() -> {
                 if (isFinishing() || isDestroyed()) return;
-                busy = false;
                 if (error != null) {
-                    setStatus(error);
-                    updateButtons();
+                    finishWithToast(error);
                     return;
                 }
-                try {
-                    Intent nativeDetail = new Intent();
-                    nativeDetail.setComponent(new ComponentName(KNOWLEDGE_PACKAGE, KNOWLEDGE_DETAIL_ACTIVITY));
-                    nativeDetail.putExtra("knowledge_id", id);
-                    nativeDetail.putExtra("from_app", "knowledge");
-                    startActivity(nativeDetail);
-                    finish();
-                } catch (RuntimeException ignored) {
-                    setStatus("The native Digest detail screen could not be opened. No Digest was changed.");
-                    updateButtons();
-                }
+                openNativeDetail(id);
             });
         });
+    }
+
+    private void openNativeDetail(long id) {
+        try {
+            Intent nativeDetail = new Intent();
+            nativeDetail.setComponent(new ComponentName(KNOWLEDGE_PACKAGE, KNOWLEDGE_DETAIL_ACTIVITY));
+            nativeDetail.putExtra("knowledge_id", id);
+            nativeDetail.putExtra("from_app", "knowledge");
+            startActivity(nativeDetail);
+            finish();
+        } catch (RuntimeException ignored) {
+            if (payload != null && hasSaved && savedId == id) finishCaptureWithOutcome("The Digest was saved, but its native details could not be opened.");
+            else finishWithToast("The native Digest entry could not be opened.");
+        }
+    }
+
+    private void openKnowledgeHome() {
+        try {
+            Intent home = new Intent();
+            home.setComponent(new ComponentName(KNOWLEDGE_PACKAGE, KNOWLEDGE_HOME_ACTIVITY));
+            startActivity(home);
+        } catch (RuntimeException ignored) {
+            Toast.makeText(this, "The native Digest app is unavailable.", Toast.LENGTH_SHORT).show();
+        }
+        finish();
+    }
+
+    private void routeLegacyReviewToKnowledgeHome() {
+        Toast.makeText(this, "Reconnect Reader to create a Digest.", Toast.LENGTH_LONG).show();
+        openKnowledgeHome();
+    }
+
+    private void finishWithToast(String message) {
+        if (message != null && !message.isEmpty()) Toast.makeText(this, message, Toast.LENGTH_LONG).show();
+        finish();
     }
 
     private boolean nativeDetailActivityReady() {
@@ -202,35 +226,46 @@ public final class DigestActivity extends Activity {
     }
 
     private void loadListsAndPriorState() {
-        busy = true; setStatus("Preparing…"); updateButtons();
         worker.execute(() -> {
             String message = null;
+            boolean authenticated;
             try {
+                authenticated = authenticateQuickRequest();
+                if (!authenticated) throw new ListLoadFailure("QUICK_AUTH_INVALID");
                 synchronized (WRITE_LOCK) {
                     if (!providerContractReady()) throw new ListLoadFailure("PROVIDER_CONTRACT_NOT_READY");
                     List<ListChoice> loaded = queryLists();
                     choices.clear(); choices.addAll(loaded); listsReady = true; loadError = null;
-                    if (!settingsMode) message = refreshPriorState();
+                    message = refreshPriorState();
                 }
             } catch (Exception error) {
-                listsReady = false; loadError = "Could not load Digest lists [" + listFailureSummary(error) + "]. Check Supernote permissions, then refresh.";
+                authenticated = quickAuthenticated;
+                listsReady = false; loadError = "The native Digest provider is unavailable. No entry was created.";
             }
             final String shown = message;
+            final boolean authOk = authenticated;
             runOnUiThread(() -> {
                 if (isFinishing() || isDestroyed()) return;
-                busy = false;
-                if (settingsMode) populateSettingsLists(); else populateReviewLists();
-                if (loadError != null) setStatus(loadError);
-                else if (shown != null) setStatus(shown);
-                else if (listWarning != null) setStatus(listWarning);
-                else if (envelope != null && envelope.isQuick() && quickSetupPending) setStatus("Review the quote and list, then allow Reader Quick Digest to save this entry.");
-                else setStatus("Review the quote and source, choose a Digest list, then save when ready.");
-                if (!settingsMode && autoQuickPending && shown == null && listsReady) {
-                    ListChoice defaultChoice = defaultChoice();
-                    if (defaultChoice != null) { autoQuickPending = false; saveWithChoice(defaultChoice, "", true); }
-                    else { autoQuickPending = false; setStatus("Choose a Digest list. Quick Digest has no valid saved default, so this request was not saved automatically."); }
+                if (!authOk) {
+                    finishWithToast("Reader Quick Digest could not be authenticated. Reconnect Reader and try again.");
+                    return;
                 }
-                updateButtons();
+                if (loadError != null) { finishCaptureWithOutcome(loadError); return; }
+                if (shown != null) {
+                    if (hasSaved && savedId > 0 && envelope.shouldOpenNative()) openNativeDetail(savedId);
+                    else if (hasSaved && savedId > 0) finishCaptureWithOutcome(null);
+                    else finishCaptureWithOutcome(shown);
+                    return;
+                }
+                if (quickAuthorized) {
+                    ListChoice choice = quickChoice();
+                    if (choice == null) { finishCaptureWithOutcome(categoryChoiceError(), outcomeReason); return; }
+                    saveWithChoice(choice, "", true);
+                } else if (quickSetupPending) {
+                    showQuickEnrollmentPrompt();
+                } else {
+                    finishWithToast(quickAuthError == null ? "Reconnect Reader to create a Digest." : quickAuthError);
+                }
             });
         });
     }
@@ -362,35 +397,11 @@ public final class DigestActivity extends Activity {
     }
 
     private String refreshPriorState() {
-        if (envelope != null && envelope.isQuick()) {
-            QuickTrustStore.Entry trusted = trustStore.get(envelope.client);
-            byte[] signingSecret = trusted == null ? null : trusted.secret;
-            boolean known = trusted != null && payload.origin.vault.equals(trusted.vault);
-            boolean setupAllowed = trusted == null && envelope.setupHex != null;
-            if (setupAllowed) {
-                try { signingSecret = DigestProtocol.parseHexSecret(envelope.setupHex); }
-                catch (Exception ignored) { signingSecret = null; }
-            } else if (known && envelope.setupHex != null) {
-                try { known = MessageDigest.isEqual(signingSecret, DigestProtocol.parseHexSecret(envelope.setupHex)); }
-                catch (Exception ignored) { known = false; }
-            }
-            boolean fresh = DigestProtocol.isTimestampFresh(System.currentTimeMillis(), envelope.time);
-            boolean signature = fresh && signingSecret != null && DigestProtocol.quickSignatureMatches(envelope.client, envelope.time, payload.rawJson, signingSecret, envelope.signature);
-            quickSetupPending = setupAllowed && signature;
-            quickAuthorized = known && signature;
-            if (!signature) loadError = "Reader Quick Digest could not be authenticated. You can review and save this item manually.";
-        }
         DigestRequestStore.Entry entry = store.get(payload.requestId);
-        if (entry == null) {
-            if (quickAuthorized) {
-                ListChoice d = defaultChoice();
-                if (d != null) { autoQuickPending = true; return null; }
-            }
-            return null;
-        }
+        if (entry == null) return null;
         if (!entry.sha.equals(payloadSha)) { blocked = true; return "This request ID was previously used with different content. It is blocked."; }
         if (DigestRequestStore.SAVED.equals(entry.status) && entry.savedId > 0) {
-            String expectedComment = entry.savedComment == null ? manualCommentOrNull("") : entry.savedComment;
+            String expectedComment = savedReceiptCommentOrNull(entry.savedComment);
             if (expectedComment != null && verifySavedRow(entry.savedId, expectedComment, entry.listAttribute, entry.savedComment != null)) {
                 hasSaved = true; savedId = entry.savedId; return "Saved to Digest (entry " + savedId + ").";
             }
@@ -400,14 +411,79 @@ public final class DigestActivity extends Activity {
         } else if (DigestRequestStore.UNCERTAIN.equals(entry.status)) {
             uncertain = true; return "A prior attempt has an uncertain result. No retry is allowed.";
         } else if (DigestRequestStore.CANCELLED.equals(entry.status)) {
-            quickAuthorized = false; quickSetupPending = false;
-            return "This request was cancelled before writing. You can review it and try once.";
+            return null;
         }
         return "This request has a saved local status that cannot be retried.";
     }
 
+    private boolean authenticateQuickRequest() {
+        if (envelope == null || !envelope.isQuick()) return false;
+        QuickTrustStore.Entry trusted = trustStore.get(envelope.client);
+        byte[] signingSecret = trusted == null ? null : trusted.secret;
+        boolean known = trusted != null && payload.origin.vault.equals(trusted.vault);
+        boolean setupAllowed = trusted == null && envelope.setupHex != null;
+        if (setupAllowed) {
+            try { signingSecret = DigestProtocol.parseHexSecret(envelope.setupHex); }
+            catch (Exception ignored) { signingSecret = null; }
+        } else if (known && envelope.setupHex != null) {
+            try { known = MessageDigest.isEqual(signingSecret, DigestProtocol.parseHexSecret(envelope.setupHex)); }
+            catch (Exception ignored) { known = false; }
+        }
+        boolean fresh = DigestProtocol.isTimestampFresh(System.currentTimeMillis(), envelope.time);
+        boolean signature = fresh && signingSecret != null && DigestProtocol.quickSignatureMatches(
+                envelope.client, envelope.time, payload.rawJson, signingSecret, envelope.rawDeliveryJson, envelope.signature);
+        quickSetupPending = setupAllowed && signature;
+        quickAuthorized = known && signature;
+        quickAuthenticated = signature && (known || setupAllowed);
+        if (!quickAuthenticated) quickAuthError = "Reader Quick Digest could not be authenticated.";
+        return quickAuthenticated;
+    }
+
     private String manualCommentOrNull(String note) {
         try { return DigestProtocol.manualComment(payload, note); } catch (Exception ignored) { return null; }
+    }
+
+    private String savedReceiptCommentOrNull(String storedComment) {
+        try { return DigestProtocol.savedReceiptComment(payload, storedComment); } catch (Exception ignored) { return null; }
+    }
+
+    private ListChoice quickChoice() {
+        return quickChoice(choices);
+    }
+
+    private ListChoice quickChoice(List<ListChoice> available) {
+        requestBlockMessage = null;
+        outcomeReason = null;
+        String requested = envelope == null ? null : envelope.categoryName();
+        if (requested == null) return defaultChoice(available);
+        if (requested.trim().isEmpty()) {
+            ListChoice uncategorized = findDefaultRow(available);
+            if (uncategorized == null) {
+                requestBlockMessage = "The Uncategorized Digest list is unavailable. Refresh lists or choose a configured category in Reader.";
+                outcomeReason = "category-not-found";
+            }
+            return uncategorized;
+        }
+        ListChoice match = null;
+        for (ListChoice choice : available) {
+            if (!requested.equals(choice.label)) continue;
+            if (match != null) {
+                requestBlockMessage = "The requested Digest category is ambiguous. Choose a category name that matches exactly one local Digest list.";
+                outcomeReason = "category-ambiguous";
+                return null;
+            }
+            match = choice;
+        }
+        if (match == null) {
+            requestBlockMessage = "The requested Digest category is unavailable. Choose an exact local Digest list name or omit the category override.";
+            outcomeReason = "category-not-found";
+        }
+        return match;
+    }
+
+    private String categoryChoiceError() {
+        if (requestBlockMessage != null) return requestBlockMessage;
+        return "No valid native Digest list is available. Configure a default category in Reader or select Uncategorized.";
     }
 
     private void buildDigestScreen() {
@@ -500,17 +576,22 @@ public final class DigestActivity extends Activity {
         return choices.get(listSpinner.getSelectedItemPosition());
     }
     private ListChoice defaultChoice() {
+        return defaultChoice(choices);
+    }
+    private ListChoice defaultChoice(List<ListChoice> available) {
         if (prefs.getBoolean(DEFAULT_UNCATEGORIZED, false)) {
-            for (ListChoice c : choices) if (c.id == 0 && c.attribute == null) return c;
+            for (ListChoice c : available) if (c.id == 0 && c.attribute == null) return c;
             return null;
         }
         String attr = prefs.getString(DEFAULT_ATTRIBUTE, null);
-        if (attr == null) return findDefaultRow();
-        for (ListChoice c : choices) if (attr.equals(c.attribute)) return c;
-        return null;
+        if (attr != null) for (ListChoice c : available) if (attr.equals(c.attribute)) return c;
+        return findDefaultRow(available);
     }
     private ListChoice findDefaultRow() {
-        for (ListChoice c : choices) if (c.id == 0) return c;
+        return findDefaultRow(choices);
+    }
+    private ListChoice findDefaultRow(List<ListChoice> available) {
+        for (ListChoice c : available) if (c.id == 0) return c;
         return null;
     }
     private boolean sameChoice(ListChoice a, ListChoice b) { return a != null && b != null && (a.attribute == null ? b.attribute == null && a.id == b.id : a.attribute.equals(b.attribute)); }
@@ -550,40 +631,65 @@ public final class DigestActivity extends Activity {
         saveWithChoice(selected, noteInput.getText().toString(), false);
     }
 
-    private void approveQuickAndSave() {
-        if (!quickSetupPending || envelope == null || envelope.setupHex == null) return;
-        ListChoice selected = selectedChoice();
-        if (selected == null) { setStatus("Refresh and choose a Digest list before allowing Quick Digest."); return; }
-        String note = noteInput.getText().toString();
-        if (manualCommentLength(note) > 2000) { setStatus("The note and source details exceed the Digest comment limit. Shorten the note."); return; }
+    private void showQuickEnrollmentPrompt() {
+        if (!quickSetupPending || envelope == null || envelope.setupHex == null || isFinishing()) return;
+        ListChoice choice = quickChoice();
+        if (choice == null) { finishCaptureWithOutcome(categoryChoiceError(), outcomeReason); return; }
+        String message = "Allow Obsidian to create Digests for vault \"" + payload.origin.vault
+                + "\" on this device? Future Digest shortcuts from this vault will save to \"" + choice.label
+                + "\" without another prompt.";
+        new AlertDialog.Builder(this)
+                .setTitle("Allow Obsidian to create Digests?")
+                .setMessage(message)
+                .setNegativeButton("Cancel", (dialog, which) -> finishCaptureWithOutcome("Digest creation was cancelled."))
+                .setPositiveButton("Allow", (dialog, which) -> authorizeQuickClientAndSave(choice))
+                .setOnCancelListener(dialog -> finishCaptureWithOutcome("Digest creation was cancelled."))
+                .show();
+    }
+
+    /** Kept for the legacy, unreachable review layout; enrollment uses the system dialog. */
+    private void approveQuickAndSave() { showQuickEnrollmentPrompt(); }
+
+    private void authorizeQuickClientAndSave(ListChoice choice) {
+        if (!quickSetupPending || envelope == null || envelope.setupHex == null || isFinishing()) return;
         byte[] secret;
         try { secret = DigestProtocol.parseHexSecret(envelope.setupHex); }
-        catch (Exception e) { setStatus("Reader setup could not be verified. Review and save manually instead."); return; }
-        try { persistDefault(selected); }
-        catch (Exception e) { setStatus("Could not save this Quick Digest default (" + e.getClass().getSimpleName() + "). No client was enrolled and no Digest was sent."); return; }
-        if (!trustStore.put(envelope.client, payload.origin.vault, secret)) { setStatus("Quick Digest could not be enabled on this device. You can still save this item with review."); return; }
-        quickAuthorized = true; quickSetupPending = false;
-        saveWithChoice(selected, note, true);
+        catch (Exception ignored) { finishCaptureWithOutcome("Reader setup could not be verified."); return; }
+        if (envelope.categoryName() == null) {
+            try { persistDefault(choice); }
+            catch (Exception ignored) { finishCaptureWithOutcome("The Digest list preference could not be saved."); return; }
+        }
+        if (!trustStore.put(envelope.client, payload.origin.vault, secret)) {
+            finishCaptureWithOutcome("Quick Digest could not be enabled on this device.");
+            return;
+        }
+        quickAuthorized = true;
+        quickSetupPending = false;
+        saveWithChoice(choice, "", true);
     }
 
     private void saveWithChoice(ListChoice choice, String note, boolean quick) {
         if (payload == null || busy || hasSaved || uncertain || cancelled || blocked || choice == null) return;
-        userNote = note == null ? "" : note;
-        busy = true; updateButtons(); setStatus("Preparing…");
+        busy = true;
         worker.execute(() -> {
             String result;
-            try { result = performSave(choice, userNote); }
+            try { result = performSave(choice, note == null ? "" : note); }
             catch (Exception error) {
-                if (uncertain) result = "The save result is uncertain. Do not retry; return to Obsidian to report the status.";
-                else if (error instanceof SecurityException) result = "Supernote storage is unavailable or not authorized. No entry was sent.";
-                else result = "Could not prepare this save (" + error.getClass().getSimpleName() + "). No entry was sent; you can try again.";
+                if (uncertain) result = "The save result is uncertain. No retry was made.";
+                else if (error instanceof CategorySelectionFailure) {
+                    outcomeReason = ((CategorySelectionFailure) error).reason;
+                    result = error.getMessage();
+                }
+                else if (error instanceof SecurityException) result = "Supernote Digest storage is unavailable or not authorized. No entry was created.";
+                else result = "The Digest could not be created (" + error.getClass().getSimpleName() + ").";
             }
-            boolean autoReturn = quick && hasSaved;
             final String shown = result;
             runOnUiThread(() -> {
                 if (isFinishing() || isDestroyed()) return;
-                busy = false; setStatus(shown); updateButtons();
-                if (autoReturn) returnToObsidian();
+                busy = false;
+                if (hasSaved && savedId > 0 && envelope.shouldOpenNative()) openNativeDetail(savedId);
+                else if (hasSaved && savedId > 0) finishCaptureWithOutcome(null);
+                else finishCaptureWithOutcome(shown);
             });
         });
     }
@@ -591,11 +697,12 @@ public final class DigestActivity extends Activity {
     private String performSave(ListChoice choice, String note) throws Exception {
         synchronized (WRITE_LOCK) {
             requireProviderContract();
+            if (envelope.shouldOpenNative() && !nativeDetailActivityReady()) return "The native Digest entry screen is unavailable. No entry was created.";
             DigestRequestStore.Entry prior = store.get(payload.requestId);
             if (prior != null) {
                 if (!prior.sha.equals(payloadSha)) { blocked = true; return "This request ID belongs to different content. No write was made."; }
                 if (DigestRequestStore.SAVED.equals(prior.status) && prior.savedId > 0) {
-                    String priorComment = prior.savedComment == null ? DigestProtocol.manualComment(payload, "") : prior.savedComment;
+                    String priorComment = DigestProtocol.savedReceiptComment(payload, prior.savedComment);
                     if (verifySavedRow(prior.savedId, priorComment, prior.listAttribute, prior.savedComment != null)) { hasSaved = true; savedId = prior.savedId; return "Saved to Digest (entry " + savedId + ")."; }
                 }
                 if (!DigestRequestStore.CANCELLED.equals(prior.status)) {
@@ -619,16 +726,29 @@ public final class DigestActivity extends Activity {
                     markUncertain(comment, choice.attribute); return "The entry was verified, but its local acknowledgement could not be persisted. Do not retry.";
                 }
                 uncertain = false; hasSaved = true; savedId = id;
-                return "Saved to Digest (entry " + id + "). Choose Return to Obsidian to acknowledge.";
+                return "Saved to Digest (entry " + id + ").";
             } catch (Exception e) { markUncertain(comment, choice.attribute); throw e; }
         }
     }
 
     private void validateSelectedChoice(ListChoice choice) throws Exception {
         List<ListChoice> current = queryLists();
+        if (envelope.categoryName() != null) {
+            ListChoice exact = quickChoice(current);
+            if (exact == null || !sameChoice(exact, choice)) {
+                String reason = "category-ambiguous".equals(outcomeReason) ? outcomeReason : "category-not-found";
+                throw new CategorySelectionFailure("The requested Digest category changed or is unavailable. Choose an exact current category name or omit the override.", reason);
+            }
+            return;
+        }
         boolean found = false;
         for (ListChoice actual : current) if (sameChoice(actual, choice)) { found = true; break; }
         if (!found) throw new IllegalStateException("Selected Digest list is no longer available");
+    }
+
+    private static final class CategorySelectionFailure extends IllegalStateException {
+        final String reason;
+        CategorySelectionFailure(String message, String reason) { super(message); this.reason = reason; }
     }
 
     private void markUncertain(DigestRequestStore.Entry entry) { markUncertain(entry.savedComment, entry.listAttribute); }
@@ -681,7 +801,49 @@ public final class DigestActivity extends Activity {
             if (prior == null && !store.put(payload.requestId, payloadSha, DigestRequestStore.CANCELLED, -1, null, null)) { setStatus("Cancellation could not be recorded."); return; }
             cancelled = true;
         }
-        setStatus("Cancelled before any provider write. Returning to Obsidian…"); updateButtons(); returnToObsidian();
+        cancelled = true;
+        finishCaptureWithOutcome("Cancelled before any provider write.");
+    }
+
+    private void finishCaptureWithOutcome(String message) {
+        finishCaptureWithOutcome(message, null);
+    }
+
+    private void finishCaptureWithOutcome(String message, String reason) {
+        if (reason != null && ("category-not-found".equals(reason) || "category-ambiguous".equals(reason))) outcomeReason = reason;
+        if (!quickAuthenticated || payload == null || envelope == null || !envelope.isQuick()) {
+            finishWithToast(message);
+            return;
+        }
+        synchronized (WRITE_LOCK) {
+            hasSaved = false;
+            uncertain = false;
+            cancelled = false;
+            savedId = -1L;
+            try {
+                DigestRequestStore.Entry entry = store.get(payload.requestId);
+                boolean sameRequest = entry != null && entry.sha.equals(payloadSha);
+                if (entry == null) store.put(payload.requestId, payloadSha, DigestRequestStore.CANCELLED, -1, null, null);
+                DigestCaptureOutcome outcome = DigestCaptureOutcome.fromLedger(
+                        sameRequest ? entry.status : (entry == null ? DigestRequestStore.CANCELLED : null),
+                        sameRequest ? entry.savedId : -1L,
+                        entry == null || !sameRequest);
+                if ("saved".equals(outcome.status)) {
+                    hasSaved = true;
+                    savedId = outcome.savedId;
+                } else if ("uncertain".equals(outcome.status)) {
+                    if (sameRequest && DigestRequestStore.PENDING.equals(entry.status)) markUncertain(entry);
+                    else uncertain = true;
+                } else {
+                    // A request ID collision is cancelled for this payload without changing the existing row.
+                    cancelled = true;
+                }
+            } catch (RuntimeException ignored) {
+                uncertain = true;
+            }
+        }
+        if (message != null && !message.isEmpty()) Toast.makeText(this, message, Toast.LENGTH_LONG).show();
+        returnToObsidian();
     }
 
     private void returnToObsidian() {
@@ -692,8 +854,12 @@ public final class DigestActivity extends Activity {
                 .appendQueryParameter("vault", payload.origin.vault).appendQueryParameter("request", payload.requestId).appendQueryParameter("status", result);
         if (id != null) builder.appendQueryParameter("id", id);
         if (id != null && quickAuthorized && envelope != null && envelope.client != null) builder.appendQueryParameter("quick", envelope.client);
+        if ("cancelled".equals(result) && outcomeReason != null) builder.appendQueryParameter("reason", outcomeReason);
         try { startActivity(new Intent(Intent.ACTION_VIEW, builder.build())); finish(); }
-        catch (RuntimeException e) { setStatus("No Obsidian acknowledgement handler opened (" + e.getClass().getSimpleName() + "). You can return manually."); }
+        catch (RuntimeException ignored) {
+            Toast.makeText(this, "Reader could not receive the Digest outcome.", Toast.LENGTH_LONG).show();
+            finish();
+        }
     }
 
     private void openOriginalNotebook() {

@@ -11,12 +11,21 @@ export interface MirrorReconciliation {
 const clone = (value: PortableMirror): PortableMirror => ({
   profile: { ...value.profile, glossaries: [...value.profile.glossaries] },
   output: value.output, recursive: value.recursive, exclude: [...value.exclude],
+  ...(value.notebookIds === undefined ? {} : { notebookIds: { ...value.notebookIds } }),
+  ...(value.automaticCheck === undefined ? {} : { automaticCheck: value.automaticCheck }),
+  ...(value.automaticCheckRecentPages === undefined ? {} : { automaticCheckRecentPages: value.automaticCheckRecentPages }),
+  ...(value.digestCategoryName === undefined ? {} : { digestCategoryName: value.digestCategoryName }),
 });
-const equal = (a: unknown, b: unknown) => JSON.stringify(a) === JSON.stringify(b);
+const canonical = (value: unknown): unknown => value && typeof value === "object" && !Array.isArray(value)
+  ? Object.fromEntries(Object.entries(value).sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0).map(([key, item]) => [key, canonical(item)]))
+  : Array.isArray(value) ? value.map(canonical) : value;
+const equal = (a: unknown, b: unknown) => JSON.stringify(canonical(a)) === JSON.stringify(canonical(b));
 const fields = ["model", "endpoint", "prompt", "glossaries", "quality", "preserveFormatting", "formattingGuide"] as const;
+const checkFields = ["automaticCheck", "automaticCheckRecentPages", "notebookIds", "digestCategoryName"] as const;
 /** Identity and display names belong to each device; only recipe and selection values reconcile. */
 export function portableMirrorEqual(a: PortableMirror, b: PortableMirror): boolean {
   return a.output === b.output && a.recursive === b.recursive && equal(a.exclude, b.exclude) &&
+    checkFields.every((key) => equal(a[key], b[key])) &&
     fields.every((key) => equal(key === "quality" ? a.profile[key] ?? "fast" : a.profile[key],
       key === "quality" ? b.profile[key] ?? "fast" : b.profile[key]));
 }
@@ -44,6 +53,11 @@ export function reconcileMirror(local: PortableMirror, baseline: MirrorBaseline 
   }
   for (const key of ["output", "recursive", "exclude"] as const)
     (value as any)[key] = merge(key, local[key], baseline[key], remote[key]);
+  for (const key of checkFields) {
+    const merged = merge(key, local[key], baseline[key], remote[key]);
+    if (merged === undefined) delete (value as any)[key];
+    else (value as any)[key] = merged;
+  }
   if (conflicts.length) return unchanged(conflicts);
   return { value: clone(value), baseline: clone(value), publish: !portableMirrorEqual(value, remote), conflicts: [] };
 }

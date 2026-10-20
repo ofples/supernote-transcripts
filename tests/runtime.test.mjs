@@ -232,6 +232,180 @@ test("bounded backfill checkpoints paid results; restart reuses them", async () 
   assert.equal(restarted.progress.stage, "Current");
 });
 
+test("Recognize now runs while globally paused without changing the saved pause preference", async () => {
+  const f=fixture(1);await f.plugin.onload();await f.plugin.update();
+  f.plugin.config.rules[0].autoRecognize=false;
+  await f.plugin.setSourcePaused("r",true);
+  await f.plugin.setNotebookPaused(source,true);
+  f.plugin.pause();
+  const callsBefore=f.calls.length;
+  f.change([{id:"native:1",number:1,fingerprint:"changed"}]);
+  await f.plugin.requestRecognitionNow({source});
+  assert.equal(f.calls.length,callsBefore+1);
+  assert.equal(f.plugin.progress.paused,true);
+  assert.equal(f.plugin.progress.running,false);
+  assert.equal(localStorage.getItem(`${f.plugin.devicePrefix}:paused`),"true");
+  assert.deepEqual(f.plugin.progress.manualSources,undefined);
+});
+
+test("Recognize now rejects an existing explicit force task without changing it",async()=>{
+  const f=fixture(1);await f.plugin.onload();await f.plugin.update();
+  const state=f.plugin.store.notebooks[source];state.forcePending=["native:1"];
+  f.plugin.enqueue(source,true,["native:1"]);await f.plugin.persist();
+  const task=f.plugin.store.queue.find(item=>item.source===source),before=f.calls.length;
+  await assert.rejects(f.plugin.requestRecognitionNow({source}),/re-recognition queued/);
+  assert.equal(f.calls.length,before);assert.equal(task.force,true);assert.deepEqual(task.pageIds,["native:1"]);
+  assert.deepEqual(state.forcePending,["native:1"]);
+});
+
+test("folder Recognize now honors exclusions and does not scan other folders",async()=>{
+  const f=fixture(1);await f.plugin.onload();
+  const second="/storage/emulated/0/Note/Reflections/b.note",sent=[];
+  f.plugin.config.rules[0].exclude=["b.note"];
+  const record=new Map([[source,"a"],[second,"b"]]);
+  const listed=[];f.reader.list=async(path)=>{listed.push(path);return path===f.plugin.config.rules[0].source?[...record.keys()].map((path,i)=>({path,size:100,mtime:i+1})):[];};
+  f.reader.open=async(path)=>({descriptor:{path,revision:"r1",pages:[{id:"native:1",number:1,fingerprint:`${record.get(path)}-fingerprint`}],width:1404,height:1872},render:async()=>`image:${path}`,close(){}});
+  f.reader.revision=async()=>"r1";
+  globalThis.__response=async request=>{const body=JSON.parse(request.body);sent.push(body);return answer("fresh",body);};
+  await f.plugin.requestRecognitionNow({ruleId:"r"});
+  assert.equal(sent.length,1,`listed=${listed.join(",")} entries=${JSON.stringify(f.plugin.store.notebooks)} progress=${JSON.stringify(f.plugin.progress)}`);assert.ok(f.plugin.store.notebooks[source]);assert.equal(f.plugin.store.notebooks[second],undefined);
+});
+
+test("repeated in-flight Recognize now requests share one provider pass",async()=>{
+  const f=fixture(1);await f.plugin.onload();
+  let dispatched;const seen=new Promise(resolve=>{dispatched=resolve;});let release;const held=new Promise(resolve=>{release=resolve;});
+  globalThis.__response=async request=>{const body=JSON.parse(request.body);f.calls.push(body);dispatched();await held;return answer("manual",body);};
+  const first=f.plugin.requestRecognitionNow({source});await seen;
+  const repeated=f.plugin.requestRecognitionNow({source});release();await Promise.all([first,repeated]);
+  assert.equal(f.calls.length,1);assert.equal(f.plugin.store.notebooks[source].status,"current");
+});
+
+test("a second manual source joins the active request and the first source resumes after yielding",async()=>{
+  const f=fixture(5);await f.plugin.onload();
+  const second="/storage/emulated/0/Note/Reflections/b.note",notes=new Map([[source,"a"],[second,"b"]]),seen=[];
+  f.reader.list=async(path)=>path.endsWith(".note")?[{path,size:100,mtime:1}]:[...notes.keys()].map((path,i)=>({path,size:100,mtime:i+1}));
+  f.reader.open=async(path)=>({descriptor:{path,revision:"r1",pages:Array.from({length:path===source?5:1},(_,i)=>({id:`native:${i+1}`,number:i+1,fingerprint:`${notes.get(path)}-${i+1}`})),width:1404,height:1872},render:async n=>`image:${path}:${n}`,close(){}});
+  f.reader.revision=async()=>"r1";
+  let dispatched;const firstCall=new Promise(resolve=>{dispatched=resolve;});let release;const held=new Promise(resolve=>{release=resolve;});
+  globalThis.__response=async request=>{const body=JSON.parse(request.body);seen.push(body);if(seen.length===1)dispatched();if(seen.length===1)await held;return answer(`text ${seen.length}`,body);};
+  const playA=f.plugin.requestRecognitionNow({source});await firstCall;
+  const playB=f.plugin.requestRecognitionNow({source:second});
+  release();await Promise.all([playA,playB]);
+  assert.ok(seen.length>=3);assert.deepEqual(requestedPages(seen.at(-1)),[5]);
+  assert.ok(f.plugin.store.notebooks[source].pages["native:5"]);assert.ok(f.plugin.store.notebooks[second].pages["native:1"]);
+  assert.equal(f.plugin.progress.manualSources,undefined);
+});
+
+test("a higher-priority source held by a shared claim cannot starve the earlier manual source",async()=>{
+  const f=fixture(5);await f.plugin.onload();sharing(f,"manual-yield-claim");await f.plugin.saveConfig();
+  const second="/storage/emulated/0/Note/Reflections/b.note",notes=new Map([[source,"a"],[second,"b"]]);
+  f.reader.list=async(path)=>path.endsWith(".note")?[{path,size:100,mtime:1}]:[...notes.keys()].map((path,i)=>({path,size:100,mtime:i+1}));
+  f.reader.open=async(path)=>({descriptor:{path,revision:"r1",pages:Array.from({length:path===source?5:1},(_,i)=>({id:`native:${i+1}`,number:i+1,fingerprint:`${notes.get(path)}-${i+1}`})),width:1404,height:1872},render:async n=>`image:${path}:${n}`,close(){}});
+  f.reader.revision=async()=>"r1";
+  const secondId=await notebookIdentity("linked-reflections","b.note");let secondClaims=0;
+  f.plugin.sharedCache.acquire=async id=>{if(id===secondId){secondClaims++;return null;}return {owner:"first"};};
+  f.plugin.sharedCache.checkLease=async()=>true;f.plugin.sharedCache.heartbeat=async()=>true;f.plugin.sharedCache.release=async()=>{};
+  let dispatched;const firstCall=new Promise(resolve=>{dispatched=resolve;});let release;const held=new Promise(resolve=>{release=resolve;});
+  globalThis.__response=async request=>{const body=JSON.parse(request.body);f.calls.push(body);if(f.calls.length===1)dispatched();if(f.calls.length===1)await held;return answer(`text ${f.calls.length}`,body);};
+  const playA=f.plugin.requestRecognitionNow({source});await firstCall;
+  const playB=f.plugin.requestRecognitionNow({source:second});release();await Promise.all([playA,playB]);
+  assert.ok(secondClaims>=1);assert.equal(f.calls.length,5);
+  assert.equal(Object.keys(f.plugin.store.notebooks[source].pages).length,5);
+  assert.equal(Object.keys(f.plugin.store.notebooks[second].pages).length,0);
+  assert.equal(f.plugin.store.notebooks[second].status,"queued");
+});
+
+test("same-update inventory hands its verified index to processing without reopening",async()=>{
+  const f=fixture(1);await f.plugin.onload();let opens=0,forks=0,renders=0,closes=0;
+  const makeOpened=()=>({descriptor:{path:source,revision:"1:100",pages:[{id:"native:1",number:1,fingerprint:"f1"}],width:1404,height:1872},
+    render:async()=>{renders++;return "verified-image";},close(){closes++;}});
+  f.reader.open=async()=>{opens++;const opened=makeOpened();opened.fork=async()=>{forks++;return makeOpened();};return opened;};
+  await f.plugin.update();
+  assert.equal(opens,1);assert.equal(forks,1);assert.equal(renders,1);assert.equal(closes,2);
+  assert.equal(f.plugin.reusableNotebooks.size,0);
+});
+
+test("runtime batches uncached target and context bitmap reads when supported",async()=>{
+  const f=fixture(2);f.plugin.config.profiles[0].quality="balanced";await f.plugin.onload();let batches=0,singles=0;
+  f.reader.open=async()=>({descriptor:{path:source,revision:"1:100",pages:[{id:"native:1",number:1,fingerprint:"f1"},{id:"native:2",number:2,fingerprint:"f2"}],width:1404,height:1872},
+    render:async number=>{singles++;return `single:${number}`;},
+    renderMany:async numbers=>{batches++;return numbers.map(number=>`batch:${number}`);},close(){}});
+  await f.plugin.update();
+  assert.equal(batches,1);assert.equal(singles,0);assert.equal(f.calls.length,1);
+});
+
+test("runtime falls back from a failed batch render to independent page renders",async()=>{
+  const f=fixture(2);f.plugin.config.profiles[0].quality="balanced";await f.plugin.onload();let singles=[];
+  f.reader.open=async()=>({descriptor:{path:source,revision:"1:100",pages:[{id:"native:1",number:1,fingerprint:"f1"},{id:"native:2",number:2,fingerprint:"f2"}],width:1404,height:1872},
+    render:async number=>{singles.push(number);if(number===1)throw Error("bad bitmap");return `single:${number}`;},
+    renderMany:async()=>{throw Error("batch decode failed");},close(){}});
+  await f.plugin.update();
+  assert.deepEqual(singles,[1,2]);assert.equal(f.plugin.store.notebooks[source].pageIssues["native:1"].kind,"render");
+  assert.ok(f.plugin.store.notebooks[source].pages["native:2"]);assert.equal(f.calls.length,1);
+});
+
+test("a pause after inventory closes retained readers before the update exits",async()=>{
+  const f=fixture(1);await f.plugin.onload();let closes=0,forks=0;
+  f.reader.open=async()=>{const opened={descriptor:{path:source,revision:"1:100",pages:[{id:"native:1",number:1,fingerprint:"f1"}],width:1404,height:1872},render:async()=>"",close(){closes++;}};
+    opened.fork=async()=>{forks++;return {...opened};};f.plugin.pause();return opened;};
+  await f.plugin.update();
+  assert.equal(forks,0);assert.equal(closes,1);assert.equal(f.plugin.reusableNotebooks.size,0);assert.equal(f.calls.length,0);
+});
+
+test("restart drops stale manual queue authorization and does not run it automatically",async()=>{
+  const f=fixture(2);await f.plugin.onload();await f.plugin.update();
+  f.plugin.enqueue(source);f.plugin.store.queue[0].manual=true;f.plugin.store.notebooks[source].status="queued";await f.plugin.persist();
+  const before=f.calls.length,restarted=new Runtime(f.app);restarted.reader=()=>f.reader;await restarted.onload();
+  assert.equal(restarted.store.queue.some(task=>task.manual),false);
+  assert.equal(restarted.store.notebooks[source].status,"partial");
+  await restarted.update(true);assert.equal(f.calls.length,before);
+});
+
+test("manual budget block clears transient play authorization and keeps the ordinary task",async()=>{
+  const f=fixture(2);await f.plugin.onload();await f.plugin.saveCostSettings({...f.plugin.costs.settings,dailyUsd:0.000001});
+  await f.plugin.requestRecognitionNow({source});
+  assert.equal(f.calls.length,0);assert.equal(f.plugin.progress.manualSources,undefined);
+  assert.equal(f.plugin.store.queue[0].manual,undefined);assert.equal(f.plugin.store.notebooks[source].status,"queued");
+});
+
+test("manual request persistence failure revokes its staged authorization without retrying persistence",async()=>{
+  const f=fixture(1);await f.plugin.onload();f.plugin.pause();
+  let writes=0;f.app.vault.adapter.write=async()=>{writes++;throw Error("disk full");};
+  await assert.rejects(f.plugin.requestRecognitionNow({source}),/Notebook state could not be saved/);
+  assert.equal(writes,1);assert.equal(f.plugin.manualSources.size,0);assert.equal(f.plugin.progress.manualSources,undefined);
+  assert.equal(f.plugin.stop,true);assert.equal(f.plugin.store.queue.some(task=>task.manual),false);
+});
+
+test("deactivation during manual inventory exits the drain without dispatch or recursion",async()=>{
+  const f=fixture(1);await f.plugin.onload();let release;const pending=new Promise(resolve=>{release=resolve;});
+  f.reader.list=async()=>pending;
+  const request=f.plugin.requestRecognitionNow({source});await Promise.resolve();f.plugin.onunload();
+  release([{path:source,size:100,mtime:1}]);await request;
+  assert.equal(f.calls.length,0);assert.equal(f.plugin.manualSources.size,0);
+  assert.equal(f.plugin.progress.manualSources,undefined);assert.equal(f.plugin.store.queue.some(task=>task.manual),false);
+});
+
+test("a pause pressed while Recognize now is resolving its inventory cancels the request", async()=>{
+  const f=fixture(1);await f.plugin.onload();
+  let release;const pending=new Promise(resolve=>{release=resolve;});
+  f.reader.list=async()=>pending;
+  const request=f.plugin.requestRecognitionNow({source});
+  await Promise.resolve();
+  f.plugin.pause();
+  release([{path:source,size:100,mtime:1}]);
+  await assert.rejects(request,/canceled by a pause/);
+  assert.equal(f.calls.length,0);
+  assert.equal(f.plugin.progress.manualSources,undefined);
+});
+
+test("Recognize now reuses unchanged cached pages without another provider request",async()=>{
+  const f=fixture(1);await f.plugin.onload();await f.plugin.update();
+  const before=f.calls.length;
+  await f.plugin.requestRecognitionNow({source});
+  assert.equal(f.calls.length,before);
+  assert.equal(f.plugin.store.notebooks[source].status,"current");
+});
+
 test("continuous updates drain a notebook beyond the old batch size", async () => {
   const f = fixture(7);
   f.plugin.config.continuous = true;
@@ -254,6 +428,24 @@ test("device OCR can publish provisionally with AI disabled but is not counted a
   assert.equal(f.calls.length,0);assert.equal(state.deviceOcr["native:2"].text,"device-only words");assert.deepEqual(state.pages,{});
   assert.notEqual(state.status,"current");assert.match(f.files.get("Mirror/a.md"),/device-only words/);
   assert.equal(f.plugin.progress.recognized,0);
+});
+
+test("runtime reads multiple device OCR pages in one batch",async()=>{
+  const f=fixture(3);f.plugin.aiEnabled=false;let batches=0,singles=0;
+  const open=f.reader.open;
+  f.reader.open=async(...args)=>{const notebook=await open(...args);notebook.readOcrMany=async numbers=>{batches++;return numbers.map(n=>n===2?"batched OCR two":undefined);};notebook.readOcr=async()=>{singles++;return undefined;};return notebook;};
+  await f.plugin.update();
+  assert.equal(batches,1);assert.equal(singles,0);assert.equal(f.calls.length,0);
+  assert.equal(f.plugin.store.notebooks[source].deviceOcr["native:2"].text,"batched OCR two");
+});
+
+test("OCR batch failure falls back per page and isolates one OCR read failure",async()=>{
+  const f=fixture(3);f.plugin.aiEnabled=false;let singles=[];
+  const open=f.reader.open;
+  f.reader.open=async(...args)=>{const notebook=await open(...args);notebook.readOcrMany=async()=>{throw Error("batch transport failed");};notebook.readOcr=async n=>{singles.push(n);if(n===2)throw Error("one bad OCR block");return n===1?"first fallback OCR":undefined;};return notebook;};
+  await f.plugin.update();const state=f.plugin.store.notebooks[source];
+  assert.deepEqual(singles,[1,2,3]);assert.equal(f.calls.length,0);
+  assert.equal(state.deviceOcr["native:1"].text,"first fallback OCR");assert.equal(state.deviceOcr["native:2"],undefined);
 });
 
 test("bad or missing page OCR does not block later provisional page text",async()=>{
@@ -531,7 +723,7 @@ test("cleanup can save to a validated explicit nested vault copy path",async()=>
 });
 
 test("invalid explicit cleanup copy paths are rejected before any AI request",async()=>{
-  for(const copyPath of ["/absolute.md","C:/outside.md","../escape.md","Supernote Transcripts/Shared Data/shared.md","supernote transcripts/shared data/shared.md","Mirror/a.md","Mirror/already.md"]){
+  for(const copyPath of ["/absolute.md","C:/outside.md","../escape.md","_supernote/Shared Data/shared.md","_supernote/shared data/shared.md","Mirror/a.md","Mirror/already.md"]){
     const f=await populatedCleanupFixture(1);f.files.set("Mirror/already.md","keep existing");const calls=f.calls.length;
     await assert.rejects(f.plugin.cleanupDocument(source,{saveCopy:true,copyPath}),/path|vault|exist|reserved|copy|destination|shared/i,copyPath);
     assert.equal(f.calls.length,calls,copyPath);assert.equal(f.files.get("Mirror/already.md"),"keep existing",copyPath);
@@ -545,7 +737,7 @@ test("a cleanup copy destination created during the paid request is preserved an
   const operation=f.plugin.cleanupDocument(source,{saveCopy:true,copyPath});await dispatched;
   f.files.set(copyPath,"created concurrently");release();await assert.rejects(operation,/exist|changed|destination/i);
   assert.equal(f.files.get(copyPath),"created concurrently");
-  assert.ok([...f.files.entries()].some(([path,text])=>path.startsWith("Supernote Transcripts/History/")&&path.endsWith("-cleanup-result.md")&&/paid race result/.test(text)));
+  assert.ok([...f.files.entries()].some(([path,text])=>path.startsWith("_supernote/History/")&&path.endsWith("-cleanup-result.md")&&/paid race result/.test(text)));
 });
 
 test("cleanup output remains overlaid when pages append and only changed page cleanup is invalidated",async()=>{
@@ -803,7 +995,7 @@ test("notebook catalog and existing transcript suggestions are opt-in and read-o
       { path: "Satsang/a.md" },
       { path: "Other/a.md" },
       { path: ".obsidian/a.md" },
-      { path: "Supernote Transcripts/History/a.md" },
+      { path: "_supernote/History/a.md" },
       { path: "Other/unrelated.md" },
     ];
   };
@@ -999,6 +1191,113 @@ test("one edit only calls AI once and reorder/deletion preserve correct text/his
   assert.match(f.files.get("Mirror/a.md"), /text 3/);
   assert.doesNotMatch(f.files.get("Mirror/a.md"), /text 2/);
 });
+test("automatic new checks pass incremental options while manual updates retain full checks across reorder and insertion",async()=>{
+  const f=fixture(3);f.plugin.config.continuous=true;const open=f.reader.open,seen=[];
+  f.reader.open=async(path,options)=>{seen.push(options&&structuredClone(options));return open(path);};
+  await f.plugin.update();
+  const state=f.plugin.store.notebooks[source],oldText=Object.fromEntries(Object.entries(state.pages).map(([id,p])=>[id,p.text]));
+  assert.ok(seen.length>=1);assert.ok(seen.every(options=>options===undefined));
+  f.change([
+    {id:"native:3",number:1,fingerprint:"f3"},
+    {id:"native:new",number:2,fingerprint:"f-new"},
+    {id:"native:1",number:3,fingerprint:"f1"},
+    {id:"native:2",number:4,fingerprint:"f2"},
+  ]);
+  seen.length=0;
+  const before=f.calls.length;
+  f.reader.open=async(path,options)=>{seen.push(options&&structuredClone(options));const opened=await open(path);opened.descriptor.checkMode="new";opened.descriptor.checkedPageIds=["native:new"];return opened;};
+  await f.plugin.update(true);
+  assert.ok(seen.length>=1);assert.ok(seen.every(options=>options?.mode==="new"&&options.recentPages===5));
+  assert.ok(seen.every(options=>options.previous.length===3));
+  assert.equal(f.calls.length,before+1);assert.deepEqual(requestedPages(f.calls.at(-1)),[2]);
+  for(const [id,text]of Object.entries(oldText))assert.equal(state.pages[id].text,text);
+  assert.deepEqual(state.order,["native:3","native:new","native:1","native:2"]);
+});
+
+test("recent automatic checks target only the checked recent IDs and do not advance the full-check stamp",async()=>{
+  const f=fixture(4);f.plugin.config.continuous=true;await f.plugin.update();
+  const state=f.plugin.store.notebooks[source],fullAt=state.lastFullCheck,fullRevision=state.lastFullCheckRevision;
+  const oldTexts=Object.fromEntries(Object.entries(state.pages).map(([id,p])=>[id,p.text]));
+  f.plugin.config.automaticCheck="recent";f.plugin.config.automaticCheckRecentPages=2;
+  f.change([
+    {id:"native:1",number:1,fingerprint:"f1"},{id:"native:2",number:2,fingerprint:"f2"},
+    {id:"native:3",number:3,fingerprint:"new-f3"},{id:"native:4",number:4,fingerprint:"f4"},
+  ]);
+  const open=f.reader.open;let optionsSeen;
+  f.reader.open=async(path,options)=>{optionsSeen=structuredClone(options);const opened=await open(path);opened.descriptor.checkMode="recent";opened.descriptor.checkedPageIds=["native:3","native:4"];return opened;};
+  const before=f.calls.length;await f.plugin.update(true);
+  assert.equal(optionsSeen.mode,"recent");assert.equal(optionsSeen.recentPages,2);assert.equal(optionsSeen.previous.length,4);
+  assert.equal(f.calls.length,before+1);assert.deepEqual(requestedPages(f.calls.at(-1)),[3]);
+  assert.equal(state.pages["native:1"].text,oldTexts["native:1"]);assert.equal(state.pages["native:2"].text,oldTexts["native:2"]);
+  assert.equal(state.lastFullCheck,fullAt);assert.equal(state.lastFullCheckRevision,fullRevision);
+  assert.equal(state.lastCheckMode,"recent");assert.ok(state.lastAutomaticCheck);
+});
+
+test("automatic recent-check leftovers resume after they fall outside the recent window",async()=>{
+  const f=fixture(3);f.plugin.config.continuous=true;await f.plugin.update();
+  f.plugin.config.continuous=false;f.plugin.config.batchPages=1;f.plugin.config.automaticCheck="recent";f.plugin.config.automaticCheckRecentPages=1;
+  f.plugin.store.notebooks[source].automaticPending=["native:3"];
+  f.change([
+    {id:"native:1",number:1,fingerprint:"f1"},{id:"native:2",number:2,fingerprint:"f2"},
+    {id:"native:3",number:3,fingerprint:"changed-f3"},{id:"native:4",number:4,fingerprint:"f4"},
+  ]);
+  const open=f.reader.open,optionCalls=[];
+  f.reader.open=async(path,options)=>{
+    optionCalls.push(options&&structuredClone(options));const opened=await open(path);
+    opened.descriptor.checkMode="recent";
+    opened.descriptor.checkedPageIds=[...(options?.pendingPageIds??[]),...opened.descriptor.pages.slice(-1).map(page=>page.id)];
+    return opened;
+  };
+  await f.plugin.update(true);
+  const state=f.plugin.store.notebooks[source];
+  assert.deepEqual(state.automaticPending,["native:4"]);
+  assert.deepEqual(requestedPages(f.calls.at(-1)),[3]);
+  f.change([
+    {id:"native:1",number:1,fingerprint:"f1"},{id:"native:2",number:2,fingerprint:"f2"},
+    {id:"native:3",number:3,fingerprint:"changed-f3"},{id:"native:4",number:4,fingerprint:"f4"},
+    {id:"native:5",number:5,fingerprint:"f5"},
+  ]);
+  optionCalls.length=0;const before=f.calls.length;await f.plugin.update(true);
+  assert.ok(optionCalls.every(options=>options?.pendingPageIds?.includes("native:4")));
+  assert.deepEqual(requestedPages(f.calls[before]),[4]);
+  assert.ok(state.automaticPending.includes("native:5"));
+});
+
+test("changing automatic check policy requests a new inventory even when the source revision is unchanged",async()=>{
+  const f=fixture(2);f.plugin.config.continuous=true;const open=f.reader.open,seen=[];
+  f.reader.open=async(path,options)=>{seen.push(options&&structuredClone(options));const opened=await open(path);opened.descriptor.checkMode=options?.mode??"all";opened.descriptor.checkedPageIds=opened.descriptor.pages.map(page=>page.id);return opened;};
+  await f.plugin.update(true);
+  const state=f.plugin.store.notebooks[source],revision=state.revision,previousPolicy=state.lastAutomaticPolicy;
+  assert.equal(state.lastCheckMode,"new");
+  f.plugin.config.automaticCheck="all";seen.length=0;
+  const before=f.calls.length;await f.plugin.update(true);
+  assert.ok(seen.length>0);assert.ok(seen.every(options=>options?.mode==="all"));
+  assert.equal(state.revision,revision);assert.notEqual(state.lastAutomaticPolicy,previousPolicy);
+  assert.equal(state.lastCheckMode,"all");assert.ok(state.lastFullCheck);assert.equal(f.calls.length,before);
+});
+
+test("automatic checks leave queued page re-recognition work untouched",async()=>{
+  const f=fixture(2);f.plugin.config.continuous=true;await f.plugin.update();
+  const state=f.plugin.store.notebooks[source];state.forcePending=["native:1"];
+  f.plugin.enqueue(source,true,["native:1"]);await f.plugin.persist();
+  const task=f.plugin.store.queue.find(item=>item.source===source),before=f.calls.length;
+  await f.plugin.update(true);
+  assert.equal(f.calls.length,before);assert.deepEqual(state.forcePending,["native:1"]);
+  assert.equal(task.force,true);assert.deepEqual(task.pageIds,["native:1"]);
+});
+
+test("an unavailable automatic partial check holds without AI and manual update retries a full inventory",async()=>{
+  const f=fixture(2);f.plugin.config.continuous=true;await f.plugin.update();
+  f.change([{id:"native:1",number:1,fingerprint:"changed"},{id:"native:2",number:2,fingerprint:"f2"}]);
+  const open=f.reader.open,seen=[];
+  f.reader.open=async(path,options)=>{seen.push(options);if(options){const error=Error("Full check required.");error.name="AutomaticCheckUnavailableError";throw error;}return open(path);};
+  const before=f.calls.length;await f.plugin.update(true);
+  assert.equal(f.calls.length,before);assert.equal(f.plugin.store.notebooks[source].executionIssue?.code,"automatic_check_requires_manual");
+  await f.plugin.update(false);
+  assert.equal(f.calls.length,before+1);assert.equal(seen.some(options=>options===undefined),true);
+  assert.equal(f.plugin.store.notebooks[source].executionIssue,undefined);
+  assert.notEqual(f.plugin.store.notebooks[source].lastFullCheckRevision,undefined);
+});
 test("metadata-only changes do not pay again or change the last saved time", async () => {
   const f = fixture(2);
   await f.plugin.update();
@@ -1065,8 +1364,10 @@ test("user edits block publishing and profile changes do not charge unchanged pa
   f.files.set("Mirror/a.md", f.files.get("Mirror/a.md") + "\nMy annotation");
   f.change([{ id: "native:1", number: 1, fingerprint: "edit" }]);
   await f.plugin.update();
-  assert.equal(f.plugin.store.notebooks[source].status, "conflict");
+  assert.equal(f.plugin.store.notebooks[source].status, "partial");
+  assert.equal(f.calls.length, 2);
   assert.match(f.files.get("Mirror/a.md"), /My annotation/);
+  assert.equal(f.plugin.getReconciliationConflicts(source).length, 1);
 });
 test("incomplete inventory never archives source; completed absence safely archives owned Markdown", async () => {
   const f = fixture(3);
@@ -1081,7 +1382,7 @@ test("incomplete inventory never archives source; completed absence safely archi
   assert.equal(f.plugin.store.queue.length, 0);
   const state = f.plugin.store.notebooks[source];
   assert.equal(state.status, "missing");
-  assert.ok(state.output.startsWith("Supernote Transcripts/Archive/"));
+  assert.ok(state.output.startsWith("_supernote/Archive/"));
   assert.ok(f.files.has(state.output));
   assert.equal(f.files.has("Mirror/a.md"), false);
 });
@@ -1171,7 +1472,7 @@ test("prototype migration without user vocabulary creates no glossary", async ()
 
 test("migrating a glossary preserves an existing unrelated reference file", async () => {
   const f = fixture(1),
-    path = "Supernote Transcripts/Glossaries/Imported glossary.txt";
+    path = "_supernote/Glossaries/Imported glossary.txt";
   f.files.set(path, "Existing user glossary");
   f.app.data = { config: { glossary: "Imported user vocabulary" }, cache: {} };
   const migrated = new Runtime(f.app);
@@ -1210,7 +1511,7 @@ test("confirmed deletion archives owned output and returning notebook restores w
   f.missing();
   await f.plugin.update();
   const archived = f.plugin.store.notebooks[source].output;
-  assert.ok(archived.startsWith("Supernote Transcripts/Archive/"));
+  assert.ok(archived.startsWith("_supernote/Archive/"));
   assert.equal(f.files.get(archived), text);
   assert.equal(f.files.has("Mirror/a.md"), false);
   f.restore();
@@ -1285,19 +1586,19 @@ test("pausing during forced request checkpoints its result and resumes remaining
   assert.equal(f.plugin.store.notebooks[source].pages["native:1"].text, paid);
   assert.equal(f.plugin.store.notebooks[source].status, "current");
 });
-test("modified owned output conflicts before any further paid request", async () => {
+test("modified owned output captures and retains the edit when the new handwriting conflicts", async () => {
   const f = fixture(1);
   await f.plugin.update();
   const modified = f.files.get("Mirror/a.md") + "\nPersonal correction";
   f.files.set("Mirror/a.md", modified);
   f.change([{ id: "native:1", number: 1, fingerprint: "changed" }]);
   await f.plugin.update();
-  assert.equal(f.calls.length, 1);
-  assert.equal(f.plugin.store.notebooks[source].status, "conflict");
-  assert.equal(f.files.get("Mirror/a.md"), modified);
-  await assert.rejects(f.plugin.manual(source, "1", true), /manually edited/);
-  assert.equal(f.calls.length, 1);
-  assert.equal(f.files.get("Mirror/a.md"), modified);
+  assert.equal(f.calls.length, 2);
+  assert.equal(f.plugin.store.notebooks[source].status, "partial");
+  assert.match(f.files.get("Mirror/a.md"), /Personal correction/);
+  assert.equal(f.plugin.getReconciliationConflicts(source).length, 1);
+  assert.equal(f.calls.length, 2);
+  assert.match(f.files.get("Mirror/a.md"), /Personal correction/);
 });
 test("profile edits during recognition cannot mutate in-flight notebook recipe or subsequent page request", async () => {
   const f = fixture(2);
@@ -1550,7 +1851,7 @@ async function storageMaintenanceFixture(){
   const previousPath=f.plugin.store.history.find(path=>path.endsWith("Previous version.md"));
   const undoPoint=parseRestoreJSON(f.files.get(previousPath));
   const previousText=undoPoint.text;
-  const cachePaths=[...f.files.keys()].filter(path=>path.startsWith(`Supernote Transcripts/Shared Data/${notebookId}/results/`)&&path.endsWith(".md"));
+  const cachePaths=[...f.files.keys()].filter(path=>path.startsWith(`_supernote/Shared Data/${notebookId}/results/`)&&path.endsWith(".md"));
   const decodeCache=path=>JSON.parse(f.files.get(path).split("```json\n")[1].split("\n```")[0]);
   const currentCache=cachePaths.find(path=>decodeCache(path).text===currentPage.text);
   const undoPage=undoPoint.snapshot.pages[firstPage.id],undoCache=cachePaths.find(path=>decodeCache(path).text===undoPage.text);
@@ -1678,7 +1979,9 @@ async function editedTranscriptFixture(count=1, shared=false, changePages) {
   const f=fixture(count);if(shared)sharing(f,"recovery-device");
   await f.plugin.saveConfig();await f.plugin.update();
   const state=f.plugin.store.notebooks[source], original=f.files.get(state.output);
-  const edited=original+"\nMy exact manual correction.\n";
+  // Body-only edits are now preserved automatically. Keep this legacy helper for
+  // explicit recovery/Force ownership gates by adding an unsafe preamble change.
+  const edited=original.replace("nomad_transcripts: true\n", "nomad_transcripts: true\nmanual_user_edit: preserve\n")+"\nMy exact manual correction.\n";
   f.files.set(state.output,edited);
   f.change(changePages??structuredClone(state.desired));
   await f.plugin.update();
@@ -1699,7 +2002,7 @@ test("replace recovery backs up exact edits, reuses cache, leaves switches alone
   const preview=await f.plugin.previewTranscriptRecovery(source);
   assert.equal(preview.current,f.edited);assert.match(preview.generated,/Previous transcription; this page has changed/);
   const result=await f.plugin.resolveTranscriptConflict(source,"replace",preview.current);
-  assert.match(result.backup,/^Supernote Transcripts\/History\/a--[a-f0-9]{12}\/Previous version\.md$/);
+  assert.match(result.backup,/^_supernote\/History\/a--[a-f0-9]{12}\/Previous version\.md$/);
   assert.equal(parseRestoreJSON(f.files.get(result.backup)).text,f.edited);assert.ok(f.plugin.store.history.includes(result.backup));
   assert.equal(f.files.get(result.output),preview.generated);assert.equal(f.calls.length,paid);
   assert.equal(JSON.stringify(f.plugin.store.notebooks[source].pages),cache);assert.equal(JSON.stringify(f.plugin.costs),ledger);
@@ -1743,7 +2046,7 @@ test("recovery refuses text changed since preview and an edit racing compare-bef
 test("failed backup leaves the original, ownership and cached results untouched",async()=>{
   const f=await editedTranscriptFixture(),preview=await f.plugin.previewTranscriptRecovery(source);
   const state=JSON.stringify(f.plugin.store.notebooks[source]),write=f.app.vault.adapter.write;
-  f.app.vault.adapter.write=async(path,text)=>{if(path.startsWith("Supernote Transcripts/History/"))throw Error("Backup disk unavailable");return write(path,text);};
+  f.app.vault.adapter.write=async(path,text)=>{if(path.startsWith("_supernote/History/"))throw Error("Backup disk unavailable");return write(path,text);};
   await assert.rejects(f.plugin.resolveTranscriptConflict(source,"replace",preview.current),/Backup disk unavailable/);
   assert.equal(f.files.get(preview.output),preview.current);assert.equal(JSON.stringify(f.plugin.store.notebooks[source]),state);
   assert.equal(f.plugin.store.history.length,0);assert.equal(f.calls.length,1);
@@ -1867,6 +2170,18 @@ test("hash lookup retains receipt validation and damaged recovery evidence fails
   assert.equal(f.files.get("Mirror/a.md"),f.edited);assert.equal(f.calls.length,1);
 });
 
+test("explicit notebook update retries a sync-record hold without bypassing validation or repeating AI",async()=>{
+  const f=fixture(1);sharing(f,"explicit-receipt-retry");await f.plugin.update();
+  const state=f.plugin.store.notebooks[source],original=f.files.get(state.output),before=f.calls.length;
+  const record=[...f.files.keys()].find(path=>path.includes("/publications/")&&path.endsWith(".md")),valid=f.files.get(record);
+  f.files.set(record,"Incomplete sync record");state.status="conflict";state.error="Shared publication receipt is damaged. Recovery stopped.";
+  await f.plugin.requestRecognitionNow({source});
+  assert.match(state.error,/receipt is damaged/);assert.equal(f.calls.length,before);assert.equal(f.files.get(state.output),original);
+  assert.equal(f.files.get(record),"Incomplete sync record");
+  f.files.set(record,valid);await f.plugin.requestRecognitionNow({source});
+  assert.equal(state.status,"current");assert.equal(f.calls.length,before);assert.equal(f.files.get(state.output),original);
+});
+
 test("Force update backs up conflicting local text and cache, publishes cached local pages while globally paused",async()=>{
   const f=await editedTranscriptFixture(2,true),state=f.plugin.store.notebooks[source],id=await notebookIdentity("linked-reflections","a.note");
   const conflicting=state.desired.map(page=>({...page,fingerprint:`remote-${page.fingerprint}`}));
@@ -1896,13 +2211,15 @@ test("Force re-recognition bypasses an active shared claim without acquiring or 
 
 test("Force update backup creation failure leaves output and recognition untouched",async()=>{
   const f=await editedTranscriptFixture(),state=f.plugin.store.notebooks[source],calls=f.calls.length,write=f.app.vault.adapter.write;
-  f.app.vault.adapter.write=async(path,text)=>{if(path.startsWith("Supernote Transcripts/History/"))throw Error("Backup disk unavailable");return write(path,text);};
+  f.app.vault.adapter.write=async(path,text)=>{if(path.startsWith("_supernote/History/"))throw Error("Backup disk unavailable");return write(path,text);};
   await assert.rejects(f.plugin.forceUpdate(source,{reRecognizeAll:true}),/Backup disk unavailable/);
   assert.equal(f.files.get(state.output),f.edited);assert.equal(f.calls.length,calls);assert.equal(f.plugin.store.history.length,0);
 });
 
 test("Force update preserves a transcript edit that races the backed-up output",async()=>{
-  const f=await editedTranscriptFixture(),state=f.plugin.store.notebooks[source],initial=f.edited,raced=f.edited+"\nRacing user correction.\n";
+  const f=await editedTranscriptFixture(),state=f.plugin.store.notebooks[source];
+  const initial=f.original+"\nMy exact manual correction.\n",raced=initial+"\nRacing user correction.\n";
+  f.files.set(state.output,initial);
   globalThis.__response=async request=>{const body=JSON.parse(request.body);f.calls.push(body);f.files.set(state.output,raced);return answer("forced transcription",body);};
   await assert.rejects(f.plugin.forceUpdate(source,{reRecognizeAll:true}),/Transcript changed during Force update/);
   const backup=f.plugin.store.history.find(path=>path.endsWith("Previous version.md"));
@@ -1936,22 +2253,24 @@ test("Force re-recognition includes cached pages and clears every existing page 
 
 test("zero run budget stops Force before provider dispatch and preserves manual edits and ownership",async()=>{
   const f=await editedTranscriptFixture(),state=f.plugin.store.notebooks[source],publishedHash=state.publishedHash,calls=f.calls.length;
+  const userEdit=f.original+"\nMy exact manual correction.\n";f.files.set(state.output,userEdit);
   f.plugin.saveCostSettings({...f.plugin.costs.settings,runUsd:0});
   await assert.rejects(f.plugin.forceUpdate(source,{reRecognizeAll:true}),/limit|spending|budget/i);
-  assert.equal(f.calls.length,calls);assert.equal(f.files.get(state.output),f.edited);assert.equal(state.publishedHash,publishedHash);
+  assert.equal(f.calls.length,calls);assert.equal(f.files.get(state.output),userEdit);assert.equal(state.publishedHash,publishedHash);
   state.status="queued";f.plugin.enqueue(source);
   await f.plugin.update();
-  assert.equal(state.status,"conflict");assert.match(state.error,/manually edited/);assert.equal(f.files.get(state.output),f.edited);assert.equal(state.publishedHash,publishedHash);
+  assert.equal(state.status,"queued");assert.match(f.files.get(state.output),/My exact manual correction/);assert.equal(state.publishedHash,await sharedHash(f.files.get(state.output)));
 });
 
 test("missing API key before Force dispatch preserves edited Markdown and published ownership",async()=>{
   const f=await editedTranscriptFixture(),state=f.plugin.store.notebooks[source],publishedHash=state.publishedHash,calls=f.calls.length;
+  const userEdit=f.original+"\nMy exact manual correction.\n";f.files.set(state.output,userEdit);
   f.plugin.apiKey="";
   await assert.rejects(f.plugin.forceUpdate(source,{reRecognizeAll:true}),/API key/);
-  assert.equal(f.calls.length,calls);assert.equal(f.files.get(state.output),f.edited);assert.equal(state.publishedHash,publishedHash);
+  assert.equal(f.calls.length,calls);assert.equal(f.files.get(state.output),userEdit);assert.equal(state.publishedHash,publishedHash);
   f.plugin.apiKey="fake-not-a-secret";state.status="queued";f.plugin.enqueue(source);
   await f.plugin.update();
-  assert.equal(state.status,"conflict");assert.match(state.error,/manually edited/);assert.equal(f.files.get(state.output),f.edited);assert.equal(state.publishedHash,publishedHash);
+  assert.equal(state.status,"partial");assert.match(f.files.get(state.output),/My exact manual correction/);assert.equal(state.publishedHash,await sharedHash(f.files.get(state.output)));
 });
 
 test("Force setup failure clears its temporary authority before another action can run",async()=>{
@@ -1978,9 +2297,12 @@ test("legacy manual-edit conflict with appended pages recovers from its owned pr
 });
 
 test("legacy recovery cannot invent a baseline for changed earlier pages or a larger remote inventory",async()=>{
-  const f=await editedTranscriptFixture(1,true,[{id:"native:1",number:1,fingerprint:"changed-local"}]);
+  const f=await editedTranscriptFixture(2,true,[{id:"native:2",number:2,fingerprint:"f2"}]);
   delete f.plugin.store.notebooks[source].publishedPages;
-  await assert.rejects(f.plugin.previewTranscriptRecovery(source),/cannot validate the older snapshot.*check sources/);
+  // A removed source page still present in the manually edited document cannot
+  // be assigned to the new local page inventory during recovery.
+  f.files.set("Mirror/a.md",`${f.edited}\n<!-- supernote-page:orphan number:99 -->`);
+  await assert.rejects(f.plugin.previewTranscriptRecovery(source),/pages missing from this local \.note source/);
   const old=await editedTranscriptFixture(1,true),id=await notebookIdentity("linked-reflections","a.note");
   delete old.plugin.store.notebooks[source].publishedPages;
   await new PublicationReceipts(old.plugin.sharedIO()).save(id,old.original,[
@@ -2942,4 +3264,462 @@ test("original page preview permits an appended page when the saved inventory is
   const calls=[];f.reader.preview=async(_path,page)=>{calls.push(page);return `image:${page}`;};
   assert.equal(await f.plugin.preview(source,3),"image:3");
   assert.deepEqual(calls,[3]);
+});
+
+test("appending handwriting recognizes only the new page and carries Obsidian edits forward",async()=>{
+  const f=fixture(1);f.plugin.config.continuous=true;await f.plugin.update();
+  const state=f.plugin.store.notebooks[source],path=state.output;
+  const edited=f.files.get(path).replace("text 1","Corrected ==important== ~~crossed~~ [source](https://example.test)");
+  f.files.set(path,edited);
+  f.change([...state.desired,{id:"native:2",number:2,fingerprint:"f2"}]);
+  const before=f.calls.length;await f.plugin.update();
+  assert.deepEqual(f.calls.slice(before).flatMap(request=>requestedPages(request)),[2]);
+  const output=f.files.get(path);
+  assert.match(output,/Corrected ==important== ~~crossed~~ \[source\]\(https:\/\/example\.test\)/);
+  assert.match(output,/text 2/);
+});
+
+test("changed handwriting sends baseline and Obsidian edit, then applies a validated reconciliation without another request",async()=>{
+  const f=fixture(1);f.plugin.config.continuous=true;await f.plugin.update();
+  const state=f.plugin.store.notebooks[source],path=state.output;
+  const edited=f.files.get(path).replace("text 1","Corrected ==same span== [reference](https://example.test)");
+  f.files.set(path,edited);
+  f.change(state.desired.map(page=>({...page,fingerprint:"f1-revised"})));
+  const before=f.calls.length;
+  globalThis.__response=async request=>{const body=JSON.parse(request.body);f.calls.push(body);return answer(JSON.stringify({pages:[{number:1,text:"New handwriting wording",joinPrevious:false,reconciliation:{status:"merged",text:"New handwriting wording with ==same span== [reference](https://example.test)"}}]}),body);};
+  await f.plugin.update();
+  assert.equal(f.calls.length,before+1);
+  const sent=JSON.stringify(f.calls.at(-1));
+  assert.match(sent,/Corrected ==same span==/);assert.match(sent,/text 1/);
+  assert.match(f.files.get(path),/New handwriting wording with ==same span== \[reference\]\(https:\/\/example\.test\)/);
+  assert.doesNotMatch(f.files.get(path),/Corrected/);
+});
+
+test("unresolved page conflicts retain current text while other changed pages continue",async()=>{
+  const f=fixture(2);f.plugin.config.continuous=true;await f.plugin.update();
+  const state=f.plugin.store.notebooks[source],path=state.output;
+  const edited=f.files.get(path).replace("text 1","User correction ==keep==");f.files.set(path,edited);
+  f.change(state.desired.map((page,i)=>({...page,fingerprint:`changed-${i}`})));
+  globalThis.__response=async request=>{const body=JSON.parse(request.body);f.calls.push(body);const numbers=requestedPages(body);return answer(JSON.stringify({pages:numbers.map(number=>({number,text:`fresh ${number}`,joinPrevious:false,...(number===1?{reconciliation:{status:"conflict",reason:"The page wording is ambiguous."}}:{})}))}),body);};
+  await f.plugin.update();
+  const conflicts=f.plugin.getReconciliationConflicts(source);
+  assert.equal(conflicts.length,1);assert.equal(conflicts[0].number,1);assert.match(conflicts[0].editedText,/User correction ==keep==/);
+  assert.match(f.files.get(path),/User correction ==keep==/);assert.match(f.files.get(path),/fresh 2/);
+  assert.equal(f.plugin.store.notebooks[source].pages[state.desired[1].id].text,"fresh 2");
+});
+
+test("conflict resolution checks expected revision and edited text, and survives restart",async()=>{
+  const f=fixture(1);f.plugin.config.continuous=true;await f.plugin.update();
+  const state=f.plugin.store.notebooks[source],path=state.output;
+  f.files.set(path,f.files.get(path).replace("text 1","User version ==keep=="));
+  f.change(state.desired.map(page=>({...page,fingerprint:"new-fingerprint"})));
+  globalThis.__response=async request=>{const body=JSON.parse(request.body);f.calls.push(body);return answer(JSON.stringify({pages:[{number:1,text:"new reading",joinPrevious:false,reconciliation:{status:"conflict",reason:"uncertain"}}]}),body);};
+  await f.plugin.update();
+  const conflict=f.plugin.getReconciliationConflicts(source)[0];
+  await assert.rejects(f.plugin.resolveReconciliationConflict(source,conflict.pageId,"keep-edits","stale-fingerprint",conflict.editedText),/changed|stale|conflict/i);
+  const restarted=new Runtime(f.app);restarted.reader=()=>f.reader;await restarted.onload();
+  assert.equal(restarted.getReconciliationConflicts(source).length,1);
+  f.change(state.desired.map(page=>({...page,fingerprint:"changed-again-before-choice"})));
+  await assert.rejects(f.plugin.resolveReconciliationConflict(source,conflict.pageId,"keep-edits",conflict.fingerprint,conflict.editedText),/changed|stale|conflict/i);
+  assert.match(f.files.get(path),/User version ==keep==/);
+});
+
+test("explicit keep-edits resolution clears a conflict only for the matching edit",async()=>{
+  const f=fixture(1);f.plugin.config.continuous=true;await f.plugin.update();
+  const state=f.plugin.store.notebooks[source],path=state.output;
+  f.files.set(path,f.files.get(path).replace("text 1","Accepted ==user text=="));
+  f.change(state.desired.map(page=>({...page,fingerprint:"explicit-resolution"})));
+  globalThis.__response=async request=>{const body=JSON.parse(request.body);f.calls.push(body);return answer(JSON.stringify({pages:[{number:1,text:"fresh but conflict",joinPrevious:false,reconciliation:{status:"conflict",reason:"Review needed."}}]}),body);};
+  await f.plugin.update();
+  const conflict=f.plugin.getReconciliationConflicts(source)[0];
+  await assert.rejects(f.plugin.resolveReconciliationConflict(source,conflict.pageId,"invalid",conflict.fingerprint,conflict.editedText),/version|choice|resolution|invalid/i);
+  await f.plugin.resolveReconciliationConflict(source,conflict.pageId,"keep-edits",conflict.fingerprint,conflict.editedText);
+  assert.equal(f.plugin.getReconciliationConflicts(source).length,0);
+  assert.match(f.files.get(path),/Accepted ==user text==/);
+});
+
+test("missing reconciliation and a proposal that changes highlighted words both become conflicts",async()=>{
+  for(const mode of ["missing","changed-highlight"]){
+    const f=fixture(1);f.plugin.config.continuous=true;await f.plugin.update();
+    const state=f.plugin.store.notebooks[source],path=state.output;
+    const edited=f.files.get(path).replace("text 1","My ==protected wording== correction");f.files.set(path,edited);
+    f.change(state.desired.map(page=>({...page,fingerprint:`${mode}-fingerprint`})));
+    globalThis.__response=async request=>{const body=JSON.parse(request.body);f.calls.push(body);const page={number:1,text:"fresh handwriting",joinPrevious:false};
+      if(mode==="changed-highlight")page.reconciliation={status:"merged",text:"fresh handwriting with ==altered wording=="};
+      return answer(JSON.stringify({pages:[page]}),body);};
+    await f.plugin.update();
+    assert.equal(f.plugin.getReconciliationConflicts(source).length,1,mode);
+    assert.match(f.files.get(path),/My ==protected wording== correction/,mode);
+    assert.match(f.plugin.getReconciliationConflicts(source)[0].reason,/reconcil|highlight|format|changed|Obsidian/i,mode);
+  }
+});
+
+test("an explicit model conflict is preserved even when local text edits appear disjoint",async()=>{
+  const f=fixture(1);f.plugin.config.continuous=true;await f.plugin.update();
+  const state=f.plugin.store.notebooks[source],path=state.output;
+  f.files.set(path,f.files.get(path).replace("text 1","User wording\ntext 1"));
+  f.change(state.desired.map(page=>({...page,fingerprint:"explicit-model-conflict"})));
+  globalThis.__response=async request=>{const body=JSON.parse(request.body);f.calls.push(body);return answer(JSON.stringify({pages:[{number:1,text:"text 1\nnew handwriting line",joinPrevious:false,reconciliation:{status:"conflict",reason:"The handwritten change may alter the meaning."}}]}),body);};
+  await f.plugin.update();
+  const [conflict]=f.plugin.getReconciliationConflicts(source);
+  assert.ok(conflict);
+  assert.match(conflict.reason,/meaning|handwritten/i);
+  assert.match(f.files.get(path),/User wording\ntext 1/);
+  assert.doesNotMatch(f.files.get(path),/new handwriting line/);
+});
+
+test("deleting a page with an Obsidian edit blocks update and preserves the edited document",async()=>{
+  const f=fixture(2);f.plugin.config.continuous=true;await f.plugin.update();
+  const state=f.plugin.store.notebooks[source],path=state.output;
+  const edited=f.files.get(path).replace("text 1","Retain this edited page");f.files.set(path,edited);
+  f.change([state.desired[1]]);
+  await f.plugin.update();
+  assert.equal(f.files.get(path),edited);
+  assert.match(f.plugin.progress.stage,/conflict|review|preserv|error|attention/i);
+});
+
+test("an Obsidian edit made during recognition is not overwritten and the paid page result stays cached",async()=>{
+  const f=fixture(1);f.plugin.config.continuous=true;await f.plugin.update();
+  const state=f.plugin.store.notebooks[source],path=state.output;
+  f.change(state.desired.map(page=>({...page,fingerprint:"mid-flight-change"})));
+  let entered,release;const dispatched=new Promise(resolve=>{entered=resolve;}),gate=new Promise(resolve=>{release=resolve;});
+  globalThis.__response=async request=>{const body=JSON.parse(request.body);f.calls.push(body);entered();await gate;return answer(JSON.stringify({pages:[{number:1,text:"cached revised recognition",joinPrevious:false,reconciliation:{status:"merged",text:"cached revised recognition"}}]}),body);};
+  const operation=f.plugin.update();await dispatched;
+  const concurrent=f.files.get(path).replace("text 1","Concurrent ==user edit==");f.files.set(path,concurrent);
+  release();await operation;
+  assert.match(f.files.get(path),/Concurrent ==user edit==/);
+  assert.equal(f.plugin.store.notebooks[source].pages[state.desired[0].id].text,"cached revised recognition");
+});
+
+test("adopting a shared receipt without presentation clears stale local edit overlays before republishing",async()=>{
+  const f=fixture(1);sharing(f,"presentation-omission");f.plugin.config.continuous=true;await f.plugin.update();
+  const state=f.plugin.store.notebooks[source],path=state.output,id=await notebookIdentity("linked-reflections","a.note");
+  const before=structuredClone(state),pages=structuredClone(state.pages),desired=structuredClone(state.desired);
+  state.editedPages={"native:1":{fingerprint:"f1",baseText:"text 1",text:"text 1\nUser overlay"}};
+  state.editConflicts={"native:1":{fingerprint:"f1",number:1,baseText:"text 1",editedText:"User overlay",recognizedText:"remote text",reason:"Review needed."}};
+  await f.plugin.publish(state,before,id);
+  const remote=f.files.get(path).replace("User overlay","Remote receipt text");
+  const receipts=new PublicationReceipts(f.plugin.sharedIO());
+  await receipts.save(id,remote,desired,pages);
+  assert.equal((await receipts.find(id,remote)).presentation,undefined);
+  f.files.set(path,remote);
+  await f.plugin.checkOutput(state,before,id,true);
+  assert.equal(state.editedPages,undefined);
+  assert.equal(state.editConflicts,undefined);
+  await f.plugin.publish(state,before,id);
+  assert.equal(f.plugin.store.notebooks[source].editedPages,undefined,JSON.stringify({published:f.plugin.store.notebooks[source].publishedHash,actual:f.files.get(path),status:f.plugin.store.notebooks[source].status,error:f.plugin.store.notebooks[source].error}));
+  assert.equal(f.plugin.store.notebooks[source].editConflicts,undefined);
+  assert.doesNotMatch(f.files.get(path),/User overlay/);
+});
+
+test("a shared page result arriving during render reconciles the existing local edit without recognition",async()=>{
+  const f=fixture(1);sharing(f,"late-edited-page-result");f.plugin.config.continuous=true;await f.plugin.update();
+  const state=f.plugin.store.notebooks[source],path=state.output,page=state.desired[0],id=await notebookIdentity("linked-reflections","a.note");
+  f.files.set(path,f.files.get(path).replace("text 1","User wording\ntext 1"));
+  f.change([{...page,fingerprint:"new-shared-fingerprint"}]);
+  const originalOpen=f.reader.open;
+  let arrived=false;
+  f.reader.open=async(...args)=>{
+    const opened=await originalOpen(...args),render=opened.render;
+    opened.render=async number=>{
+      const image=await render(number);
+      if(!arrived){arrived=true;const profile=await f.plugin.profile("general");await f.plugin.sharedCache.saveResult({notebookId:id,pageId:page.id,fingerprint:"new-shared-fingerprint",recipe:profile.recipe},"text 1\nFresh handwriting line");}
+      return image;
+    };
+    return opened;
+  };
+  const before=f.calls.length;await f.plugin.update();
+  assert.equal(arrived,true);assert.equal(f.calls.length,before);
+  const updated=f.plugin.store.notebooks[source];
+  assert.equal(updated.editedPages[page.id].fingerprint,"f1");
+  assert.equal(f.plugin.getReconciliationConflicts(source).length,1);
+  assert.match(f.files.get(path),/User wording\ntext 1/);
+  assert.equal(f.plugin.getReconciliationConflicts(source)[0].recognizedText,"text 1\nFresh handwriting line");
+});
+
+test("an old shared edit presentation arriving during publish becomes a current page conflict",async()=>{
+  const f=fixture(1);sharing(f,"old-edit-presentation-arrival");f.plugin.config.continuous=true;await f.plugin.update();
+  const state=f.plugin.store.notebooks[source],path=state.output,page=state.desired[0],id=await notebookIdentity("linked-reflections","a.note");
+  const oldFingerprint=page.fingerprint,oldText=f.files.get(path).replace("text 1","User correction");
+  f.files.set(path,oldText);f.change([{...page,fingerprint:"published-during-recognition"}]);
+  globalThis.__response=async request=>{
+    const body=JSON.parse(request.body);f.calls.push(body);
+    const current=f.plugin.store.notebooks[source],desired=current.desired[0],recipe=current.pages[page.id].recipe;
+    const recognition={fingerprint:desired.fingerprint,text:"Different handwritten wording",recipe,number:1};
+    const presentation={cleanedPages:{},editedPages:{[page.id]:{fingerprint:oldFingerprint,baseText:"text 1",text:"User correction"}}};
+    await new PublicationReceipts(f.plugin.sharedIO()).save(id,oldText,current.desired,{[page.id]:recognition},presentation);
+    f.files.set(path,oldText);
+    return answer(JSON.stringify({pages:[{number:1,text:recognition.text,joinPrevious:false}]}),body);
+  };
+  await f.plugin.update();
+  const conflicts=f.plugin.getReconciliationConflicts(source);
+  assert.equal(conflicts.length,1);
+  assert.equal(conflicts[0].fingerprint,"published-during-recognition");
+  assert.equal(conflicts[0].recognizedText,"Different handwritten wording");
+  assert.match(f.files.get(path),/User correction/);
+  assert.equal(f.plugin.store.notebooks[source].status,"partial");
+});
+
+test("an automatic update refreshes a synced presentation receipt without source changes or AI calls",async()=>{
+  const f=fixture(1);sharing(f,"automatic-presentation-refresh");f.plugin.config.continuous=true;f.plugin.config.automaticCheck="new";
+  await f.plugin.update(true);
+  const state=f.plugin.store.notebooks[source],path=state.output,page=state.desired[0],id=await notebookIdentity("linked-reflections","a.note");
+  const original=f.files.get(path),revision=state.revision,policy=state.lastAutomaticPolicy,calls=f.calls.length;
+  const edited="text 1\nSynced ==manual correction==";
+  const remote=original.replace("text 1",edited);
+  const presentation={cleanedPages:{},editedPages:{[page.id]:{fingerprint:page.fingerprint,baseText:"text 1",text:edited}}};
+  await new PublicationReceipts(f.plugin.sharedIO()).save(id,remote,state.desired,state.pages,presentation);
+  f.files.set(path,remote);
+  const open=f.reader.open,seen=[];
+  f.reader.open=async(note,options)=>{seen.push(options&&structuredClone(options));return open(note);};
+  await f.plugin.update(true);
+  const updated=f.plugin.store.notebooks[source];
+  assert.equal(updated.revision,revision);assert.equal(updated.lastAutomaticPolicy,policy);
+  assert.ok(seen.length>0);assert.ok(seen.every(options=>options?.mode==="new"));
+  assert.equal(f.calls.length,calls);
+  assert.equal(updated.editedPages[page.id].text,edited);
+  assert.match(f.files.get(path),/Synced ==manual correction==/);
+  assert.equal(updated.publishedHash,await sharedHash(f.files.get(path)));
+});
+
+test("automatic shared-result adoption leaves explicit force intent queued",async()=>{
+  const f=fixture(1);sharing(f,"automatic-cache-force-intent");f.plugin.config.continuous=true;f.plugin.config.automaticCheck="all";
+  await f.plugin.update();
+  const state=f.plugin.store.notebooks[source],page=state.desired[0],profile=await f.plugin.profile("general"),id=await notebookIdentity("linked-reflections","a.note");
+  const currentFingerprint="new-current-fingerprint";
+  await f.plugin.sharedCache.saveResult({notebookId:id,pageId:page.id,fingerprint:currentFingerprint,recipe:profile.recipe},"fresh shared text");
+  f.change([{...page,fingerprint:currentFingerprint}]);
+  state.forcePending=[page.id];
+  f.plugin.enqueue(source,true,[page.id]);await f.plugin.persist();
+  const task=f.plugin.store.queue.find(item=>item.source===source),before=f.calls.length;
+  await f.plugin.update(true);
+  assert.equal(f.calls.length,before);
+  assert.equal(state.pages[page.id].fingerprint,currentFingerprint);assert.equal(state.pages[page.id].text,"fresh shared text");
+  assert.deepEqual(state.forcePending,[page.id]);
+  assert.equal(f.plugin.store.queue.find(item=>item.source===source)?.force,true);
+  assert.deepEqual(f.plugin.store.queue.find(item=>item.source===source)?.pageIds,[page.id]);
+  assert.equal(task.force,true);
+});
+
+test("automatic discovery hydrates an exact shared success for a skipped page without recognition",async()=>{
+  const f=fixture(1);f.plugin.config.continuous=true;f.plugin.config.automaticCheck="all";
+  await f.plugin.update();
+  sharing(f,"skipped-page-shared-hydration");
+  const state=f.plugin.store.notebooks[source],page=state.desired[0],rule=f.plugin.config.rules[0],id=await notebookIdentity("linked-reflections","a.note");
+  const profile=await f.plugin.profile(rule.profileId),before=f.calls.length;
+  f.files.set(state.output,f.files.get(state.output).replace("text 1","User wording\ntext 1"));
+  delete state.pages[page.id];state.pageIssues={[page.id]:{fingerprint:page.fingerprint,number:page.number,status:"skipped",kind:"provider",reason:"Skipped by you; no successful recognition is claimed.",attempts:0,updatedAt:new Date().toISOString()}};state.status="partial";
+  await f.plugin.sharedCache.saveResult({notebookId:id,pageId:page.id,fingerprint:page.fingerprint,recipe:profile.recipe},"recognized on the other device");
+  await f.plugin.update(true);
+  const hydrated=f.plugin.store.notebooks[source];
+  assert.equal(f.calls.length,before);
+  assert.equal(hydrated.pages[page.id].text,"recognized on the other device");
+  assert.equal(hydrated.pages[page.id].fingerprint,page.fingerprint);
+  assert.equal(hydrated.pages[page.id].recipe,profile.recipe);
+  assert.equal(hydrated.pageIssues?.[page.id],undefined);
+  assert.equal(hydrated.status,"partial");
+  assert.match(f.files.get(hydrated.output),/User wording/);
+});
+
+test("automatic shared hydration adopts an exact older result outside new-page recognition scope",async()=>{
+  const f=fixture(1);f.plugin.config.continuous=true;f.plugin.config.automaticCheck="new";
+  await f.plugin.update(true);
+  sharing(f,"skipped-page-shared-exclusion");
+  const state=f.plugin.store.notebooks[source],page=state.desired[0],rule=f.plugin.config.rules[0],id=await notebookIdentity("linked-reflections","a.note");
+  const profile=await f.plugin.profile(rule.profileId),before=f.calls.length;
+  delete state.pages[page.id];state.pageIssues={[page.id]:{fingerprint:page.fingerprint,number:page.number,status:"skipped",kind:"provider",reason:"Skipped by you; no successful recognition is claimed.",attempts:0,updatedAt:new Date().toISOString()}};state.status="partial";
+  await f.plugin.sharedCache.saveResult({notebookId:id,pageId:page.id,fingerprint:page.fingerprint,recipe:profile.recipe},"must remain excluded");
+  await f.plugin.update(true);
+  const retained=f.plugin.store.notebooks[source];
+  assert.equal(f.calls.length,before);
+  assert.equal(retained.pages[page.id].text,"must remain excluded");
+  assert.equal(retained.pages[page.id].recipe,profile.recipe);
+  assert.equal(retained.pageIssues?.[page.id],undefined);
+  assert.equal(retained.status,"current");
+  assert.equal(f.plugin.store.queue.some(task=>task.source===source),false);
+});
+
+test("automatic shared hydration leaves a skipped explicit re-recognition available for review",async()=>{
+  const f=fixture(1);f.plugin.config.continuous=true;f.plugin.config.automaticCheck="all";
+  await f.plugin.update(true);
+  sharing(f,"skipped-page-forced-hydration");
+  const state=f.plugin.store.notebooks[source],page=state.desired[0],rule=f.plugin.config.rules[0],id=await notebookIdentity("linked-reflections","a.note");
+  const profile=await f.plugin.profile(rule.profileId),before=f.calls.length;
+  delete state.pages[page.id];state.pageIssues={[page.id]:{fingerprint:page.fingerprint,number:page.number,status:"skipped",kind:"provider",reason:"Skipped by you; no successful recognition is claimed.",attempts:1,force:true,updatedAt:new Date().toISOString()}};state.status="partial";
+  await f.plugin.sharedCache.saveResult({notebookId:id,pageId:page.id,fingerprint:page.fingerprint,recipe:profile.recipe},"must not satisfy forced retry");
+  await f.plugin.update(true);
+  const retained=f.plugin.store.notebooks[source];
+  assert.equal(f.calls.length,before);
+  assert.equal(retained.pages[page.id],undefined);
+  assert.equal(retained.pageIssues[page.id].force,true);
+});
+
+
+test("support-folder migration moves files and references without recognition or losing cached edits", async () => {
+  const f=fixture(1);await f.plugin.update();
+  const state=f.plugin.store.notebooks[source], oldText=f.files.get(state.output);
+  state.editedPages={"native:1":{fingerprint:"f1",baseText:"text 1",text:"A retained correction."}};
+  const cacheBefore=JSON.stringify({pages:state.pages,editedPages:state.editedPages,desired:state.desired,publishedHash:state.publishedHash});
+  state.output="Supernote Transcripts/Transcripts/a.md";
+  f.files.set(state.output,oldText);f.files.delete("Mirror/a.md");
+  f.plugin.config.rules[0].output="Supernote Transcripts/Transcripts";
+  f.plugin.config.profiles[0].glossaries=["Supernote Transcripts/Glossaries/Terms.md"];
+  f.files.set("Supernote Transcripts/Glossaries/Terms.md","glossary");
+  const a=f.app.vault.adapter;
+  a.exists=async p=>f.files.has(p)||[...f.files.keys()].some(k=>k.startsWith(p+"/"));
+  a.list=async p=>{
+    const base=p+"/", descendants=[...f.files.keys()].filter(k=>k.startsWith(base));
+    return {files:descendants.filter(k=>!k.slice(base.length).includes("/")&&f.files.get(k)!=="folder"),
+      folders:[...new Set(descendants.filter(k=>k.slice(base.length).includes("/")).map(k=>base+k.slice(base.length).split("/")[0]))]};
+  };
+  a.rename=async(from,to)=>{for(const [k,v] of [...f.files])if(k===from||k.startsWith(from+"/")){f.files.set(to+k.slice(from.length),v);f.files.delete(k);}};
+  a.rmdir=async p=>{f.files.delete(p);};
+  const requestCount=f.calls.length;
+  await f.plugin.reorganizeStorage();
+  const migrated=f.plugin.store.notebooks[source];
+  assert.equal(migrated.output,"Supernote Transcripts/a.md");
+  assert.equal(f.files.get(migrated.output),oldText);
+  assert.equal(f.files.get("_supernote/Glossaries/Terms.md"),"glossary");
+  assert.equal(JSON.stringify({pages:migrated.pages,editedPages:migrated.editedPages,desired:migrated.desired,publishedHash:migrated.publishedHash}),cacheBefore);
+  assert.equal(f.calls.length,requestCount);
+  await f.plugin.reorganizeStorage();assert.equal(f.calls.length,requestCount);
+});
+
+test("folder consolidation retains paid notebook identities and cached pages without recognition", async () => {
+  const f=fixture(1);await f.plugin.update();
+  const before=JSON.stringify(f.plugin.store.notebooks[source].pages), oldIdentity=await notebookIdentity("r","a.note"), requests=f.calls.length;
+  f.plugin.initializing=false;
+  const result=await f.plugin.consolidateSourceFolder({source:"/storage/emulated/0/Note/Reflections",ruleId:"r",sharedId:"new-folder",profileId:"general",output:"Mirror",notebooks:[source,"/storage/emulated/0/Note/Reflections/old.note"],allowed:[source]});
+  assert.equal(result.retainedIdentities["a.note"],oldIdentity);
+  assert.deepEqual(f.plugin.config.rules[0].exclude,["old.note"]);
+  assert.equal(JSON.stringify(f.plugin.store.notebooks[source].pages),before);
+  assert.equal(f.calls.length,requests);
+});
+
+
+test("moving glossary support files preserves paid recipe and glossary hashes", async () => {
+  const f=fixture(1);
+  const profile=f.plugin.config.profiles[0];
+  profile.glossaries=["Supernote Transcripts/Glossaries/Terms.md"];
+  f.files.set(profile.glossaries[0],"jnana: knowledge");
+  const before=await f.plugin.profile(profile.id);
+  f.files.set("_supernote/Glossaries/Terms.md",f.files.get(profile.glossaries[0]));
+  profile.glossaries=["_supernote/Glossaries/Terms.md"];
+  const after=await f.plugin.profile(profile.id);
+  assert.equal(after.recipe,before.recipe);assert.equal(after.glossaryHash,before.glossaryHash);
+  assert.equal(after.reference,before.reference);assert.equal(f.calls.length,0);
+});
+
+
+test("Android null search-exclusion defaults are safely initialized during reorganization", async () => {
+  const f=fixture(1),values=new Map();
+  f.app.vault.getConfig=key=>values.get(key)??null;
+  f.app.vault.setConfig=(key,value)=>values.set(key,value);
+  await f.plugin.reorganizeStorage();
+  assert.deepEqual(values.get("userIgnoreFilters"),["_supernote/","_supernote-storage.md"]);
+  assert.equal(f.calls.length,0);
+});
+
+function supportTreeFixture(){
+  const f=fixture(1),a=f.app.vault.adapter;
+  a.exists=async p=>f.files.has(p)||[...f.files.keys()].some(k=>k.startsWith(p+"/"));
+  a.list=async p=>{
+    const prefix=p+"/",entries=[...f.files.keys()].filter(k=>k.startsWith(prefix));
+    return {files:entries.filter(k=>!k.slice(prefix.length).includes("/")&&f.files.get(k)!=="folder"),
+      folders:[...new Set(entries.filter(k=>k.slice(prefix.length).includes("/")).map(k=>prefix+k.slice(prefix.length).split("/")[0]))]};
+  };
+  a.rename=async(from,to)=>{for(const [k,v] of [...f.files])if(k===from||k.startsWith(from+"/")){f.files.set(to+k.slice(from.length),v);f.files.delete(k);}};
+  a.rmdir=async p=>f.files.delete(p);
+  f.plugin.initializing=false;
+  return f;
+}
+
+test("changing support folder moves saved results and glossary references without spending or invalidating recipes",async()=>{
+  const f=supportTreeFixture();
+  f.files.set("_supernote/Glossaries/Terms.md","jnana: knowledge");
+  f.files.set("_supernote/Shared Data/saved.md","paid saved result");
+  f.plugin.config.profiles[0].glossaries=["_supernote/Glossaries/Terms.md"];
+  const before=await f.plugin.profile("general");
+  f.plugin.config.supportFolder="System/Supernote data";
+  await f.plugin.saveConfig();
+  assert.equal(f.plugin.config.supportFolder,"System/Supernote data");
+  assert.equal(f.files.get("System/Supernote data/Shared Data/saved.md"),"paid saved result");
+  assert.equal(f.files.has("_supernote/Shared Data/saved.md"),false);
+  assert.deepEqual(f.plugin.config.profiles[0].glossaries,["System/Supernote data/Glossaries/Terms.md"]);
+  assert.equal((await f.plugin.profile("general")).recipe,before.recipe);
+  assert.equal(f.app.data.storageMove,undefined);
+  assert.match(f.files.get("_supernote-storage.md"),/System\/Supernote data/);
+  assert.equal(f.calls.length,0);
+});
+
+test("support move journal survives an interrupted rename and recovers within the same session",async()=>{
+  const f=supportTreeFixture(),a=f.app.vault.adapter,rename=a.rename;
+  f.files.set("_supernote/History/a.md","previous version");
+  a.rename=async()=>{throw Error("Temporary Sync lock");};
+  f.plugin.config.supportFolder="Support data";
+  await f.plugin.saveConfig();
+  assert.equal(f.app.data.storageMove.to,"Support data");
+  assert.match(f.plugin.supportStorageIssue,/needs attention/);
+  a.rename=rename;
+  await f.plugin.refreshSharedSettings();
+  assert.equal(f.plugin.supportStorageIssue,undefined);
+  assert.equal(f.app.data.storageMove,undefined);
+  assert.equal(f.files.get("Support data/History/a.md"),"previous version");
+  assert.equal(f.calls.length,0);
+});
+
+test("receiver waits for moved support files then preserves late old-root results and recovers without re-recognition",async()=>{
+  const f=supportTreeFixture();
+  const layout={version:1,root:"Support",previousRoot:"_supernote",revision:crypto.randomUUID(),files:["Shared Data/known.md"]};
+  f.files.set("_supernote-storage.md","<!-- supernote-storage-v1 -->\n"+JSON.stringify(layout));
+  f.files.set("Support","folder");
+  f.files.set("_supernote/Shared Data/late.md","late paid result");
+  await assert.rejects(f.plugin.refreshSharedSettings(),/still arriving/);
+  assert.match(f.plugin.supportStorageIssue,/still arriving/);
+  f.files.set("Support/Shared Data/known.md","earlier paid result");
+  await f.plugin.refreshSharedSettings();
+  assert.equal(f.plugin.supportStorageIssue,undefined);
+  assert.equal(f.plugin.config.supportFolder,"Support");
+  assert.equal(f.files.get("Support/Shared Data/late.md"),"late paid result");
+  // A different peer's old-root write may arrive after the first adoption.
+  f.files.set("_supernote/Shared Data/even-later.md","delayed paid result");
+  await f.plugin.refreshSharedSettings();
+  assert.equal(f.files.get("Support/Shared Data/even-later.md"),"delayed paid result");
+  assert.equal(f.files.has("_supernote/Shared Data/even-later.md"),false);
+  assert.equal(f.calls.length,0);
+});
+
+test("different destination contents block support adoption and preserve both copies",async()=>{
+  const f=supportTreeFixture();
+  const layout={version:1,root:"Support",previousRoot:"_supernote",revision:crypto.randomUUID(),files:["History/a.md"]};
+  f.files.set("_supernote-storage.md","<!-- supernote-storage-v1 -->\n"+JSON.stringify(layout));
+  f.files.set("Support/History/a.md","remote");f.files.set("_supernote/History/a.md","local");
+  await assert.rejects(f.plugin.refreshSharedSettings(),/different contents/);
+  assert.equal(f.files.get("Support/History/a.md"),"remote");assert.equal(f.files.get("_supernote/History/a.md"),"local");
+  assert.equal(f.plugin.config.supportFolder,undefined);assert.equal(f.calls.length,0);
+});
+
+test("local Storage visibility preferences preserve unrelated search exclusions",async()=>{
+  const f=supportTreeFixture(),values=new Map([["userIgnoreFilters",["copilot/","_supernote/"]]]);
+  f.app.vault.getConfig=key=>values.get(key);f.app.vault.setConfig=(key,value)=>values.set(key,value);
+  await f.plugin.setStoragePreferences({hideInExplorer:false,excludeFromSearch:false});
+  assert.deepEqual(values.get("userIgnoreFilters"),["copilot/"]);
+  assert.deepEqual(f.plugin.storagePreferences(),{hideInExplorer:false,excludeFromSearch:false});
+  await f.plugin.setStoragePreferences({hideInExplorer:true,excludeFromSearch:true});
+  assert.deepEqual(values.get("userIgnoreFilters"),["copilot/","_supernote/","_supernote-storage.md"]);
+  assert.equal(f.calls.length,0);
+});
+
+test("archived notebooks follow support relocation while ordinary transcript destinations stay intact",async()=>{
+  const f=supportTreeFixture();await f.plugin.update();
+  const state=f.plugin.store.notebooks[source],pages=JSON.stringify(state.pages);
+  state.output="_supernote/Archive/one/a.md";state.outputOverride=state.output;
+  f.files.set(state.output,"archived transcript");
+  f.plugin.config.supportFolder="Data/Support";
+  await f.plugin.saveConfig();
+  assert.equal(state.output,"Data/Support/Archive/one/a.md");
+  assert.equal(state.outputOverride,state.output);
+  assert.equal(f.plugin.config.rules[0].output,"Mirror");
+  assert.equal(f.files.get(state.output),"archived transcript");assert.equal(JSON.stringify(state.pages),pages);
+  assert.doesNotThrow(()=>f.plugin.assertStateReady());
 });

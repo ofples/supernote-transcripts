@@ -5,12 +5,14 @@ import { reconcilePages } from "./reconcile.mjs";
  * The caller owns persistence and decides how to display individual failures.
  * @param {any[]} entries
  * @param {any} reader
- * @param {{platform?: string, mayStart?: () => boolean, onResult?: (entry: any, result: any) => void | Promise<void>}} options
+ * @param {{platform?: string, retain?: boolean, mayStart?: () => boolean, onResult?: (entry: any, result: any) => void | Promise<void>}} options
  */
 export async function inventoryNotebooks(entries, reader, {
-  platform = "desktop", mayStart = () => true, onResult = () => {},
+  platform = "desktop", retain = false, mayStart = () => true, onResult = () => {},
 } = {}) {
   const results = new Map();
+  const maxRetained = retain ? (platform === "nomad" ? 4 : 8) : 0;
+  let retainedCount = 0;
   let cursor = 0;
   const worker = async () => {
     while (cursor < entries.length && mayStart()) {
@@ -21,6 +23,11 @@ export async function inventoryNotebooks(entries, reader, {
         // Detach the descriptor before closing the underlying byte source.
         const d = opened.descriptor;
         result = { descriptor: { ...d, pages: d.pages.map(p => ({ ...p })) } };
+        if (retainedCount < maxRetained && typeof opened.fork === "function") {
+          result.reusable = opened;
+          opened = undefined;
+          retainedCount++;
+        }
       } catch (error) {
         result = { error };
       } finally {
@@ -38,7 +45,10 @@ export async function inventoryNotebooks(entries, reader, {
     length: Math.min(entries.length, platform === "nomad" ? 2 : 4),
   }, worker));
   const failed = settled.find(r => r.status === "rejected");
-  if (failed) throw failed.reason;
+  if (failed) {
+    await Promise.allSettled([...results.values()].map(result => result.reusable?.close()));
+    throw failed.reason;
+  }
   return results;
 }
 

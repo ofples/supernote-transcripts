@@ -26,7 +26,7 @@ Estimates are provisional when there is little comparable history. They are guid
 
 ## Devices do not show the same sources or queue
 
-Queues, source file paths, provider credentials, execution switches, budgets and pause state are local to each device. Confirm each device uses its own Obsidian configuration folder/profile and that the plugin is installed in that active folder. The local plugin `data.json` and state slots live there; do not copy them between devices. If the same profile/config folder is shared, Obsidian Sync can overwrite device-local mounts or state. Use Obsidian’s [configuration profile settings](https://obsidian.md/help/sync/settings) to keep them separate. Shared mirror settings and page records are vault files, so confirm both devices sync `Supernote Transcripts/Shared Data/` and have a version that supports shared settings. Sync may be delayed. It cannot guarantee exactly-once recognition or simultaneous-write safety; inspect Obsidian conflict copies before choosing which transcript to keep.
+Queues, source file paths, provider credentials, execution switches, budgets and pause state are local to each device. Confirm each device uses its own Obsidian configuration folder/profile and that the plugin is installed in that active folder. The local plugin `data.json` and state slots live there; do not copy them between devices. If the same profile/config folder is shared, Obsidian Sync can overwrite device-local mounts or state. Use Obsidian’s [configuration profile settings](https://obsidian.md/help/sync/settings) to keep them separate. Shared mirror settings and page records are vault files, so confirm both devices sync `_supernote/Shared Data/` and have a version that supports shared settings. Sync may be delayed. It cannot guarantee exactly-once recognition or simultaneous-write safety; inspect Obsidian conflict copies before choosing which transcript to keep.
 
 ## Settings will not save or sync
 
@@ -42,7 +42,7 @@ The update inventory step refreshes changed notebook metadata before AI work: up
 
 ## A page link has no enhanced view
 
-Page links are optional and work without an MD Reader enhancement. Confirm the source identity and saved page ID still match the local notebook. On Nomad, native Notes navigation requires the separate Supernote Bridge Android app; install or update to [version 0.6.0](installation.md#optional-companions) if the link does not open Notes. On desktop, a compatible enabled `.note` viewer may handle in-vault notebooks; otherwise Transcripts uses its own read-only page preview, including for external local sources.
+Page links are optional and work without an MD Reader enhancement. Confirm the source identity and saved page ID still match the local notebook. On Nomad, native Notes navigation requires the separate Supernote Bridge Android app; install or update to [version 0.6.1](installation.md#optional-companions) if the link does not open Notes. On desktop, a compatible enabled `.note` viewer may handle in-vault notebooks; otherwise Transcripts uses its own read-only page preview, including for external local sources.
 
 ## Restore last version is unavailable or the notebook stays paused
 

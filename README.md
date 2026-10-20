@@ -2,7 +2,7 @@
 
 Supernote Transcripts is an Obsidian plugin that reads selected Supernote `.note` notebooks and creates or updates Markdown transcripts using an AI provider you configure. It keeps notebook files as read-only source material. You choose which notebooks to mirror and where to save the Markdown.
 
-Version **0.15.0** is an early prerelease. Download the Transcripts manual-install ZIP from the [v0.15.0 GitHub release](https://github.com/ofples/supernote-transcripts/releases/tag/v0.15.0). The optional **Supernote Bridge 0.6.0** Android app is distributed separately; download its APK from the [Bridge 0.6.0 release](https://github.com/ofples/supernote-transcripts/releases/tag/bridge-v0.6.0). There is no confirmed Community Plugins listing. See [installation](docs/installation.md) and [validation notes](VALIDATION.md) for setup and build/device verification boundaries.
+Version **0.16.0** is an early prerelease. Download the Transcripts manual-install ZIP from the [v0.16.0 GitHub release](https://github.com/ofples/supernote-transcripts/releases/tag/v0.16.0). The optional **Supernote Bridge 0.6.1** Android app is distributed separately; download its APK from the [Bridge 0.6.1 release](https://github.com/ofples/supernote-transcripts/releases/tag/bridge-v0.6.1). There is no confirmed Community Plugins listing. See [installation](docs/installation.md) and [validation notes](VALIDATION.md) for setup and build/device verification boundaries.
 
 ## Start here
 
@@ -16,7 +16,7 @@ Version **0.15.0** is an early prerelease. Download the Transcripts manual-insta
 
 ## Important setup choices
 
-Keep original `.note` files in a local source folder. If Obsidian Sync is used, exclude the raw `Supernote/` folder before copying the notebooks into a vault. Sync generated Markdown and `Supernote Transcripts/Shared Data/` between devices. Use separate Obsidian configuration folders for Nomad and desktop so local source mounts and state are not synchronized over one another. The [end-to-end workflow](docs/workflow.md) explains how this relates to native Supernote Cloud Sync and the optional desktop Cloud Sync plugin.
+Keep original `.note` files in a local source folder. If Obsidian Sync is used, exclude the raw `Supernote/` folder before copying the notebooks into a vault. Sync generated Markdown and `_supernote/Shared Data/` between devices. Use separate Obsidian configuration folders for Nomad and desktop so local source mounts and state are not synchronized over one another. The [end-to-end workflow](docs/workflow.md) explains how this relates to native Supernote Cloud Sync and the optional desktop Cloud Sync plugin.
 
 Recognition can use paid provider capacity. Start paused, select only the notebooks you want, inspect the model, prompt, glossary, quality and estimates, then choose **Update**. Automatic catch-up is optional. The [user guide](docs/user-guide.md#review-costs-and-run-safely) explains estimates, local budgets, pausing, and retries.
 

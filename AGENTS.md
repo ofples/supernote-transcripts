@@ -13,6 +13,7 @@ This repository is the Obsidian Supernote Transcripts plugin plus local build, v
 - Keep credentials, tokens, signing keys, local configs, raw notes, private backups, and private evidence out of tracked source. Root `.gitignore` keeps `private/` and `test-artifacts/` local; do not force-add their contents.
 - Tests and validation must not make paid recognition requests unless the user explicitly authorizes them. Prefer fixtures and mocks for UI or provider-shape checks.
 - Scripts named for activation, staging, migration, cleanup, reload, recovery, or device state may change a real vault or device. Read them before running and obtain the corresponding user request for installation, note modification, publishing, or destructive recovery.
+- A user request may authorize local Nomad installation/testing without authorizing publication. Do not push to GitHub, create tags or releases, or deploy until the user explicitly asks for publication in a later request.
 - Preserve package lockfiles and use npm for this npm project. Do not modify third-party clones or their dependencies as a shortcut.
 
 ## Build and test

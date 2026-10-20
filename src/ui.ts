@@ -45,6 +45,7 @@ import {
   validateDestination,
   validateSource,
 } from "./reconcile.mjs";
+import { isDataPath, TRANSCRIPTS_ROOT } from "./storage-paths";
 
 const ROOT = "/storage/emulated/0/Note";
 const MODEL_OPTIONS = [
@@ -144,6 +145,7 @@ const iconButton = (
       : classes.includes("st-close") ? "Close"
       : classes.includes("st-edit") ? "Configure"
       : classes.includes("st-source-pause") ? (/^Resume/i.test(label) ? "Resume" : "Pause")
+      : classes.includes("st-recognize-now") ? (/^Queued/i.test(label) ? "Queued" : /^Recognizing|^Queuing/i.test(label) ? "Working" : "Recognize")
       : /Do next/i.test(label) ? "Do next"
       : /^Resume/i.test(label) ? "Resume"
       : /^Pause/i.test(label) ? "Pause"
@@ -230,6 +232,7 @@ type Screen =
   | "browser"
   | "detail"
   | "recovery"
+  | "page-reconciliation"
   | "cleanup"
   | "storage"
   | "reprocess"
@@ -238,6 +241,27 @@ type Screen =
   | "output-folders"
   | "output-folder-create"
   | "exclude-confirm";
+
+type ReconciliationConflict = {
+  pageId: string;
+  number: number;
+  reason: string;
+  editedText: string;
+  recognizedText: string;
+  proposedText?: string;
+  fingerprint: string;
+};
+
+type ReconciliationChoice = "keep-edits" | "use-recognition" | "use-proposal";
+
+type ReconciliationController = Controller;
+type RecognitionNowTarget = { source?: string; ruleId?: string };
+type RecognitionNowController = Controller & {
+  requestRecognitionNow?: (target: RecognitionNowTarget) => Promise<void>;
+};
+type ManualProgress = Controller["progress"] & { manualSources?: string[] };
+type ManualQueueTask = { source: string; manual?: boolean };
+
 class MirrorsModal extends Modal {
   private readonly actionGate = new AsyncActionGate();
   private configSaveQueue: Promise<void> = Promise.resolve();
@@ -260,6 +284,8 @@ class MirrorsModal extends Modal {
   private detailLive?: HTMLElement;
   private pageIssuesLive?: HTMLElement;
   private notebookRetryQueued = new Set<string>();
+  private recognitionNowBusy = new Set<string>();
+  private workingCardExpanded = false;
   private updateButton?: HTMLButtonElement;
   private homeProgressDetailsOpen = false;
   private forceUpdateSource = "";
@@ -271,6 +297,7 @@ class MirrorsModal extends Modal {
   private costDraft?: CostSettings;
   private costReturnScreen: "home" | "queue" | "settings" = "home";
   private outputPickerPath = "";
+  private folderPickerPurpose: "output" | "support" = "output";
   private outputFolderSearch = "";
   private outputFolderName = "";
   private editorRule?: FolderRule;
@@ -294,9 +321,15 @@ class MirrorsModal extends Modal {
     concurrency: number;
     showPageHeadings: boolean;
     cleanupPrompt: string;
+    automaticCheck: "new" | "recent" | "all";
+    automaticCheckRecentPages: number;
     pairingAddress: string;
     pairingCode: string;
+    supportFolder: string;
+    hideSupportFolderInExplorer: boolean;
+    excludeSupportFilesFromSearch: boolean;
   };
+  private settingsTab: "connection" | "recognition" | "updates" | "storage" = "connection";
   private settingsProfilesBaseline: Profile[] = [];
   private browserPath = ROOT;
   private browserRootPath = ROOT;
@@ -318,6 +351,14 @@ class MirrorsModal extends Modal {
   private recoveryBusy = false;
   private recoveryWaitingForIdle = false;
   private recoveryResult?: { action: "replace" | "keep"; backup?: string; output: string };
+  private reconciliationSummary?: HTMLElement;
+  private reconciliationSource = "";
+  private reconciliationConflicts: ReconciliationConflict[] = [];
+  private reconciliationError = "";
+  private reconciliationLoading = false;
+  private reconciliationBusyPage = "";
+  private reconciliationChoiceBusy?: ReconciliationChoice;
+  private reconciliationRequest = 0;
   private notebookChoices: {
     source: string;
     relative: string;
@@ -496,7 +537,8 @@ class MirrorsModal extends Modal {
       this.costDraft = JSON.parse(JSON.stringify(this.c.costs.settings));
       this.screen = this.costReturnScreen;
     } else if (this.screen === "output-folders") {
-      this.screen = "editor";
+      this.screen = this.folderPickerPurpose === "support" ? "settings" : "editor";
+      if (this.folderPickerPurpose === "support") this.settingsTab = "storage";
     } else if (this.screen === "output-folder-create") {
       this.outputFolderName = "";
       this.screen = "output-folders";
@@ -509,7 +551,7 @@ class MirrorsModal extends Modal {
       this.screen = "editor";
     } else if (this.screen === "browser" && this.browserFrom === "edit")
       this.screen = "editor";
-    else if (this.screen === "recovery") this.screen = "detail";
+    else if (this.screen === "recovery" || this.screen === "page-reconciliation") this.screen = "detail";
     else if (this.screen === "exclude-confirm") {
       this.excludeSource = "";
       this.excludeError = "";
@@ -533,7 +575,13 @@ class MirrorsModal extends Modal {
     const controller = this.c as Controller & {
       provider?: "api" | "subscription";
       concurrency?: number;
+      storagePreferences?: () => { hideInExplorer: boolean; excludeFromSearch: boolean };
     };
+    const storagePreferences = controller.storagePreferences?.() ?? {
+      hideInExplorer: true,
+      excludeFromSearch: true,
+    };
+    const storageConfig = this.c.config as typeof this.c.config & { supportFolder?: string };
     const profilesSnapshot = this.c.config.profiles.map((p) => ({
       ...p,
       glossaries: [...p.glossaries],
@@ -556,14 +604,26 @@ class MirrorsModal extends Modal {
       showPageHeadings: this.c.config.showPageHeadings === true &&
         (profilesSnapshot.find((p) => p.id === "general")?.preserveFormatting ?? true) === false,
       cleanupPrompt: (this.c.config as typeof this.c.config & { cleanupPrompt?: string }).cleanupPrompt ?? DEFAULT_CLEANUP_PROMPT,
+      automaticCheck: (this.c.config as typeof this.c.config & { automaticCheck?: "new" | "recent" | "all" }).automaticCheck ?? "new",
+      automaticCheckRecentPages: (this.c.config as typeof this.c.config & { automaticCheckRecentPages?: number }).automaticCheckRecentPages ?? 5,
       pairingAddress: "",
       pairingCode: "",
+      supportFolder: storageConfig.supportFolder ?? "_supernote",
+      hideSupportFolderInExplorer: storagePreferences.hideInExplorer,
+      excludeSupportFilesFromSearch: storagePreferences.excludeFromSearch,
     };
+    this.settingsTab = "connection";
     this.screen = "settings";
     this.render();
   }
+  private selectSettingsTab(key: "connection" | "recognition" | "updates" | "storage") {
+    this.settingsTab = key;
+    this.render();
+    this.body.scrollTop = 0;
+    this.body.querySelector<HTMLButtonElement>(`[data-settings-tab="${key}"]`)?.focus();
+  }
   private render() {
-    const mutationBusy = this.excludeBusy || this.outputFolderCreateBusy;
+    const mutationBusy = this.excludeBusy || this.outputFolderCreateBusy || !!this.reconciliationBusyPage;
     this.back.hidden = this.screen === "home";
     this.back.disabled = mutationBusy;
     this.headAction.disabled = mutationBusy;
@@ -614,13 +674,15 @@ class MirrorsModal extends Modal {
                     : this.screen === "costs"
                       ? "Costs"
                       : this.screen === "output-folders"
-                        ? "Choose output folder"
+                        ? this.folderPickerPurpose === "support" ? "Choose support folder" : "Choose output folder"
                         : this.screen === "output-folder-create"
                           ? "Create output folder"
                         : this.screen === "exclude-confirm"
                           ? "Exclude notebook"
                         : this.screen === "recovery"
                           ? "Edited transcript"
+                        : this.screen === "page-reconciliation"
+                          ? "Review page changes"
                         : "Notebook",
     );
     this.body.empty();
@@ -630,6 +692,7 @@ class MirrorsModal extends Modal {
     this.rows = undefined;
     this.detailLive = undefined;
     this.pageIssuesLive = undefined;
+    this.reconciliationSummary = undefined;
     this.costLive = undefined;
     this.updateButton = undefined;
     if (this.screen === "home") this.renderHome();
@@ -649,6 +712,7 @@ class MirrorsModal extends Modal {
     else if (this.screen === "exclude-confirm") this.renderExcludeConfirmation();
     else if (this.screen === "editor") this.renderEditor();
     else if (this.screen === "recovery") this.renderRecovery();
+    else if (this.screen === "page-reconciliation") this.renderPageReconciliation();
     else this.renderDetail();
   }
   private refreshLive() {
@@ -657,7 +721,10 @@ class MirrorsModal extends Modal {
     else if (this.screen === "detail") {
       this.refreshDetail();
       const state = this.displayStore.notebooks[this.selectedSource];
-      if (state) this.refreshPageIssues(state);
+      if (state) {
+        this.refreshPageIssues(state);
+        this.refreshReconciliationSummary(state.source);
+      }
     }
     else if (this.screen === "recovery") {
       if (this.c.progress.running && !this.recoveryWaitingForIdle) {
@@ -746,9 +813,21 @@ class MirrorsModal extends Modal {
       new Notice(this.stateBlockedMessage());
       return;
     }
-    if (p.running && !p.paused) this.c.pause();
+    const manualSources = this.currentManualSources();
+    if (manualSources.length) {
+      this.c.pause();
+    }
+    else if (p.running && !p.paused) this.c.pause();
     else if (p.paused) safe(this.c.resume());
     else safe(this.c.update());
+  }
+  private currentManualSources() {
+    return [...new Set([
+      ...((this.c.progress as ManualProgress).manualSources ?? []),
+      ...(((this.c.store.queue as ManualQueueTask[] | undefined) ?? [])
+        .filter((task) => task.manual)
+        .map((task) => task.source)),
+    ])];
   }
   private openCosts() {
     if (this.excludeBusy || this.outputFolderCreateBusy) return;
@@ -781,6 +860,7 @@ class MirrorsModal extends Modal {
       model,
       multipleSources,
       this.c.progress.stage,
+      this.currentManualSources(),
       this.c.progress.running,
       this.c.progress.paused,
       this.c.progress.stateBlocked,
@@ -798,8 +878,10 @@ class MirrorsModal extends Modal {
       this.summary.dataset.key = summaryKey;
       this.summary.empty();
       this.summary.classList.add("st-summary-status");
-      el(this.summary, "strong", model.label, "st-summary-title");
       const active = this.c.queueView.working;
+      const manualSources = this.currentManualSources();
+      const activeIsManual = !!active && manualSources.includes(active.source);
+      el(this.summary, "strong", activeIsManual ? "Manual recognition" : manualSources.length ? "Manual request queued" : model.label, "st-summary-title");
       const budgetReason = this.c.progress.budgetBlocked;
       const executionReason = (this.c.progress as typeof this.c.progress & { executionBlocked?: string }).executionBlocked;
       el(
@@ -809,6 +891,10 @@ class MirrorsModal extends Modal {
           ? "Recognition is paused; review Costs to continue."
           : executionReason
             ? "Recognition is paused; review settings to continue."
+            : activeIsManual
+            ? `Recognizing manually · ${base(active.source).replace(/\.note$/i, "")}`
+            : manualSources.length
+            ? "A one-time request is waiting in Queue."
             : active
           ? (() => {
               const state = this.displayStore.notebooks[active.source];
@@ -869,6 +955,9 @@ class MirrorsModal extends Modal {
       this.c.progress.budgetBlocked,
       this.c.progress.stateBlocked,
       (this.c.progress as typeof this.c.progress & { executionBlocked?: string }).executionBlocked,
+      (this.c.progress as ManualProgress).manualSources,
+      (this.c.store.queue as ManualQueueTask[] | undefined)?.filter((task) => task.manual).map((task) => task.source),
+      [...this.recognitionNowBusy].sort(),
       (this.c as Controller & { sharedSettingsIssues?: unknown }).sharedSettingsIssues,
     ]);
     if (this.rows.dataset.key !== key) {
@@ -925,7 +1014,7 @@ class MirrorsModal extends Modal {
       setText(this.updateButton, this.actionLabel());
       this.updateButton.disabled =
         !!this.c.progress.stateBlocked ||
-        (this.c.progress.running && this.c.progress.paused) ||
+        (this.c.progress.running && this.c.progress.paused && !this.currentManualSources().length) ||
         (!this.c.progress.running && aiOn(this.c) && (
           !!this.c.progress.budgetBlocked ||
           !!(this.c.progress as typeof this.c.progress & { executionBlocked?: string }).executionBlocked
@@ -958,6 +1047,55 @@ class MirrorsModal extends Modal {
         "st-source-parent",
       );
     return copy;
+  }
+  private manualTaskState(target: RecognitionNowTarget) {
+    const sources = target.source
+      ? [target.source]
+      : Object.values(this.displayStore.notebooks)
+          .filter((state) => state.ruleId === target.ruleId)
+          .map((state) => state.source);
+    const key = target.source ? `source:${target.source}` : `rule:${target.ruleId}`;
+    const active = ((this.c.progress as ManualProgress).manualSources ?? [])
+      .some((source) => sources.includes(source));
+    const queued = ((this.c.store.queue as ManualQueueTask[] | undefined) ?? [])
+      .some((task) => task.manual && sources.includes(task.source));
+    return { key, active, queued, busy: this.recognitionNowBusy.has(key) };
+  }
+  private renderRecognizeNow(parent: HTMLElement, target: RecognitionNowTarget, title: string, sourceDisabled = false) {
+    const controller = this.c as RecognitionNowController;
+    const state = this.manualTaskState(target);
+    const label = state.active ? `Recognizing: ${title}`
+      : state.queued || state.busy ? `Queued: ${title}`
+      : `Recognize now: ${title}`;
+    const button = iconButton(
+      parent,
+      state.active ? "loader-circle" : state.queued || state.busy ? "clock-3" : "play",
+      label,
+      () => {
+        if (!controller.requestRecognitionNow || this.c.progress.stateBlocked || state.active || state.queued || state.busy) return;
+        this.recognitionNowBusy.add(state.key);
+        this.refreshHome();
+        void controller.requestRecognitionNow(target).catch((error) => new Notice(`Could not queue recognition: ${err(error)}`)).finally(() => {
+          this.recognitionNowBusy.delete(state.key);
+          this.refreshHome();
+        });
+      },
+      "st-recognize-now",
+    );
+    button.dataset.queueKey = `recognize:${state.key}`;
+    button.disabled = !controller.requestRecognitionNow || !!this.c.progress.stateBlocked || sourceDisabled || state.active || state.queued || state.busy;
+    if (sourceDisabled) {
+      button.title = "Enable this source before queueing recognition.";
+      button.setAttribute("aria-description", "Enable this source before queueing recognition.");
+    } else if (this.c.progress.stateBlocked) {
+      button.title = this.stateBlockedMessage();
+      button.setAttribute("aria-description", this.stateBlockedMessage());
+    }
+    return button;
+  }
+  private manualActive(source: string) {
+    return ((this.c.progress as ManualProgress).manualSources ?? []).includes(source) ||
+      (((this.c.store.queue as ManualQueueTask[] | undefined) ?? []).some((task) => task.manual && task.source === source));
   }
   private queueProgress(copy: HTMLElement, source: string) {
     const state = this.displayStore.notebooks[source];
@@ -1051,6 +1189,9 @@ class MirrorsModal extends Modal {
       this.c.progress.stateBlocked,
       (this.c.progress as typeof this.c.progress & { executionBlocked?: string }).executionBlocked,
       this.c.progress.detail,
+      (this.c.progress as ManualProgress).manualSources,
+      (this.c.store.queue as ManualQueueTask[] | undefined)?.filter((task) => task.manual).map((task) => task.source),
+      [...this.recognitionNowBusy].sort(),
       Object.values(this.displayStore.notebooks).map((s) => [
         s.source,
         notebookPresentation(s),
@@ -1072,7 +1213,12 @@ class MirrorsModal extends Modal {
       if (this.c.progress.stateBlocked)
         this.renderStateBlockedNotice(this.summary);
       const overview = el(this.summary, "section", undefined, "st-queue-overview");
-      const globalStatus = this.c.progress.stage === "Checking notebook pages"
+      const manualWorking = !!q.working && this.currentManualSources().includes(q.working.source);
+      const globalStatus = manualWorking
+        ? `Recognizing manually · ${base(q.working!.source).replace(/\.note$/i, "")}`
+        : this.currentManualSources().length
+        ? "Manual request queued"
+        : this.c.progress.stage === "Checking notebook pages"
         ? `Checking notebooks · ${this.c.progress.checked} of ${this.c.progress.total}`
         : this.c.progress.budgetBlocked
         ? ((this.c as Controller & { provider?: string }).provider === "subscription" ? "Usage limit reached" : "Spending paused")
@@ -1118,6 +1264,33 @@ class MirrorsModal extends Modal {
           undefined,
           "st-queue-row st-working",
         );
+        row.tabIndex = 0;
+        row.setAttribute("role", "group");
+        row.setAttribute("aria-label", `Working now: ${base(q.working.source)}`);
+        row.setAttribute("aria-expanded", String(this.workingCardExpanded));
+        row.classList.toggle("st-working-expanded", this.workingCardExpanded);
+        const toggleWorkingCard = () => {
+          this.workingCardExpanded = !this.workingCardExpanded;
+          row.setAttribute("aria-expanded", String(this.workingCardExpanded));
+          row.classList.toggle("st-working-expanded", this.workingCardExpanded);
+          const details = row.querySelector(".st-working-details") as HTMLElement | null;
+          if (details) details.hidden = !this.workingCardExpanded;
+          const caret = row.querySelector(".st-working-disclosure") as HTMLButtonElement | null;
+          if (caret) {
+            setIcon(caret, this.workingCardExpanded ? "chevron-down" : "chevron-right");
+            caret.setAttribute("aria-expanded", String(this.workingCardExpanded));
+          }
+        };
+        row.addEventListener("click", (event: MouseEvent) => {
+          const interactive = (event.target as HTMLElement).closest("button,a,input,select,textarea,[role=button]");
+          if (interactive && interactive !== row) return;
+          toggleWorkingCard();
+        });
+        row.addEventListener("keydown", (event: KeyboardEvent) => {
+          if (event.target !== row || (event.key !== "Enter" && event.key !== " ")) return;
+          event.preventDefault();
+          toggleWorkingCard();
+        });
         const copy = this.queueCopy(row, q.working.source);
         const workingState = this.displayStore.notebooks[q.working.source];
         const workingView = workingState ? notebookPresentation(workingState) : undefined;
@@ -1128,9 +1301,8 @@ class MirrorsModal extends Modal {
         const completed = workingView?.ready ?? (current ? Math.max(0, current.number - 1) : 0);
         const cleaningUp = /cleanup/i.test(q.working.stage);
         el(copy, "p", cleaningUp ? "Cleaning up document…" : total ? `Recognizing… ${Math.min(completed, total)}/${total} pages` : "Recognizing…", "st-caption st-working-progress");
-        const workingDetails = el(copy, "details", undefined, "st-working-details");
-        workingDetails.dataset.queueSection = "working details";
-        el(workingDetails, "summary", "Details");
+        const workingDetails = el(copy, "div", undefined, "st-working-details");
+        workingDetails.hidden = !this.workingCardExpanded;
         el(workingDetails, "p", `${q.working.stage}${current ? ` · page ${current.number} of ${current.total}` : ""}`, "st-caption");
         const contextPage = this.c.progress.renderingContext && this.c.progress.activePage?.source === q.working.source
           ? String(this.c.progress.activePage.number)
@@ -1163,10 +1335,11 @@ class MirrorsModal extends Modal {
           this.renderQueueEstimate(workingDetails, q.working.source);
         }
         const state = this.displayStore.notebooks[q.working.source];
+        const controls = el(row, "div", undefined, "st-working-controls");
         if (state) {
-          const pausing =
+          const pausing = !this.currentManualSources().includes(q.working.source) && (
             !!state.paused ||
-            !!this.c.config.rules.find((r) => r.id === state.ruleId)?.paused;
+            !!this.c.config.rules.find((r) => r.id === state.ruleId)?.paused);
           if (pausing)
             el(
               copy,
@@ -1175,16 +1348,26 @@ class MirrorsModal extends Modal {
               "st-caption",
             );
           const pause = iconButton(
-            row,
+            controls,
             "pause",
             pausing
               ? "Pausing after current page"
-              : `Pause ${base(q.working.source)}`,
+              : `${this.currentManualSources().includes(q.working.source) ? "Pause manual recognition" : "Pause"}: ${base(q.working.source)}`,
             () => safe(this.c.setNotebookPaused(q.working!.source, true)),
           );
-          pause.disabled = pausing;
+          pause.disabled = pausing && !this.currentManualSources().includes(q.working.source);
           pause.dataset.queueKey = `pause:${q.working.source}`;
+          pause.addEventListener("click", (event) => event.stopPropagation());
         }
+        const disclosure = iconButton(
+          controls,
+          this.workingCardExpanded ? "chevron-down" : "chevron-right",
+          `${this.workingCardExpanded ? "Collapse" : "Expand"} working details for ${base(q.working.source)}`,
+          toggleWorkingCard,
+          "st-working-disclosure",
+        );
+        disclosure.setAttribute("aria-expanded", String(this.workingCardExpanded));
+        disclosure.addEventListener("click", (event) => event.stopPropagation());
       }
       if (q.waiting.length) el(this.summary, "h2", "Up next", "st-section-heading st-queue-heading");
       else if (!q.working && !q.paused.length && !attentionSources.length) el(this.summary, "p", "No pending pages.", "st-empty");
@@ -1222,8 +1405,6 @@ class MirrorsModal extends Modal {
         ),
       ))
         detail.open = openSections.has(detail.dataset.queueSection ?? detail.className);
-      const estimateInfo = this.summary.querySelector<HTMLDetailsElement>(".st-queue-estimate-info");
-      if (estimateInfo) estimateInfo.open = openSections.has(estimateInfo.className);
       if (focusKey)
         this.summary
           .querySelector<HTMLElement>(
@@ -1236,7 +1417,7 @@ class MirrorsModal extends Modal {
       setText(this.updateButton, this.actionLabel());
       this.updateButton.disabled =
         !!this.c.progress.stateBlocked ||
-        (this.c.progress.running && this.c.progress.paused) ||
+        (this.c.progress.running && this.c.progress.paused && !this.currentManualSources().length) ||
         (!this.c.progress.running && aiOn(this.c) && (
           !!this.c.progress.budgetBlocked ||
           !!(this.c.progress as typeof this.c.progress & { executionBlocked?: string }).executionBlocked
@@ -1250,11 +1431,17 @@ class MirrorsModal extends Modal {
     resume: boolean,
   ) {
     if (!sources.length) return;
-    const details = el(parent, "details", undefined, "st-queue-collapsed");
-    details.dataset.queueSection = title;
-    el(details, "summary", `${title} (${sources.length})`);
+    const section = resume
+      ? el(parent, "details", undefined, "st-queue-collapsed")
+      : el(parent, "section", undefined, "st-queue-attention");
+    if (resume) {
+      (section as HTMLDetailsElement).dataset.queueSection = title;
+      el(section, "summary", `${title} (${sources.length})`);
+    } else {
+      el(section, "h2", `${title} (${sources.length})`, "st-section-heading");
+    }
     for (const source of sources) {
-      const row = el(details, "div", undefined, "st-queue-row");
+      const row = el(section, "div", undefined, "st-queue-row");
       const state = this.displayStore.notebooks[source];
       const copy = this.queueCopy(row, source);
       this.queueProgress(copy, source);
@@ -1360,16 +1547,27 @@ class MirrorsModal extends Modal {
     };
     const estimate = controller.queueEstimate?.();
     if (!estimate || estimate.pages <= 0) return;
-    const details = el(parent, "details", undefined, "st-queue-estimate-info");
-    el(details, "summary", "About this estimate");
+    const details = el(parent, "div", undefined, "st-queue-estimate-info");
+    const help = btn(details, "?", () => {}, "st-button st-help-button");
+    help.setAttribute("aria-label", "Help: About this estimate");
+    help.setAttribute("aria-expanded", "false");
+    const panel = el(details, "div", undefined, "st-help-text");
+    const panelId = "st-queue-estimate-help-" + Math.random().toString(36).slice(2);
+    panel.id = panelId;
+    panel.hidden = true;
+    help.setAttribute("aria-controls", panelId);
+    help.addEventListener("click", () => {
+      panel.hidden = !panel.hidden;
+      help.setAttribute("aria-expanded", String(!panel.hidden));
+    });
     if (controller.provider === "subscription") {
-      el(details, "p", "Forecasts eligible work after you press Update or Resume. Individually paused or blocked notebooks are excluded. Spending or execution limits can still stop requests. Page and request counts are tracked by this plugin. ChatGPT manages plan allowance; no dollar charge is estimated.", "st-caption st-estimate-note");
+      el(panel, "p", "Forecasts eligible work after you press Update or Resume. Individually paused or blocked notebooks are excluded. Spending or execution limits can still stop requests. Page and request counts are tracked by this plugin. ChatGPT manages plan allowance; no dollar charge is estimated.", "st-caption st-estimate-note");
       return;
     }
     const sample = `${estimate.samples} recent comparable page${estimate.samples === 1 ? "" : "s"}`;
-    el(details, "p", `Forecasts eligible work after you press Update or Resume. Individually paused or blocked notebooks are excluded. Spending or execution limits can still stop requests. ${estimate.provisional ? "Provisional; " : ""}Based on ${sample}. Estimates are not bills.`, "st-caption st-estimate-note");
+    el(panel, "p", `Forecasts eligible work after you press Update or Resume. Individually paused or blocked notebooks are excluded. Spending or execution limits can still stop requests. ${estimate.provisional ? "Provisional; " : ""}Based on ${sample}. Estimates are not bills.`, "st-caption st-estimate-note");
     if (estimate.reservationUsd !== undefined && Number.isFinite(estimate.reservationUsd) && estimate.reservationUsd > 0)
-      el(details, "p", `Conservative budget reservation: $${estimate.reservationUsd.toFixed(4)}.`, "st-caption st-reservation-note");
+      el(panel, "p", `Conservative budget reservation: $${estimate.reservationUsd.toFixed(4)}.`, "st-caption st-reservation-note");
   }
   private duration(seconds: number) {
     const minutes = Math.max(1, Math.round(seconds / 60));
@@ -1378,6 +1576,7 @@ class MirrorsModal extends Modal {
   private actionLabel() {
     const p = this.c.progress;
     if (p.stateBlocked) return "Saved state unavailable";
+    if (this.currentManualSources().length) return "Pause";
     if (p.running && !p.paused) return "Pause";
     if (p.running && p.paused) return "Pausing…";
     if (p.budgetBlocked)
@@ -1407,6 +1606,17 @@ class MirrorsModal extends Modal {
     if (/shared transcript results have not arrived or conflict with local results|shared transcript results.*(?:not arrived|conflict)/i.test(state.error ?? ""))
       return "Shared recognition needs review. Check Sync or use Force update to choose this device’s saved results.";
     return fallback;
+  }
+  private detailAttentionReason(state: Controller["store"]["notebooks"][string], fallback?: string) {
+    const reason = this.forceUpdateReason(state, fallback);
+    const error = String(state.error ?? "");
+    if (/shared publication receipt.{0,60}(?:damaged|invalid|mismatch)/i.test(error))
+      return "Could not verify this transcript’s sync record. It links the saved Markdown to the original note; this check did not modify the notebook. Check Sync, then use Check & update.";
+    if (reason !== "Open notebook details to review the error.") return reason;
+    const fullError = error.split(/\r?\n/, 1)[0].replace(/^Error:\s*/i, "").trim();
+    const conciseError = fullError.match(/^.*?[.!?](?:\s|$)/)?.[0].trim() ?? fullError;
+    if (conciseError) return conciseError.length > 180 ? `${conciseError.slice(0, 177)}…` : conciseError;
+    return "This notebook needs attention before its next update.";
   }
   private openForceUpdate(source: string) {
     if (!this.c.forceUpdate) return new Notice("Force update is not available in this runtime yet.");
@@ -1529,6 +1739,7 @@ class MirrorsModal extends Modal {
       output: "Output folder",
       recursive: "Include subfolders",
       exclude: "Excluded notebooks",
+      digestCategoryName: "Digest category",
       "settings history": "Settings history",
     };
     for (const issue of issues) {
@@ -1609,38 +1820,37 @@ class MirrorsModal extends Modal {
     if (reason && reason !== view.caption)
       el(meta, "p", reason, "st-caption st-attention-reason");
     progressBar(row, view, `${shortPath(rule.source)} pages ready`);
-    const controls = el(row, "div", undefined, "st-row-controls");
     const recoverySources = stateSources.filter((source) =>
       canRecoverTranscriptEdits(this.displayStore.notebooks[source]),
     );
-    if (recoverySources.length)
-      btn(
-        controls,
-        recoverySources.length > 1
-          ? `Resolve ${recoverySources.length} edits`
-          : "Resolve edits",
-        () => this.openRecovery(recoverySources[0]),
-        "st-button st-text-button st-recovery-action",
-      );
     const issueSource = stateSources.find((source) =>
       currentPageIssues(this.displayStore.notebooks[source]).some((issue) => issue.status !== "skipped"),
     );
-    if (issueSource)
-      btn(
-        controls,
-        "Review pages",
-        () => {
+    const state = isNotebook && stateSources.length
+      ? this.displayStore.notebooks[stateSources[0]]
+      : undefined;
+    if (recoverySources.length || issueSource || (state && this.canForceUpdate(state))) {
+      const actions = el(row, "div", undefined, "st-source-actions");
+      if (recoverySources.length)
+        btn(
+          actions,
+          recoverySources.length > 1 ? `Resolve ${recoverySources.length} edits` : "Resolve edits",
+          () => this.openRecovery(recoverySources[0]),
+          "st-button st-text-button st-recovery-action",
+        );
+      if (issueSource)
+        btn(actions, "Review pages", () => {
           this.selectedRule = this.displayStore.notebooks[issueSource].ruleId;
           this.selectedSource = issueSource;
           this.detailReturnScreen = "home";
           this.screen = "detail";
           this.render();
-        },
-        "st-button st-text-button st-review-pages",
-      );
+        }, "st-button st-text-button st-review-pages");
+      if (state) this.renderForceUpdateAction(actions, state);
+    }
+    const controls = el(row, "div", undefined, "st-row-controls");
     if (isNotebook && stateSources.length) {
       const state = this.displayStore.notebooks[stateSources[0]];
-      this.renderForceUpdateAction(controls, state);
       iconButton(
         controls,
         "info",
@@ -1649,34 +1859,44 @@ class MirrorsModal extends Modal {
         "st-notebook-details-action",
       );
       const paused = !!(rule.paused || state?.paused);
+      const manualPending = this.manualActive(stateSources[0]);
       const pause = iconButton(
         controls,
-        paused ? "play" : "pause",
-        `${paused ? "Resume" : "Pause"} ${title}`,
+        "pause",
+        `${manualPending ? "Pause manual recognition" : paused ? "Resume automatic updates" : "Pause automatic updates"}: ${title}`,
         () => {
           if (paused && this.c.progress.stateBlocked) return new Notice(this.stateBlockedMessage());
-          safe(
-            rule.paused
-              ? this.c.setSourcePaused(rule.id, false)
-              : state?.paused
-                ? this.c.setNotebookPaused(stateSources[0], false)
-                : this.c.setSourcePaused(rule.id, true),
-          );
+          if (manualPending) safe(this.c.setNotebookPaused(stateSources[0], true));
+          else safe(rule.paused
+            ? this.c.setSourcePaused(rule.id, false)
+            : state?.paused
+              ? this.c.setNotebookPaused(stateSources[0], false)
+              : this.c.setSourcePaused(rule.id, true));
         },
         "st-source-pause",
       );
+      pause.setAttribute("aria-pressed", String(paused));
       pause.dataset.notebookId = stateSources[0];
-      pause.disabled = !!this.c.progress.stateBlocked && paused;
+      pause.disabled = !!this.c.progress.stateBlocked && paused && !manualPending;
+      this.renderRecognizeNow(controls, { source: stateSources[0] }, title);
     } else {
+      const source = stateSources[0];
+      const manualPending = isNotebook
+        ? !!source && this.manualActive(source)
+        : stateSources.some((candidate) => this.manualActive(candidate));
       const pause = iconButton(
         controls,
-        rule.paused ? "play" : "pause",
-        `${rule.paused ? "Resume" : "Pause"} ${title}`,
-        () => safe(this.c.setSourcePaused(rule.id, !rule.paused)),
+        "pause",
+        `${manualPending ? "Pause manual recognition" : rule.paused ? "Resume automatic updates" : "Pause automatic updates"}: ${title}`,
+        () => manualPending
+          ? safe(this.c.setSourcePaused(rule.id, true))
+          : safe(this.c.setSourcePaused(rule.id, !rule.paused)),
         "st-source-pause",
       );
+      pause.setAttribute("aria-pressed", String(!!rule.paused));
       pause.dataset.configId = `${rule.id}:pause`;
-      pause.disabled = !!this.c.progress.stateBlocked && !!rule.paused;
+      pause.disabled = !!this.c.progress.stateBlocked && !!rule.paused && !manualPending;
+      this.renderRecognizeNow(controls, isNotebook && source ? { source } : { ruleId: rule.id }, title, !rule.enabled);
     }
     const configure = iconButton(
       controls,
@@ -1690,7 +1910,7 @@ class MirrorsModal extends Modal {
       this.makeNotebookOpenable(row, rule.id, stateSources[0]);
     else {
       row.setAttribute("role", "group");
-      if (!isNotebook && stateSources.length) {
+      if (!isNotebook) {
         const expanded = this.expandedRules.has(rule.id);
         const disclosure = iconButton(
           controls,
@@ -1764,26 +1984,44 @@ class MirrorsModal extends Modal {
     if (reason && reason !== view.caption)
       el(meta, "p", reason, "st-caption st-attention-reason");
     progressBar(row, view, `${shortPath(state.source)} pages ready`);
+    const issues = currentPageIssues(state).filter((issue) => issue.status !== "skipped");
+    if (canRecoverTranscriptEdits(state) || issues.length || this.canForceUpdate(state)) {
+      const actions = el(row, "div", undefined, "st-source-actions");
+      if (canRecoverTranscriptEdits(state))
+        btn(actions, "Resolve edits", () => this.openRecovery(state.source), "st-button st-text-button st-recovery-action");
+      else if (issues.length)
+        btn(actions, "Review pages", () => {
+          this.selectedRule = state.ruleId;
+          this.selectedSource = state.source;
+          this.detailReturnScreen = "home";
+          this.screen = "detail";
+          this.render();
+        }, "st-button st-text-button st-review-pages");
+      this.renderForceUpdateAction(actions, state);
+    }
     const controls = el(row, "div", undefined, "st-row-controls");
+    const manualPending = this.manualActive(state.source);
+    const paused = !!(rule.paused || state.paused);
     const pause = iconButton(
       controls,
-      state.paused ? "play" : "pause",
-      `${state.paused ? "Resume" : "Pause"} ${title}`,
+      "pause",
+      `${manualPending ? "Pause manual recognition" : paused ? "Resume automatic updates" : "Pause automatic updates"}: ${title}`,
       () => {
-        if (state.paused && this.c.progress.stateBlocked) return new Notice(this.stateBlockedMessage());
-        safe(this.c.setNotebookPaused(state.source, !state.paused));
+        if (paused && this.c.progress.stateBlocked && !manualPending) return new Notice(this.stateBlockedMessage());
+        if (manualPending) safe(this.c.setNotebookPaused(state.source, true));
+        else if (rule.paused) safe(this.c.setSourcePaused(rule.id, false));
+        else safe(this.c.setNotebookPaused(state.source, !state.paused));
       },
       "st-source-pause",
     );
+    pause.setAttribute("aria-pressed", String(paused));
     pause.dataset.notebookId = state.source;
     if (rule.paused) {
-      pause.disabled = true;
-      pause.setAttribute(
-        "aria-label",
-        `Resume ${base(rule.source)} to continue ${title}`,
-      );
+      pause.disabled = !manualPending;
+      if (!manualPending) pause.setAttribute("aria-label", `Resume automatic updates: ${base(rule.source)} to continue ${title}`);
     }
-    if (this.c.progress.stateBlocked && state.paused) pause.disabled = true;
+    if (this.c.progress.stateBlocked && state.paused && !manualPending) pause.disabled = true;
+    this.renderRecognizeNow(controls, { source: state.source }, title, !rule.enabled);
     iconButton(
       controls,
       "info",
@@ -2010,6 +2248,32 @@ class MirrorsModal extends Modal {
     const sharedMirrorField = el(sourceSection, "div", undefined, "st-shared-mirror-field");
     void this.renderSharedMirrors(sharedMirrorField, r);
 
+    const digestSection = el(root, "section", undefined, "st-form-section st-digest-settings");
+    el(digestSection, "h2", "Digests", "st-section-heading");
+    const digestRule = r as FolderRule & { digestCategoryName?: string };
+    const hasDigestCategoryOverride = typeof digestRule.digestCategoryName === "string";
+    this.toggle(
+      digestSection,
+      "Use source-specific Digest category",
+      hasDigestCategoryOverride,
+      (enabled) => {
+        if (enabled) digestRule.digestCategoryName ??= "";
+        else delete digestRule.digestCategoryName;
+        this.render();
+      },
+      "By default, this source inherits MD Reader’s category. A blank override selects Uncategorized.",
+    );
+    if (hasDigestCategoryOverride) {
+      const category = this.text(
+        digestSection,
+        "Digest category name",
+        digestRule.digestCategoryName!,
+        (value) => { digestRule.digestCategoryName = value; },
+        "Use the exact native category name. Blank selects Uncategorized.",
+      );
+      category.maxLength = 128;
+    }
+
     const outputSection = el(root, "section", undefined, "st-form-section st-output-section");
     el(outputSection, "h2", "Markdown", "st-section-heading");
     const outputChoice = el(outputSection, "div", undefined, "st-output-choice");
@@ -2018,7 +2282,7 @@ class MirrorsModal extends Modal {
       "Output folder",
       r.output,
       (v) => (r.output = v),
-      "Choose a vault folder or enter a new path.",
+      `Transcripts stay under Supernote Transcripts. Plugin support data lives in ${this.supportFolderPath()}, which can sync with the vault and can be excluded from Search.`,
     );
     const outputField = outputFolderInput.closest<HTMLElement>(".st-field");
     outputField?.classList.add("st-output-folder-field");
@@ -2028,6 +2292,7 @@ class MirrorsModal extends Modal {
       outputControls,
       "Choose folder",
       () => {
+        this.folderPickerPurpose = "output";
         this.outputPickerPath = "";
         this.outputFolderSearch = "";
         this.outputFolderName = "";
@@ -2042,12 +2307,33 @@ class MirrorsModal extends Modal {
     const ruleWithAutomatic = r as FolderRule & { autoRecognize?: boolean };
     this.toggle(
       transcription,
-      "Automatically recognize new and changed pages",
+      "Automatic updates",
       ruleWithAutomatic.autoRecognize !== false,
-      (value) => { ruleWithAutomatic.autoRecognize = value; },
+      (value) => { ruleWithAutomatic.autoRecognize = value; this.render(); },
       this.c.autoEnabled
-        ? "Automatic updates are enabled on this device. Turn this off for manual updates only."
+        ? "Automatic updates are enabled on this device. Turn this off for manual updates only. The check mode below controls what automatic catch-up inspects."
         : "Automatic updates are off on this device. Manual Update remains available.",
+    );
+    const automaticRule = r as FolderRule & { automaticCheck?: "new" | "recent" | "all"; automaticCheckRecentPages?: number };
+    const automaticDefaults = this.c.config as typeof this.c.config & { automaticCheck?: "new" | "recent" | "all"; automaticCheckRecentPages?: number };
+    const inheritAutomatic = automaticRule.automaticCheck === undefined;
+    if (ruleWithAutomatic.autoRecognize !== false) this.toggle(transcription, "Use default automatic checks", inheritAutomatic, (value) => {
+      if (value) {
+        automaticRule.automaticCheck = undefined;
+        automaticRule.automaticCheckRecentPages = undefined;
+      } else {
+        automaticRule.automaticCheck = automaticDefaults.automaticCheck ?? "new";
+        automaticRule.automaticCheckRecentPages = automaticDefaults.automaticCheckRecentPages ?? 5;
+      }
+      this.render();
+    }, "Sources inherit the setting under Settings · Updates until you choose a source override.");
+    if (ruleWithAutomatic.autoRecognize !== false && !inheritAutomatic) this.automaticCheckControl(
+      transcription,
+      automaticRule.automaticCheck ?? "new",
+      (value) => { automaticRule.automaticCheck = value; },
+      automaticRule.automaticCheckRecentPages ?? automaticDefaults.automaticCheckRecentPages ?? 5,
+      (value) => { automaticRule.automaticCheckRecentPages = value; },
+      "Automatic checks",
     );
     const sourceProfile = el(transcription, "section", undefined, "st-source-profile-mode");
     this.toggle(
@@ -2204,7 +2490,7 @@ class MirrorsModal extends Modal {
         option.value = mirror.id;
       }
       select.value = rule.sharedId ?? "";
-      this.help(field, "Link this local source to a shared logical mirror across your devices. Keep each device's Obsidian configuration folder separate; syncing one profile can overwrite local source paths, settings, and queue state. Shared Data and Markdown transcripts are the cross-device content.", "Shared mirror");
+      this.help(field, `Link this local source to a shared logical mirror across your devices. Keep each device's Obsidian configuration folder separate; syncing one profile can overwrite local source paths, settings, and queue state. Shared data is stored in ${this.supportFolderPath()} and syncs with the vault; exclude that folder from Search. Markdown transcripts stay under Supernote Transcripts.`, "Shared mirror");
       const consequence = el(field, "small", "Saving to a different existing mirror replaces this source’s recognition profile, folder selection and exclusions with the shared versions. Local edits to those settings may be discarded.", "st-shared-mirror-warning");
       consequence.hidden = !select.value || select.value === originalSharedId;
       select.addEventListener("change", () => {
@@ -2425,6 +2711,7 @@ class MirrorsModal extends Modal {
       try {
         r.source = validateSource(r.source);
         r.output = validateDestination(r.output.trim());
+        if (this.isOperationalDataPath(r.output)) throw Error("Choose a transcript output folder outside the support folder, which is reserved for plugin data.");
         const generalProfileId = this.c.config.profiles.find((profile) => profile.id === "general")?.id ?? "general";
         const custom =
           this.prompt !== p.prompt ||
@@ -2524,7 +2811,7 @@ class MirrorsModal extends Modal {
       id: crypto.randomUUID(),
       enabled: true,
       source: path,
-      output: "Supernote Transcripts/Transcripts",
+      output: TRANSCRIPTS_ROOT,
       recursive: !path.toLowerCase().endsWith(".note"),
       exclude: [],
       profileId: p.id,
@@ -2578,7 +2865,7 @@ class MirrorsModal extends Modal {
         id: crypto.randomUUID(),
         enabled: true,
         source,
-        output: "Supernote Transcripts/Transcripts",
+        output: TRANSCRIPTS_ROOT,
         recursive: !source.toLowerCase().endsWith(".note"),
         exclude: [],
         profileId: profile.id,
@@ -2852,18 +3139,19 @@ class MirrorsModal extends Modal {
     const parts = this.outputPickerPath.split("/").filter(Boolean);
     if (parts.length) {
       const breadcrumbs = el(root, "nav", undefined, "st-browser-breadcrumbs");
-      breadcrumbs.setAttribute("aria-label", "Output folder path");
+      breadcrumbs.setAttribute("aria-label", this.folderPickerPurpose === "support" ? "Support folder path" : "Output folder path");
       const up = btn(breadcrumbs, "Up", () => {
         this.outputPickerPath = parts.slice(0, -1).join("/");
         this.render();
       }, "st-browser-crumb st-browser-up");
-      up.setAttribute("aria-label", `Up to ${parts.length > 1 ? parts.slice(0, -1).join("/") : "output root"}`);
-      const rootCrumb = btn(breadcrumbs, "Output root", () => {
+      const rootLabel = this.folderPickerPurpose === "support" ? "vault root" : "output root";
+      up.setAttribute("aria-label", `Up to ${parts.length > 1 ? parts.slice(0, -1).join("/") : rootLabel}`);
+      const rootCrumb = btn(breadcrumbs, this.folderPickerPurpose === "support" ? "Vault root" : "Output root", () => {
         this.outputPickerPath = "";
         this.render();
       }, "st-browser-crumb st-browser-root");
-      rootCrumb.setAttribute("aria-label", "Choose output folder root");
-      rootCrumb.setAttribute("title", "Return to the output folder root");
+      rootCrumb.setAttribute("aria-label", this.folderPickerPurpose === "support" ? "Browse from vault root" : "Choose output folder root");
+      rootCrumb.setAttribute("title", this.folderPickerPurpose === "support" ? "Return to the vault root" : "Return to the output folder root");
       for (let index = 0; index < parts.length; index++) {
         el(breadcrumbs, "span", "›", "st-browser-separator");
         const path = parts.slice(0, index + 1).join("/");
@@ -2882,19 +3170,30 @@ class MirrorsModal extends Modal {
       actions,
       "Cancel",
       () => {
-        this.screen = "editor";
+        this.screen = this.folderPickerPurpose === "support" ? "settings" : "editor";
+        if (this.folderPickerPurpose === "support") this.settingsTab = "storage";
         this.render();
       },
       "st-button st-text-button",
     );
-    btn(actions, "Create", () => this.openOutputFolderCreate(), "st-button st-text-button st-create-folder-open");
+    if (this.folderPickerPurpose === "output")
+      btn(actions, "Create", () => this.openOutputFolderCreate(), "st-button st-text-button st-create-folder-open");
     const choose = btn(
       actions,
-      "Choose this folder",
+      this.folderPickerPurpose === "support" ? "Use this folder" : "Choose this folder",
       () => {
-        if (!this.outputPickerPath || !this.editorRule) return;
-        this.editorRule.output = this.outputPickerPath;
-        this.screen = "editor";
+        if (!this.outputPickerPath) return;
+        if (this.folderPickerPurpose === "support") {
+          const d = this.settingsDraft;
+          if (!d) return;
+          d.supportFolder = this.outputPickerPath;
+          this.settingsTab = "storage";
+          this.screen = "settings";
+        } else {
+          if (!this.editorRule) return;
+          this.editorRule.output = this.outputPickerPath;
+          this.screen = "editor";
+        }
         this.render();
       },
       "st-button st-primary",
@@ -2943,7 +3242,7 @@ class MirrorsModal extends Modal {
         return;
       allFolders = [...new Set(result.folders)]
         .filter(
-          (folder) => !folder.split("/").some((part) => part.startsWith(".")),
+          (folder) => !folder.split("/").some((part) => part.startsWith(".")) && !this.isOperationalDataPath(this.outputPickerPath ? `${this.outputPickerPath}/${folder}` : folder),
         )
         .sort((a, b) => a.localeCompare(b));
       drawFolders(allFolders);
@@ -2965,6 +3264,7 @@ class MirrorsModal extends Modal {
     const path = [parentPath, name].filter(Boolean).join("/");
     try {
       validateDestination(path);
+      if (this.isOperationalDataPath(path)) throw new Error("The support folder is reserved for plugin data.");
       if (this.app.vault.getAbstractFileByPath(path))
         throw new Error("A file or folder with that name already exists here.");
       this.outputFolderCreateBusy = true;
@@ -3025,6 +3325,13 @@ class MirrorsModal extends Modal {
   }
   private isDesktop() {
     return (this.c as Controller & { platform?: string }).platform === "desktop";
+  }
+  private isOperationalDataPath(path: string) {
+    return (isDataPath as (path: string, supportRoot?: string) => boolean)(path, this.supportFolderPath());
+  }
+  private supportFolderPath() {
+    const config = this.c.config as typeof this.c.config & { supportFolder?: string };
+    return config.supportFolder ?? "_supernote";
   }
   private sourceLabel(path: string) {
     return !this.isDesktop() ? shortPath(path) : path || "Computer";
@@ -3188,7 +3495,41 @@ class MirrorsModal extends Modal {
     const d = this.settingsDraft;
     if (!d) return;
     const root = el(this.body, "section", undefined, "st-form");
-    const connection = el(root, "section", undefined, "st-settings-section st-settings-connection");
+    const tabList = el(root, "nav", undefined, "st-view-tabs st-settings-tabs");
+    tabList.setAttribute("role", "tablist");
+    tabList.setAttribute("aria-label", "Settings sections");
+    const addPanel = (key: "connection" | "recognition" | "updates" | "storage", label: string) => {
+      const tab = btn(tabList, label, () => this.selectSettingsTab(key), `st-view-tab st-settings-tab${this.settingsTab === key ? " is-active" : ""}`);
+      tab.dataset.settingsTab = key;
+      tab.setAttribute("role", "tab");
+      tab.setAttribute("aria-selected", String(this.settingsTab === key));
+      tab.setAttribute("aria-controls", `st-settings-panel-${key}`);
+      tab.id = `st-settings-tab-${key}`;
+      tab.tabIndex = this.settingsTab === key ? 0 : -1;
+      tab.addEventListener("keydown", (event) => {
+        const keys = ["connection", "recognition", "updates", "storage"] as const;
+        const current = keys.indexOf(key);
+        const next = event.key === "ArrowRight" ? (current + 1) % keys.length
+          : event.key === "ArrowLeft" ? (current + keys.length - 1) % keys.length
+          : event.key === "Home" ? 0
+          : event.key === "End" ? keys.length - 1
+          : -1;
+        if (next < 0) return;
+        event.preventDefault();
+        this.selectSettingsTab(keys[next]);
+      });
+      const panel = el(root, "section", undefined, `st-settings-panel st-settings-panel-${key}`);
+      panel.id = `st-settings-panel-${key}`;
+      panel.setAttribute("role", "tabpanel");
+      panel.setAttribute("aria-labelledby", tab.id);
+      panel.hidden = this.settingsTab !== key;
+      return panel;
+    };
+    const connectionPanel = addPanel("connection", "Connection");
+    const recognitionPanel = addPanel("recognition", "Recognition");
+    const updatesPanel = addPanel("updates", "Updates");
+    const storagePanel = addPanel("storage", "Storage");
+    const connection = el(connectionPanel, "section", undefined, "st-settings-section st-settings-connection");
     el(connection, "h2", "Connection", "st-section-heading");
     const controller = this.c as Controller & {
       provider?: "api" | "subscription";
@@ -3440,14 +3781,7 @@ class MirrorsModal extends Modal {
         }
       }
     }
-    btn(
-      connection,
-      "Costs and limits",
-      () => this.openCosts(),
-      "st-button st-text-button",
-    );
-
-    const runBehavior = el(root, "section", undefined, "st-form-section st-settings-section st-run-behavior");
+    const runBehavior = el(updatesPanel, "section", undefined, "st-form-section st-settings-section st-run-behavior");
     el(runBehavior, "h2", "Updates", "st-section-heading");
     this.toggle(
       runBehavior,
@@ -3463,11 +3797,12 @@ class MirrorsModal extends Modal {
       (v) => (d.autoEnabled = v),
       "Runs while Obsidian is active",
     );
+    this.automaticCheckControl(runBehavior, d.automaticCheck, (value) => { d.automaticCheck = value; }, d.automaticCheckRecentPages, (value) => { d.automaticCheckRecentPages = value; });
     this.number(runBehavior, "Simultaneous requests", d.concurrency, 1, 32, (v) => (d.concurrency = v));
     this.number(runBehavior, "Check interval (minutes)", d.intervalMinutes, 1, 60, (v) => (d.intervalMinutes = v));
     const general = d.profiles.find((p) => p.id === "general") ?? d.profiles[0];
     if (general) {
-      const defaults = el(root, "section", undefined, "st-form-section st-settings-section st-recognition-defaults");
+      const defaults = el(recognitionPanel, "section", undefined, "st-form-section st-settings-section st-recognition-defaults");
       el(defaults, "h2", "Recognition", "st-section-heading");
       el(defaults, "p", "Used by sources without custom recognition settings.", "st-caption st-section-help");
       this.modelPicker(defaults, "Default model", general.model, (v) => (general.model = v));
@@ -3495,12 +3830,12 @@ class MirrorsModal extends Modal {
       formattingGuide.maxLength = 10_000;
       formattingGuide.disabled = !formattingEnabled;
     }
-    const cleanupDefaults = el(root, "section", undefined, "st-form-section st-settings-section st-cleanup-defaults");
+    const cleanupDefaults = el(recognitionPanel, "section", undefined, "st-form-section st-settings-section st-cleanup-defaults");
     el(cleanupDefaults, "h2", "Document cleanup", "st-section-heading");
     el(cleanupDefaults, "p", "Used for every cleanup run. Per-run instructions are added to this guidance.", "st-caption st-section-help");
     const defaultCleanupPrompt = this.textarea(cleanupDefaults, "Default cleanup instructions", d.cleanupPrompt, (value) => { d.cleanupPrompt = value; });
     defaultCleanupPrompt.maxLength = 20000;
-    const presentation = el(root, "section", undefined, "st-form-section st-settings-section st-settings-presentation");
+    const presentation = el(recognitionPanel, "section", undefined, "st-form-section st-settings-section st-settings-presentation");
     el(presentation, "h2", "Appearance", "st-section-heading");
     const pageHeadings = this.toggle(
       presentation,
@@ -3512,8 +3847,42 @@ class MirrorsModal extends Modal {
         : "Presentation only; changing this does not run recognition again.",
     );
     pageHeadings.disabled = (general?.preserveFormatting ?? true) === true;
-    const storage = el(root, "section", undefined, "st-form-section st-settings-section st-settings-storage");
+    const storage = el(storagePanel, "section", undefined, "st-form-section st-settings-section st-settings-storage");
     el(storage, "h2", "Storage", "st-section-heading");
+    el(storage, "p", "Choose where plugin support files live. They stay separate from readable transcripts.", "st-caption st-section-help");
+    const supportFolderInput = this.text(
+      storage,
+      "Support folder",
+      d.supportFolder,
+      (value) => { d.supportFolder = value; },
+      "A normal folder path inside this vault. Obsidian Sync may not sync dot-prefixed folders; use an underscore name such as _supernote for synced support data.",
+    );
+    const supportFolderField = supportFolderInput.closest<HTMLElement>(".st-field");
+    supportFolderField?.classList.add("st-support-folder-field");
+    const supportFolderControls = el(supportFolderField ?? storage, "div", undefined, "st-support-folder-controls");
+    supportFolderControls.append(supportFolderInput);
+    btn(supportFolderControls, "Choose folder", () => {
+      this.folderPickerPurpose = "support";
+      this.outputPickerPath = "";
+      this.outputFolderSearch = "";
+      this.browserError = "";
+      this.screen = "output-folders";
+      this.render();
+    }, "st-button st-text-button st-support-folder-choose");
+    this.toggle(
+      storage,
+      "Hide support folder in File Explorer",
+      d.hideSupportFolderInExplorer,
+      (value) => { d.hideSupportFolderInExplorer = value; },
+      "Hides plugin support files from Obsidian’s file list. It does not hide transcript Markdown.",
+    );
+    this.toggle(
+      storage,
+      "Exclude support files from Search and Quick Switcher",
+      d.excludeSupportFilesFromSearch,
+      (value) => { d.excludeSupportFilesFromSearch = value; },
+      "Keeps plugin data out of native Search and Quick Switcher results. It does not affect transcript files.",
+    );
     el(storage, "p", "Review saved recognition history and cached source data. Cleanup is always started manually.", "st-caption");
     btn(storage, "Review storage", () => this.openStorage(), "st-button st-text-button st-review-storage");
     const actions = el(this.footer, "div", undefined, "st-actions");
@@ -3536,7 +3905,32 @@ class MirrorsModal extends Modal {
             aiEnabled: boolean;
             provider: "api" | "subscription";
             concurrency: number;
+            storagePreferences?: () => { hideInExplorer: boolean; excludeFromSearch: boolean };
+            setStoragePreferences?: (prefs: { hideInExplorer: boolean; excludeFromSearch: boolean }) => Promise<void>;
           };
+          const supportFolder = d.supportFolder.trim().replace(/\\/g, "/").replace(/\/+$/, "");
+          try {
+            validateDestination(supportFolder);
+            const currentSupportFolder = this.supportFolderPath();
+            if (this.isOperationalDataPath(supportFolder) && supportFolder.toLowerCase() !== currentSupportFolder.toLowerCase() && supportFolder.toLowerCase() !== "_supernote")
+              throw new Error("Choose a folder outside reserved plugin data locations.");
+          } catch (error) {
+            new Notice(`Invalid support folder: ${err(error)}`);
+            this.setFormControlsDisabled(false);
+            return;
+          }
+          d.supportFolder = supportFolder;
+          const currentStoragePreferences = controller.storagePreferences?.() ?? {
+            hideInExplorer: true,
+            excludeFromSearch: true,
+          };
+          const storagePreferencesChanged = currentStoragePreferences.hideInExplorer !== d.hideSupportFolderInExplorer ||
+            currentStoragePreferences.excludeFromSearch !== d.excludeSupportFilesFromSearch;
+          if (storagePreferencesChanged && !controller.setStoragePreferences) {
+            new Notice("Storage visibility settings are unavailable in this runtime.");
+            this.setFormControlsDisabled(false);
+            return;
+          }
           let nextProfiles: Profile[];
           try {
             nextProfiles = mergeProfileDrafts(
@@ -3559,6 +3953,9 @@ class MirrorsModal extends Modal {
             intervalMinutes: this.c.config.intervalMinutes,
             showPageHeadings: this.c.showPageHeadings,
             cleanupPrompt: (this.c.config as typeof this.c.config & { cleanupPrompt?: string }).cleanupPrompt,
+            automaticCheck: (this.c.config as typeof this.c.config & { automaticCheck?: "new" | "recent" | "all" }).automaticCheck,
+            automaticCheckRecentPages: (this.c.config as typeof this.c.config & { automaticCheckRecentPages?: number }).automaticCheckRecentPages,
+            supportFolder: (this.c.config as typeof this.c.config & { supportFolder?: string }).supportFolder,
           };
           const appliedProfiles = JSON.stringify(nextProfiles);
           this.c.apiKey = d.apiKey;
@@ -3571,11 +3968,27 @@ class MirrorsModal extends Modal {
           this.c.showPageHeadings = d.showPageHeadings;
           const configWithCleanup = this.c.config as typeof this.c.config & { cleanupPrompt?: string };
           configWithCleanup.cleanupPrompt = d.cleanupPrompt.trim() ? d.cleanupPrompt : undefined;
+          const automaticConfig = this.c.config as typeof this.c.config & { automaticCheck?: "new" | "recent" | "all"; automaticCheckRecentPages?: number };
+          automaticConfig.automaticCheck = d.automaticCheck === "new" ? undefined : d.automaticCheck;
+          automaticConfig.automaticCheckRecentPages = d.automaticCheckRecentPages === 5 ? undefined : d.automaticCheckRecentPages;
+          const storageConfig = this.c.config as typeof this.c.config & { supportFolder?: string };
+          storageConfig.supportFolder = supportFolder === "_supernote" ? undefined : supportFolder;
+          let configSaved = false;
           try {
             await this.saveConfigQueued();
+            configSaved = true;
+            if (storagePreferencesChanged)
+              await controller.setStoragePreferences!({
+                hideInExplorer: d.hideSupportFolderInExplorer,
+                excludeFromSearch: d.excludeSupportFilesFromSearch,
+              });
             this.settingsDraft = undefined;
             this.goBack();
           } catch (error) {
+            if (configSaved) {
+              new Notice(`Settings were saved, but storage visibility could not be applied: ${err(error)}`);
+              return;
+            }
             if (this.c.apiKey === d.apiKey) this.c.apiKey = previous.apiKey;
             if (controller.aiEnabled === d.aiEnabled) controller.aiEnabled = previous.aiEnabled;
             if (this.c.autoEnabled === d.autoEnabled) this.c.autoEnabled = previous.autoEnabled;
@@ -3589,6 +4002,12 @@ class MirrorsModal extends Modal {
               this.c.showPageHeadings = previous.showPageHeadings;
             if (configWithCleanup.cleanupPrompt === (d.cleanupPrompt.trim() ? d.cleanupPrompt : undefined))
               configWithCleanup.cleanupPrompt = previous.cleanupPrompt;
+            if (automaticConfig.automaticCheck === (d.automaticCheck === "new" ? undefined : d.automaticCheck))
+              automaticConfig.automaticCheck = previous.automaticCheck;
+            if (automaticConfig.automaticCheckRecentPages === (d.automaticCheckRecentPages === 5 ? undefined : d.automaticCheckRecentPages))
+              automaticConfig.automaticCheckRecentPages = previous.automaticCheckRecentPages;
+            if (storageConfig.supportFolder === (supportFolder === "_supernote" ? undefined : supportFolder))
+              storageConfig.supportFolder = previous.supportFolder;
             new Notice(err(error));
           } finally {
             this.setFormControlsDisabled(false);
@@ -4197,6 +4616,7 @@ class MirrorsModal extends Modal {
     this.pageIssuesLive = el(this.body, "section", undefined, "st-page-issues");
     this.refreshPageIssues(this.displayStore.notebooks[this.selectedSource]);
     this.refreshDetail();
+    this.renderReconciliationSummary(this.body, this.selectedSource);
     const controls = el(this.body, "section", undefined, "st-detail-controls");
     const state = this.displayStore.notebooks[this.selectedSource];
     btn(
@@ -4217,6 +4637,11 @@ class MirrorsModal extends Modal {
       `Revision ${state.revision || "not indexed"} · saved ${state.lastSaved || "never"}`,
       "st-caption",
     );
+    const checkTimes = state as typeof state & { lastAutomaticCheck?: string; lastFullCheck?: string };
+    if (checkTimes.lastAutomaticCheck || checkTimes.lastFullCheck) {
+      const formatCheckTime = (value?: string) => value ? (Number.isNaN(Date.parse(value)) ? value : new Date(value).toLocaleString()) : "never";
+      el(technical, "p", `Automatic check ${formatCheckTime(checkTimes.lastAutomaticCheck)} · full check ${formatCheckTime(checkTimes.lastFullCheck)}`, "st-caption st-check-timestamps");
+    }
     const recognitionHistory = el(details, "details", undefined, "st-recognition-history");
     el(recognitionHistory, "summary", "Page recognition history");
     const recognizedPages = state.desired.filter((page) => {
@@ -4246,6 +4671,211 @@ class MirrorsModal extends Modal {
     if (deviceOcrPages) {
       el(technical, "p", `Device OCR is available for ${deviceOcrPages} page${deviceOcrPages === 1 ? "" : "s"}; it is separate from saved AI recognition.`, "st-caption");
     }
+  }
+  private renderReconciliationSummary(parent: HTMLElement, source: string) {
+    const root = el(parent, "section", undefined, "st-reconciliation-summary");
+    root.hidden = true;
+    this.reconciliationSummary = root;
+    this.refreshReconciliationSummary(source);
+  }
+  private refreshReconciliationSummary(source: string) {
+    const controller = this.c as ReconciliationController;
+    const summary = this.reconciliationSummary;
+    if (!summary || !controller.getReconciliationConflicts) return;
+    const request = ++this.reconciliationRequest;
+    void Promise.resolve()
+      .then(() => controller.getReconciliationConflicts.call(this.c, source))
+      .then((conflicts) => {
+        if (
+          request !== this.reconciliationRequest ||
+          !summary.isConnected ||
+          this.screen !== "detail" ||
+          this.selectedSource !== source
+        ) return;
+        summary.empty();
+        if (!conflicts.length) {
+          summary.hidden = true;
+          return;
+        }
+        summary.hidden = false;
+        el(summary, "p", `${conflicts.length} page${conflicts.length === 1 ? " has" : "s have"} edits that differ from the new recognition.`, "st-summary-title");
+        el(summary, "p", "Review these existing pages before choosing which text to keep. New pages are kept automatically.", "st-caption");
+        btn(
+          summary,
+          "Review changes",
+          () => this.openPageReconciliation(source),
+          "st-button st-text-button st-review-reconciliation",
+        );
+      })
+      .catch(() => {
+        if (
+          request !== this.reconciliationRequest ||
+          !summary.isConnected ||
+          this.screen !== "detail" ||
+          this.selectedSource !== source
+        ) return;
+        summary.empty();
+        summary.hidden = false;
+        el(summary, "p", "Could not check for page changes.", "st-caption st-attention-reason");
+        btn(summary, "Try again", () => this.refreshReconciliationSummary(source), "st-button st-text-button st-review-reconciliation-retry");
+      });
+  }
+  private openPageReconciliation(source: string) {
+    if (!this.displayStore.notebooks[source]) return;
+    this.reconciliationSource = source;
+    this.reconciliationConflicts = [];
+    this.reconciliationError = "";
+    this.reconciliationLoading = true;
+    this.reconciliationBusyPage = "";
+    this.reconciliationChoiceBusy = undefined;
+    this.screen = "page-reconciliation";
+    this.render();
+    void this.loadPageReconciliation(source);
+  }
+  private async loadPageReconciliation(source: string) {
+    const controller = this.c as ReconciliationController;
+    if (!controller.getReconciliationConflicts) {
+      this.reconciliationLoading = false;
+      this.reconciliationError = "Page change review is unavailable in this version.";
+      this.render();
+      return;
+    }
+    const request = ++this.reconciliationRequest;
+    this.reconciliationLoading = true;
+    try {
+      const conflicts = await controller.getReconciliationConflicts.call(this.c, source);
+      if (
+        request !== this.reconciliationRequest ||
+        this.screen !== "page-reconciliation" ||
+        this.reconciliationSource !== source
+      ) return;
+      this.reconciliationConflicts = conflicts;
+      this.reconciliationError = "";
+    } catch {
+      if (
+        request !== this.reconciliationRequest ||
+        this.screen !== "page-reconciliation" ||
+        this.reconciliationSource !== source
+      ) return;
+      this.reconciliationError = "Could not load page changes. Try again.";
+    } finally {
+      if (
+        request === this.reconciliationRequest &&
+        this.screen === "page-reconciliation" &&
+        this.reconciliationSource === source
+      ) {
+        this.reconciliationLoading = false;
+        this.render();
+      }
+    }
+  }
+  private async resolvePageReconciliation(
+    conflict: ReconciliationConflict,
+    choice: ReconciliationChoice,
+  ) {
+    if (this.reconciliationBusyPage || this.c.progress.running) return;
+    const controller = this.c as ReconciliationController;
+    if (!controller.resolveReconciliationConflict || !controller.getReconciliationConflicts) {
+      this.reconciliationError = "Page change review is unavailable in this version.";
+      this.render();
+      return;
+    }
+    const source = this.reconciliationSource;
+    this.reconciliationBusyPage = conflict.pageId;
+    this.reconciliationChoiceBusy = choice;
+    this.reconciliationError = "";
+    this.render();
+    let applied = false;
+    try {
+      await controller.resolveReconciliationConflict.call(
+        this.c,
+        source,
+        conflict.pageId,
+        choice,
+        conflict.fingerprint,
+        conflict.editedText,
+      );
+      applied = true;
+    } catch {
+      this.reconciliationError = "This page may have changed. Refresh the review and check the current text before choosing again.";
+    }
+    if (applied) {
+      try {
+        this.reconciliationConflicts = await controller.getReconciliationConflicts.call(this.c, source);
+      } catch {
+        this.reconciliationError = "Your choice was saved, but the page list could not refresh. Try Refresh changes.";
+      }
+    } else {
+      try {
+        this.reconciliationConflicts = await controller.getReconciliationConflicts.call(this.c, source);
+      } catch {
+        // Keep the reviewed values visible with the stale-data message above.
+      }
+    }
+    this.reconciliationBusyPage = "";
+    this.reconciliationChoiceBusy = undefined;
+    this.render();
+  }
+  private renderPageReconciliation() {
+    const state = this.displayStore.notebooks[this.reconciliationSource];
+    const root = el(this.body, "section", undefined, "st-page-reconciliation");
+    el(root, "h2", "Review page changes", "st-section-heading");
+    if (!state) {
+      el(root, "p", "This notebook is no longer available.", "st-caption");
+      btn(this.footer, "Back to notebook", () => this.goBack(), "st-button st-primary");
+      return;
+    }
+    el(root, "p", shortPath(state.source), "st-caption st-reconciliation-source");
+    el(root, "p", "Only existing pages with edits that differ are listed. New pages are kept automatically. Nothing changes until you choose an action.", "st-caption");
+    if (this.c.progress.running) {
+      el(root, "p", "Wait for active requests to finish before resolving page changes.", "st-caption st-reconciliation-busy");
+    }
+    if (this.reconciliationError) {
+      el(root, "p", this.reconciliationError, "st-error st-reconciliation-error");
+      if (!this.reconciliationBusyPage && !this.reconciliationLoading)
+        btn(root, "Refresh changes", () => void this.loadPageReconciliation(state.source), "st-button st-text-button st-reconciliation-refresh");
+    }
+    if (this.reconciliationLoading) {
+      el(root, "p", "Loading page changes…", "st-caption st-reconciliation-loading");
+    } else if (!this.reconciliationError && !this.reconciliationConflicts.length) {
+      el(root, "p", "No page changes need review.", "st-summary-title st-reconciliation-empty");
+    } else {
+      for (const conflict of this.reconciliationConflicts) {
+        const card = el(root, "article", undefined, "st-page-conflict");
+        el(card, "h3", `Page ${conflict.number}`, "st-page-conflict-heading");
+        const reason = String(conflict.reason || "The edited text differs from the latest recognition.").replace(/\s+/g, " ").trim();
+        el(card, "p", reason.length > 240 ? `${reason.slice(0, 237)}…` : reason, "st-caption st-page-conflict-reason");
+        const versions = el(card, "div", undefined, "st-page-conflict-versions st-recovery-versions");
+        const addVersion = (title: string, text: string) => {
+          const version = el(versions, "section", undefined, "st-page-conflict-version st-recovery-version");
+          el(version, "h4", title, "st-page-conflict-version-title");
+          el(version, "pre", text || "(No text)", "st-page-conflict-text st-recovery-text");
+        };
+        addVersion("Your edits", conflict.editedText);
+        addVersion("New handwriting recognition", conflict.recognizedText);
+        if (conflict.proposedText !== undefined)
+          addVersion("Proposed edit", conflict.proposedText);
+        const actions = el(card, "div", undefined, "st-page-conflict-actions st-actions");
+        const choiceButtons: [ReconciliationChoice, HTMLButtonElement][] = [
+          ["keep-edits", btn(actions, "Keep my edits", () => void this.resolvePageReconciliation(conflict, "keep-edits"), "st-button st-text-button st-reconcile-keep")],
+          ["use-recognition", btn(actions, "Use updated handwriting", () => void this.resolvePageReconciliation(conflict, "use-recognition"), "st-button st-primary st-reconcile-recognition")],
+        ];
+        if (conflict.proposedText !== undefined)
+          choiceButtons.push([
+            "use-proposal",
+            btn(actions, "Use proposed edit", () => void this.resolvePageReconciliation(conflict, "use-proposal"), "st-button st-text-button st-reconcile-proposal"),
+          ]);
+        for (const [choice, action] of choiceButtons) {
+          action.disabled = !!this.reconciliationBusyPage || this.c.progress.running;
+          if (this.reconciliationBusyPage === conflict.pageId && choice === this.reconciliationChoiceBusy) {
+            setText(action, "Saving choice…");
+            action.disabled = true;
+          }
+        }
+      }
+    }
+    const back = btn(this.footer, "Back to notebook", () => this.goBack(), "st-button st-primary st-reconciliation-back");
+    back.disabled = !!this.reconciliationBusyPage;
   }
   private openExcludeConfirmation(source: string) {
     if (!this.displayStore.notebooks[source]) return;
@@ -4347,30 +4977,78 @@ class MirrorsModal extends Modal {
   }
   private renderDocumentActions(parent: HTMLElement, state: Controller["store"]["notebooks"][string]) {
     const controls = el(parent, "section", undefined, "st-document-actions");
-    const actions = el(controls, "div", undefined, "st-document-action-toolbar st-document-action-buttons");
+    const updateGroup = el(controls, "section", undefined, "st-document-action-group st-update-controls");
+    el(updateGroup, "h2", "Update", "st-section-heading");
+    const updateActions = el(updateGroup, "div", undefined, "st-document-action-toolbar st-document-action-buttons st-detail-action-grid");
+    const controller = this.c as RecognitionNowController;
+    const task = this.manualTaskState({ source: state.source });
+    const checkUpdate = btn(
+      updateActions,
+      task.active ? "Recognizing…" : task.queued || task.busy ? "Queued" : "Check & update",
+      () => {
+        if (!controller.requestRecognitionNow || task.active || task.queued || task.busy || this.c.progress.stateBlocked) return;
+        this.recognitionNowBusy.add(task.key);
+        checkUpdate.disabled = true;
+        setText(checkUpdate, "Queueing…");
+        void controller.requestRecognitionNow({ source: state.source }).then(() => {
+          if (this.screen === "detail" && this.selectedSource === state.source) this.render();
+        }).catch((error) => {
+          new Notice(`Could not queue notebook update: ${err(error)}`);
+        }).finally(() => {
+          this.recognitionNowBusy.delete(task.key);
+          if (this.screen === "detail" && this.selectedSource === state.source) this.render();
+        });
+      },
+      "st-button st-primary st-check-update-action",
+    );
+    checkUpdate.disabled = !controller.requestRecognitionNow || task.active || task.queued || task.busy || !!this.c.progress.stateBlocked;
+    if (this.c.progress.stateBlocked) checkUpdate.title = this.stateBlockedMessage();
+    const rule = this.c.config.rules.find((item) => item.id === state.ruleId);
+    const manualActive = this.manualActive(state.source);
+    const pause = btn(updateActions, manualActive || !state.paused ? "Pause recognition" : "Resume recognition", () => {
+      const pending = this.actionGate.run(`detail-pause:${state.source}`, async () => {
+        pause.disabled = true;
+        try {
+          if (this.manualActive(state.source)) await this.c.setNotebookPaused(state.source, true);
+          else await this.c.setNotebookPaused(state.source, !state.paused);
+          if (this.screen === "detail" && this.selectedSource === state.source) this.render();
+        } catch (error) {
+          new Notice(`Could not change recognition pause: ${err(error)}`);
+          if (pause.isConnected) pause.disabled = false;
+        }
+      });
+      if (pending) safe(pending);
+    }, "st-button st-pause-recognition-action");
+    pause.setAttribute("aria-pressed", String(manualActive || !!state.paused));
+    pause.disabled = !!this.c.progress.stateBlocked && !!state.paused && !manualActive;
+    if (rule?.paused) pause.title = "Folder automatic updates are paused; Check & update runs this notebook only.";
     if (this.canForceUpdate(state)) {
       const reason = this.forceUpdateReason(state, "This notebook needs attention before its next update.");
-      el(controls, "p", reason, "st-caption st-attention-reason");
-      btn(actions, "Force update", () => this.openForceUpdate(state.source), "st-button st-text-button st-force-update-action");
+      if (reason) el(updateGroup, "p", reason, "st-caption st-attention-reason");
+      btn(updateActions, "Force update", () => this.openForceUpdate(state.source), "st-button st-text-button st-force-update-action");
     }
-    btn(actions, "Clean up document", () => this.openDocumentWorkflow("cleanup", state.source), "st-button st-text-button st-cleanup-open");
-    btn(actions, "Re-recognize pages", () => this.openDocumentWorkflow("reprocess", state.source), "st-button st-text-button st-reprocess-open");
-    btn(actions, "Exclude notebook", () => this.openExcludeConfirmation(state.source), "st-button st-danger st-exclude-open");
-    const history = el(controls, "section", undefined, "st-history-panel");
+    btn(updateActions, "Exclude notebook", () => this.openExcludeConfirmation(state.source), "st-button st-danger st-exclude-open");
+
+    const toolsGroup = el(controls, "section", undefined, "st-document-action-group st-notebook-tools");
+    el(toolsGroup, "h2", "Notebook tools", "st-section-heading");
+    const toolsActions = el(toolsGroup, "div", undefined, "st-document-action-toolbar st-document-action-buttons st-detail-action-grid");
+    btn(toolsActions, "Clean up document", () => this.openDocumentWorkflow("cleanup", state.source), "st-button st-cleanup-open");
+    btn(toolsActions, "Re-recognize pages", () => this.openDocumentWorkflow("reprocess", state.source), "st-button st-reprocess-open");
+    const history = el(toolsGroup, "section", undefined, "st-history-panel");
     history.hidden = true;
     history.id = `st-history-${crypto.randomUUID()}`;
-    const historyToggle = btn(actions, "History", () => {
+    const historyToggle = btn(toolsActions, "History", () => {
       const open = history.hidden;
       history.hidden = !open;
       historyToggle.setAttribute("aria-expanded", String(open));
     }, "st-button st-text-button st-history-details");
     historyToggle.setAttribute("aria-expanded", "false");
     historyToggle.setAttribute("aria-controls", history.id);
-    const controller = this.c as Controller & {
+    const versionController = this.c as Controller & {
       lastVersion?: (source: string) => Promise<{ path: string; createdAt: string } | undefined>;
       restoreLastVersion?: (source: string) => Promise<void>;
     };
-    if (controller.lastVersion && controller.restoreLastVersion) this.renderLastVersion(history, state.source);
+    if (versionController.lastVersion && versionController.restoreLastVersion) this.renderLastVersion(history, state.source);
     else el(history, "p", "Saved transcript history is not available in this runtime.", "st-caption");
   }
   private savedModelFor(source: string) {
@@ -5081,7 +5759,7 @@ class MirrorsModal extends Modal {
       label,
       caption,
       view.ratio,
-      this.forceUpdateReason(state, view.reason),
+      this.detailAttentionReason(state, view.reason),
       currentPageIssues(state),
       state.error,
       this.c.progress.stage,
@@ -5110,7 +5788,7 @@ class MirrorsModal extends Modal {
       if (this.c.progress.detail) el(details, "p", this.c.progress.detail, "st-caption st-working-detail");
       details.open = progressDetailsOpen;
     }
-    const reason = this.forceUpdateReason(state, view.reason);
+    const reason = this.detailAttentionReason(state, view.reason);
     if (reason)
       el(root, "p", reason, "st-caption st-attention-reason");
     if (state.error) {
@@ -5242,6 +5920,51 @@ class MirrorsModal extends Modal {
       setText(summary, qualitySummary(value));
       change(value);
     });
+  }
+  private automaticCheckControl(
+    parent: HTMLElement,
+    mode: "new" | "recent" | "all",
+    change: (value: "new" | "recent" | "all") => void,
+    recentPages: number,
+    changeRecentPages: (value: number) => void,
+    label = "Automatic checks",
+  ) {
+    const field = el(parent, "div", undefined, "st-field st-quality-field st-quality-control st-automatic-check-field st-automatic-check-control");
+    el(field, "span", label);
+    const slider = el(field, "input") as HTMLInputElement;
+    slider.type = "range";
+    slider.min = "0";
+    slider.max = "2";
+    slider.step = "1";
+    const modes = ["new", "recent", "all"] as const;
+    const labels = ["New pages", "Recent edits", "All changes"];
+    slider.value = String(modes.indexOf(mode));
+    slider.setAttribute("aria-label", label);
+    slider.setAttribute("aria-valuetext", labels[modes.indexOf(mode)]);
+    const labelRow = el(field, "div", undefined, "st-quality-labels st-automatic-check-labels");
+    labels.forEach((item) => el(labelRow, "span", item));
+    const summary = el(field, "p", this.automaticCheckSummary(mode), "st-quality-summary st-automatic-check-summary");
+    const recent = this.number(field, "Last N pages", recentPages, 1, 100, changeRecentPages);
+    const recentField = recent.closest(".st-field") as HTMLElement;
+    recentField.classList.add("st-automatic-check-count-field");
+    recentField.querySelector(".st-help-button")?.remove();
+    recent.min = "1";
+    recent.max = "100";
+    recent.step = "1";
+    recent.classList.add("st-automatic-check-recent-pages");
+    recentField.hidden = mode !== "recent";
+    recent.setAttribute("aria-label", "Recent pages to check");
+    this.help(field, "This default is local to this device. Source-specific choices are saved with source settings and sync. New pages checks every page ID and page order, including insertions in the middle, but it cannot detect changed ink on older pages. Recent edits also checks the last N pages and all new page IDs; older ink changes may be missed. All changes scans all page content. Manual Update always checks full content and reuses unchanged cached recognition. If page IDs are missing or ambiguous, automatic checking asks for Manual Update instead of silently scanning everything.", label);
+    slider.addEventListener("input", () => {
+      const value = modes[Number(slider.value)] ?? "new";
+      slider.setAttribute("aria-valuetext", labels[modes.indexOf(value)]);
+      setText(summary, this.automaticCheckSummary(value));
+      recentField.hidden = value !== "recent";
+      change(value);
+    });
+  }
+  private automaticCheckSummary(mode: "new" | "recent" | "all") {
+    return mode === "new" ? "Checks for new pages and page-order changes." : mode === "recent" ? "Checks new pages and recent pages for changed ink." : "Checks all page content for changes.";
   }
   private text(
     parent: HTMLElement,

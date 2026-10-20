@@ -11,10 +11,19 @@ import type {
   NotebookChoice,
   QueueView,
   NotebookDescriptor,
+  OpenNotebook,
+  NotebookCheckOptions,
 } from "./types";
+import { automaticCheckOptions, automaticPageIds, automaticPolicyKey, descriptorCheckMode, validateAutomaticCheck } from "./automatic-check";
+import { digestPreferencesForOutput, validateDigestCategoryName } from "./digest-preferences";
 import { AndroidReadOnlySource } from "./reader";
 import { DesktopReadOnlySource } from "./desktop-reader";
-import { SharedNotebookCache, notebookIdentity, isSharedPath, type SharedIO, type LeaseHandle } from "./shared";
+import { SharedNotebookCache, isSharedPath, type SharedIO, type LeaseHandle } from "./shared";
+import { notebookIdentityFor } from "./notebook-identity";
+import { DATA_ROOT, GLOSSARY_ROOT, TRANSCRIPTS_ROOT, isDataPath, supportPaths } from "./storage-paths";
+import { STORAGE_LOCATOR, decodeStorageLayout, encodeStorageLayout, makeStorageLayout, storageLayoutReady, executeSupportMove, remapSupportReferences, validateSupportDestination, type StorageMoveJournal } from "./support-storage";
+import { planStorageMoves, executeStorageMoves, migrateStructureReferences, consolidateFolder, assertReaderRelocationSafe } from "./structure-migration";
+import { installSupportFileExclusions } from "./support-file-exclusions";
 import { MirrorCatalog, mirrorFingerprint, type PortableMirror } from "./catalog";
 import { portableMirrorEqual, reconcileMirror } from "./mirror-sync";
 import { ChatGPTSession } from "./subscription";
@@ -23,12 +32,13 @@ import { SubscriptionUsage } from "./subscription-usage";
 import { encodeStateSnapshot, loadStateSlots, STATE_STORAGE_BLOCK } from "./state";
 import { interruptedAttempts } from "./attempt-recovery.mjs";
 import { RecognitionFailure, isRecognitionFailure, completedResponse, normalizePageText, isEmptyPage, providerFailure } from "./subscription-stream.mjs";
-import { GENERAL_TRANSCRIPTION_PROMPT, TRANSCRIPTION_RESPONSE_RULES, GROUP_RESPONSE_RULES, recognitionPrompt, resolveFormatting, handwritingFormattingPrompt } from "./prompts.mjs";
+import { GENERAL_TRANSCRIPTION_PROMPT, TRANSCRIPTION_RESPONSE_RULES, GROUP_RESPONSE_RULES, recognitionPrompt, resolveFormatting, handwritingFormattingPrompt, reconciliationInstructions, CONTINUE_PAGE_TEXT, EMPTY_PAGE_TEXT } from "./prompts.mjs";
+import { captureMarkdownEdits, mergePageEdits, validateReconciledText } from "./edit-reconciliation.mjs";
 import { qualitySettings, planRecognitionGroups, contextPages } from "./quality.mjs";
 import { cleanupInput, cleanupPages, DEFAULT_CLEANUP_PROMPT, stripPageComments } from "./cleanup.mjs";
 import { restorePath, readRestore, writeRestore, restoredState } from "./restore";
 import { inspectStorage, cleanStorage } from "./storage";
-import { pageTextLayer } from "./provenance.mjs";
+import { pageTextLayer, displayedPageText } from "./provenance.mjs";
 import { runWorkers } from "./workers.mjs";
 import { inventoryNotebooks, inventoryView } from "./inventory.mjs";
 import { PublicationReceipts, canAdvancePublication, canAdoptPublication, type Receipt } from "./publication";
@@ -58,6 +68,9 @@ import {
 } from "./reconcile.mjs";
 
 const GENERAL_PROMPT = GENERAL_TRANSCRIPTION_PROMPT;
+const pageBody = (text:string) => text.replace(/\r\n?/g,"\n").replace(new RegExp(`^${CONTINUE_PAGE_TEXT}\\s*`),"").trim();
+const pageWithBody = (body:string, original:string) =>
+  (original.startsWith(CONTINUE_PAGE_TEXT)?`${CONTINUE_PAGE_TEXT}\n`:"") + (body || EMPTY_PAGE_TEXT);
 const DEFAULT_PROFILE: Profile = {
   id: "general",
   name: "General — no glossary",
@@ -121,6 +134,19 @@ export default class SupernoteTranscripts extends Plugin implements Controller {
   private stateEstablished = false;
   private writes: Promise<void> = Promise.resolve();
   private task: Promise<unknown> | null = null;
+  private updateOperation = false;
+  private manualSources = new Set<string>();
+  private manualEntries = new Map<string, SourceEntry>();
+  private manualPersistenceCounts = new Map<string, number>();
+  private manualStart: Promise<void> | null = null;
+  private manualCancelRevision=0;
+  private manualAuthorizationRevision=-1;
+  private manualPauseRevisions=new Map<string,number>();
+  private manualOnlyRun = false;
+  private runVisitedSources?:Set<string>;
+  private runEntries?:Map<string,SourceEntry>;
+  private presentationRefreshSources=new Set<string>();
+  private sharedHydrationSources=new Set<string>();
   private pageNavigation?: Promise<void>;
   private previewImages = new Map<string,string>();
   private previewReads = new Map<string,Promise<string>>();
@@ -128,6 +154,7 @@ export default class SupernoteTranscripts extends Plugin implements Controller {
   private disposed = false;
   private scanSources = new Set<string>();
   private inventories=new Map<string,{descriptor?:NotebookDescriptor;error?:unknown}>();
+  private reusableNotebooks=new Map<string,OpenNotebook>();
   private forcedPublication?:{source:string;output:string;hash?:string};
   get displayStore():Store {
     if(!this.inventories.size)return this.store;
@@ -142,6 +169,11 @@ export default class SupernoteTranscripts extends Plugin implements Controller {
   private settingsPersistencePending = false;
   private sharedSettingsTimer?: ReturnType<typeof setTimeout>;
   private sharedCache?: SharedNotebookCache;
+  private activeSupportFolder = DATA_ROOT;
+  private storageMove?: StorageMoveJournal;
+  private supportStorageIssue?: string;
+  private storageVisibilityStyle?: HTMLStyleElement;
+  private get paths(){return supportPaths(this.activeSupportFolder);}
   private historyProtectedSources = new Set<string>();
   private chatGPT?: ChatGPTSession;
   private planUsage?: SubscriptionUsage;
@@ -207,14 +239,14 @@ export default class SupernoteTranscripts extends Plugin implements Controller {
     await this.session.startDesktopPairing();
     const state=this.session.pairing,io=this.sharedIO();
     const deviceId=this.shared?.deviceId;
-    if(state&&io&&deviceId)try {await advertisePairing(io,state,deviceId);}catch{
+    if(state&&io&&deviceId)try {await advertisePairing(io,state,deviceId,Date.now(),this.paths.shared);}catch{
       new Notice("Pairing is ready. Desktop discovery could not be shared; enter its address manually.");
     }
   }
   async discoverSubscriptionDesktops(){
     const io=this.sharedIO();
     if(!io)throw Error("Desktop discovery needs the same synced vault on both devices. You can enter its address manually.");
-    return discoverPairing(io,url=>requestUrl({url,throw:false}));
+    return discoverPairing(io,url=>requestUrl({url,throw:false}),Date.now(),this.paths.shared);
   }
   async stopSubscriptionPairing(){this.session.stopDesktopPairing();}
   async cancelSubscriptionPairing(){await this.session.cancelPairing();}
@@ -243,9 +275,184 @@ export default class SupernoteTranscripts extends Plugin implements Controller {
   private async historyIdentity(state:NotebookState) {
     const rule=this.config.rules.find(r=>r.id===state.ruleId)??ruleFor(state.source,this.config.rules);
     if(!rule)throw Error("Configure this notebook's source before managing its previous version.");
-    const id=await notebookIdentity(rule.sharedId??rule.id,relativeToRule(state.source,rule));
+    const id=await notebookIdentityFor(rule,state.source);
     const title=state.source.split("/").pop()!.replace(/\.note$/i,"");
-    return {id,path:restorePath(id,title)};
+    return {id,path:restorePath(id,title,this.paths.history)};
+  }
+  storagePreferences(){
+    try{
+      const value=JSON.parse(localStorage.getItem(`${this.devicePrefix}:storage-preferences`)??"{}");
+      return {hideInExplorer:value.hideInExplorer!==false,excludeFromSearch:value.excludeFromSearch!==false};
+    }catch{return {hideInExplorer:true,excludeFromSearch:true};}
+  }
+  async setStoragePreferences(preferences:{hideInExplorer:boolean;excludeFromSearch:boolean}){
+    if(typeof preferences.hideInExplorer!=="boolean"||typeof preferences.excludeFromSearch!=="boolean")throw Error("Choose whether support data is visible and searchable on this device.");
+    localStorage.setItem(`${this.devicePrefix}:storage-preferences`,JSON.stringify(preferences));
+    await this.applyStoragePreferences();this.emit();
+  }
+  private async applyStoragePreferences(){
+    const prefs=this.storagePreferences(),vault=this.app.vault as any;
+    if(vault.getConfig&&vault.setConfig){
+      const old=vault.getConfig("userIgnoreFilters");
+      if(old!=null&&!Array.isArray(old))throw Error("Vault search exclusions could not be read safely.");
+      const key=`${this.devicePrefix}:support-ignore-owned`;
+      let owned:string[]=[];
+      try{const saved=JSON.parse(localStorage.getItem(key)??"null");owned=Array.isArray(saved)?saved:[`${DATA_ROOT}/`];}catch{}
+      const normalized=(p:string)=>p.replace(/\/$/,"").toLowerCase();
+      const filters=(old??[]).filter((p:unknown)=>typeof p==="string"&&!owned.some(o=>normalized(o)===normalized(p as string)));
+      const nextOwned:string[]=[];
+      if(prefs.excludeFromSearch)for(const path of [`${this.activeSupportFolder}/`,STORAGE_LOCATOR]){
+        if(!filters.some((p:string)=>normalized(p)===normalized(path))){filters.push(path);nextOwned.push(path);}
+        else if(owned.some(p=>normalized(p)===normalized(path)))nextOwned.push(path);
+      }
+      if(JSON.stringify(filters)!==JSON.stringify(old))await vault.setConfig("userIgnoreFilters",filters);
+      localStorage.setItem(key,JSON.stringify(nextOwned));
+    }
+    if(typeof document.createElement==="function"&&document.head){
+      if(!this.storageVisibilityStyle){
+        const style=document.createElement("style");this.storageVisibilityStyle=style;document.head.appendChild(style);this.register(()=>style.remove());
+      }
+      this.storageVisibilityStyle.textContent=prefs.hideInExplorer
+        ? `.nav-files-container .nav-folder:has(> .nav-folder-title[data-path=${JSON.stringify(this.activeSupportFolder)}]), .nav-files-container .nav-file:has(> .nav-file-title[data-path=${JSON.stringify(STORAGE_LOCATOR)}]) { display: none; }` : "";
+    }
+  }
+  private structureIO(){
+    const a=this.app.vault.adapter;
+    return {exists:(p:string)=>a.exists(p),read:(p:string)=>a.read(p),list:(p:string)=>a.list(p),
+      mkdir:async(p:string)=>{await this.app.vault.createFolder(p);},
+      rename:async(from:string,to:string)=>{const file=this.app.vault.getAbstractFileByPath?.(from);if(file)await this.app.vault.rename(file,to);else await a.rename(from,to);},
+      remove:async(p:string)=>{const file=this.app.vault.getAbstractFileByPath?.(p);if(file)await this.app.vault.delete(file,true);else await a.remove(p);},
+      rmdir:async(p:string)=>{await a.rmdir(p,false);}};
+  }
+  private async writeStorageLayout(layout:import("./support-storage").StorageLayout){
+    const text=encodeStorageLayout(layout),file=this.app.vault.getAbstractFileByPath?.(STORAGE_LOCATOR);
+    if(file)await this.app.vault.modify(file as any,text);
+    else if(await this.app.vault.adapter.exists(STORAGE_LOCATOR))await this.app.vault.adapter.write(STORAGE_LOCATOR,text);
+    else await this.app.vault.create(STORAGE_LOCATOR,text);
+  }
+  private async finishStorageMove(){
+    const journal=this.storageMove;if(!journal)return;
+    await executeSupportMove(this.structureIO(),journal);
+    remapSupportReferences(this.config,this.store,journal.from,journal.to);
+    this.activeSupportFolder=journal.to;this.sharedCache=undefined;
+    this.config.storageRevision=journal.layout.revision;
+    this.supportStorageIssue=undefined;
+    // Keep the journal until both state and locator are durable. Restart can resume a completed rename.
+    await this.persist();await this.persistSettings();
+    if(await this.app.vault.adapter.exists(STORAGE_LOCATOR)){
+      const current=decodeStorageLayout(await this.app.vault.adapter.read(STORAGE_LOCATOR));
+      if(current.revision!==journal.layout.revision&&current.revision!==journal.baseRevision)throw Error("Another device changed the support folder during this move. Both locations were preserved; review Storage before retrying.");
+    }
+    await this.writeStorageLayout(journal.layout);
+    this.storageMove=undefined;this.supportStorageIssue=undefined;
+    await this.persistSettings();await this.applyStoragePreferences();
+  }
+  private async changeSupportFolder(requested:string){
+    if(this.task)throw Error("Pause recognition and wait for active requests before moving support data.");
+    const to=validateSupportDestination(requested,this.config,this.store,this.activeSupportFolder);
+    if(to===this.activeSupportFolder){this.config.supportFolder=to;return;}
+    if(this.storageMove)throw Error("A support-folder move needs to finish first. Reload Obsidian, then review Storage.");
+    const a=this.app.vault.adapter;
+    let remote:import("./support-storage").StorageLayout|undefined;
+    if(await a.exists(STORAGE_LOCATOR)){
+      remote=decodeStorageLayout(await a.read(STORAGE_LOCATOR));
+      if(remote.revision!==this.config.storageRevision||remote.root!==this.activeSupportFolder)throw Error("The shared support location changed on another device. Retry Sync in Sources before choosing a different location.");
+      if([remote.previousRoot,...(remote.previousRoots??[])].some(p=>p.toLowerCase().startsWith(to.toLowerCase()+"/")||to.toLowerCase().startsWith(p.toLowerCase()+"/")))
+        throw Error("Choose a support folder separate from its earlier locations, so delayed Sync files can be recovered safely.");
+    }
+    if(await a.exists(to)){const entries=await a.list(to);if(entries.files.length||entries.folders.length)throw Error("That folder contains files. Choose a new or empty folder so existing files cannot be mixed or overwritten.");}
+    const layout=await makeStorageLayout(this.structureIO(),this.activeSupportFolder,to);
+    layout.previousRoots=[...new Set([...(remote?.previousRoots??[]),...(remote?[remote.previousRoot]:[]),this.activeSupportFolder])];
+    this.config.supportFolder=this.activeSupportFolder;
+    this.storageMove={from:this.activeSupportFolder,to,layout,baseRevision:this.config.storageRevision};
+    try{await this.persistSettings();}catch(error){this.storageMove=undefined;throw error;}
+    // From here Save is committed as a resumable move; do not tell the form to roll back.
+    try{await this.finishStorageMove();}catch(error){
+      this.supportStorageIssue=`Support-folder move needs attention. Existing data was preserved. Reload Obsidian to retry. ${readable(error)}`;
+      this.stage("Storage needs attention",this.supportStorageIssue);
+    }
+  }
+  private async refreshStorageLocation(){
+    if(this.storageMove){await this.finishStorageMove();return;}
+    const a=this.app.vault.adapter;
+    if(!await a.exists(STORAGE_LOCATOR)){this.supportStorageIssue=undefined;return;}
+    const layout=decodeStorageLayout(await a.read(STORAGE_LOCATOR));
+    if(layout.revision===this.config.storageRevision&&layout.root===this.activeSupportFolder){
+      // Sync can deliver an old-root write after we accepted the locator. Keep
+      // collecting those late records instead of stranding paid results there.
+      this.supportStorageIssue=undefined;
+      await this.mergePreviousSupportRoots(layout);
+      return;
+    }
+    if(layout.root!==this.activeSupportFolder&&layout.previousRoot!==this.activeSupportFolder&&!layout.previousRoots?.includes(this.activeSupportFolder))
+      throw Error(`The support folder was changed independently on another device. Both folders were preserved. Review ${this.activeSupportFolder} and ${layout.root} before changing Storage settings.`);
+    validateSupportDestination(layout.root,this.config,this.store,this.activeSupportFolder);
+    if(!await storageLayoutReady(this.structureIO(),layout))throw Error("Support data is still arriving through Obsidian Sync. Keep both devices online, then choose Retry Sync in Sources. Recognition is held to avoid repeating completed pages.");
+    const from=this.activeSupportFolder;
+    await this.mergePreviousSupportRoots(layout,from);
+    remapSupportReferences(this.config,this.store,from,layout.root);
+    this.activeSupportFolder=layout.root;this.sharedCache=undefined;this.config.storageRevision=layout.revision;
+    this.supportStorageIssue=undefined;
+    await this.persist();await this.persistSettings();await this.applyStoragePreferences();
+    this.supportStorageIssue=undefined;
+  }
+  private async mergePreviousSupportRoots(layout:import("./support-storage").StorageLayout,from?:string){
+    const previous=[...new Set([...(from?[from]:[]),layout.previousRoot,...(layout.previousRoots??[])])].filter(p=>p!==layout.root);
+    if(previous.some(p=>p.toLowerCase().startsWith(layout.root.toLowerCase()+"/")||layout.root.toLowerCase().startsWith(p.toLowerCase()+"/")))
+      throw Error("The shared support location overlaps an earlier location. Both folders were preserved; choose separate folders in Storage.");
+    const roots=previous.map(from=>({from,to:layout.root})),io=this.structureIO();
+    const moves=await planStorageMoves(io,roots);
+    if(moves.length)await executeStorageMoves(io,moves,roots);
+  }
+  /** Byte-preserving migration, also resumable after an interrupted folder move. */
+  async reorganizeStorage() {
+    if(this.task)throw Error("Wait for active recognition to finish before reorganizing support files.");
+    const a=this.app.vault.adapter;
+    const io={
+      exists:(p:string)=>a.exists(p),read:(p:string)=>a.read(p),list:(p:string)=>a.list(p),
+      mkdir:async(p:string)=>{await this.app.vault.createFolder(p);},
+      rename:async(from:string,to:string)=>{
+        const file=this.app.vault.getAbstractFileByPath?.(from);
+        if(file)await this.app.vault.rename(file,to);else await a.rename(from,to);
+      },
+      remove:async(p:string)=>{const file=this.app.vault.getAbstractFileByPath?.(p);if(file)await this.app.vault.delete(file,true);else await a.remove(p);},
+      rmdir:async(p:string)=>{const file=this.app.vault.getAbstractFileByPath?.(p);if(file)await this.app.vault.delete(file,true);else await a.rmdir(p,false);},
+    };
+    const moves=await planStorageMoves(io);
+    const next=migrateStructureReferences(this.config,this.store);
+    if(moves.length)await assertReaderRelocationSafe(io);
+    if(moves.length)await executeStorageMoves(io,moves);
+    if(next.changed){
+      this.config=next.config;this.store=next.store;
+      await this.persist();await this.persistSettings();
+    }
+    const vault=this.app.vault as any;
+    if(vault.getConfig&&vault.setConfig){
+      const old=vault.getConfig("userIgnoreFilters");
+      if(old!=null&&!Array.isArray(old))throw Error("Vault search exclusions could not be read safely.");
+      const filters=(old??[]).filter((p:unknown)=>typeof p==="string"&&!/^Supernote Transcripts\/?$/i.test(p));
+      if(JSON.stringify(filters)!==JSON.stringify(old))await vault.setConfig("userIgnoreFilters",filters);
+    }
+    await this.applyStoragePreferences();
+    return {moves:moves.length,changed:next.changed};
+  }
+  /** Explicit maintenance operation. It never opens images or dispatches recognition. */
+  async consolidateSourceFolder(options: Parameters<typeof consolidateFolder>[2]) {
+    this.assertStateReady();
+    if(this.task||this.initializing||this.disposed)throw Error("Wait for the plugin to become idle before combining sources.");
+    let result: {ruleId:string;excluded:number;retainedIdentities?:Record<string,string>} | undefined;
+    await this.settingsOperation(async()=>{
+      if(this.task)throw Error("Wait for recognition to finish before combining sources.");
+      const next=await consolidateFolder(this.config,this.store,options);
+      this.config=next.config;this.store=next.store;
+      next.rule.sharedPending=true;
+      await this.persist();await this.persistSettings();
+      try{await this.syncMirrorSettings(true);await this.persistSettings();}
+      catch(error){this.settingsSyncIssue(error);throw error;}
+      this.emit();
+      result={ruleId:next.rule.id,excluded:next.rule.exclude.length,retainedIdentities:next.rule.notebookIds};
+    });
+    return result!;
   }
   private async savePrevious(state:NotebookState,text:string,once=false) {
     if(once&&this.historyProtectedSources.has(state.source))return (await this.historyIdentity(state)).path;
@@ -282,7 +489,7 @@ export default class SupernoteTranscripts extends Plugin implements Controller {
         try {
           if(shared&&lease&&!await shared.checkLease(lease))throw Error("Another device took priority. Your transcript is unchanged.");
           await this.app.vault.adapter.process(current.output,text=>{if(text!==before)throw Error("The transcript changed while restoring. Its edits were preserved.");return point.text;});written=true;
-          if(this.sharedIO())await new PublicationReceipts(io).save(id,point.text,next.desired,next.pages,this.presentationFor(next));
+          if(this.sharedIO())await new PublicationReceipts(io,this.paths.shared).save(id,point.text,next.desired,next.pages,this.presentationFor(next));
           this.store.notebooks[source]=next;this.store.queue=this.store.queue.filter(t=>t.source!==source);
           await this.persist();
         } catch(error) {
@@ -364,7 +571,7 @@ export default class SupernoteTranscripts extends Plugin implements Controller {
       if(point){await protect(point.snapshot.pages,point.textHash);protectedHistory.push(path);guards.set(path,await io.read(path));}
       known.set(id,entry);
     }
-    const plan=await inspectStorage(io,{knownNotebooks:[...known.values()],trackedHistory:this.store.history,protectedHistory});
+    const plan=await inspectStorage(io,{dataRoot:this.activeSupportFolder,knownNotebooks:[...known.values()],trackedHistory:this.store.history,protectedHistory});
     return {plan,guards};
   }
   async storageSummary() {
@@ -391,6 +598,14 @@ export default class SupernoteTranscripts extends Plugin implements Controller {
         }
       };
       const result=await cleanStorage(this.storageIO(guard),plan);
+      if(await this.app.vault.adapter.exists(STORAGE_LOCATOR)){
+        const prior=decodeStorageLayout(await this.app.vault.adapter.read(STORAGE_LOCATOR));
+        if(prior.root!==this.activeSupportFolder||prior.revision!==this.config.storageRevision)throw Error("The support location changed on another device. Retry Sync before clearing storage.");
+        const layout=await makeStorageLayout(this.structureIO(),this.activeSupportFolder,this.activeSupportFolder);
+        layout.revision=this.config.storageRevision??layout.revision;
+        layout.previousRoot=prior.previousRoot;layout.previousRoots=prior.previousRoots;
+        await this.writeStorageLayout(layout);
+      }
       const retained:string[]=[];
       for(const path of this.store.history)if(await this.app.vault.adapter.exists(path))retained.push(path);
       if(retained.length!==this.store.history.length){this.store.history=retained;await this.persist();}
@@ -402,16 +617,16 @@ export default class SupernoteTranscripts extends Plugin implements Controller {
     const io=this.sharedIO();if(!io)return undefined;
     let id=localStorage.getItem(`${this.devicePrefix}:device-id`);
     if(!id){id=crypto.randomUUID();localStorage.setItem(`${this.devicePrefix}:device-id`,id);}
-    return this.sharedCache??=new SharedNotebookCache(io,id);
+    return this.sharedCache??=new SharedNotebookCache(io,id,{root:this.paths.shared});
   }
-  async listSharedMirrors(){const io=this.sharedIO();return io?(await new MirrorCatalog(io).list()).map(m=>({id:m.id,name:m.name})):[];}
+  async listSharedMirrors(){const io=this.sharedIO();return io?(await new MirrorCatalog(io,this.paths.shared).list()).map(m=>({id:m.id,name:m.name})):[];}
   async exportSavedResults(){
     if(this.task)throw Error("Wait for active recognition before sharing saved results.");
     const shared=this.shared,io=this.sharedIO();if(!shared||!io)return 0;
     let count=0;
     for(const state of Object.values(this.store.notebooks)){
       const rule=ruleFor(state.source,this.config.rules);if(!rule||!this.sourceSelected(state.source))continue;
-      const id=await notebookIdentity(rule.sharedId??rule.id,relativeToRule(state.source,rule));
+      const id=await notebookIdentityFor(rule,state.source);
       for(const page of state.desired){
         const result=state.pages[page.id];if(!result?.text||result.fingerprint!==page.fingerprint||!/^[a-f0-9]{64}$/.test(result.recipe))continue;
         const query={notebookId:id,pageId:page.id,fingerprint:page.fingerprint,recipe:result.recipe};
@@ -419,7 +634,7 @@ export default class SupernoteTranscripts extends Plugin implements Controller {
       }
       if(state.publishedHash&&await io.exists(state.output)){
         const text=await io.read(state.output);
-        if(await hash(text)===state.publishedHash)await new PublicationReceipts(io).save(id,text,state.desired,state.pages,this.presentationFor(state));
+        if(await hash(text)===state.publishedHash)await new PublicationReceipts(io,this.paths.shared).save(id,text,state.desired,state.pages,this.presentationFor(state));
       }
     }
     return count;
@@ -445,6 +660,13 @@ export default class SupernoteTranscripts extends Plugin implements Controller {
         const cost=(avg as {usd?:number}).usd;
         if(cost!==undefined)usd+=cost*n;
         else{const price=priceFor(p.endpoint,p.model,this.costs.settings);provisional=true;const formattingTokens=Math.ceil(handwritingFormattingPrompt(p,this.config.profiles.find(profile=>profile.id==="general")).length/2);if(price)usd+=groups.reduce((sum,g)=>sum+((3000*(g.length+contextPages(g,s.desired,p.quality).length)+formattingTokens)*price.input+(1000*g.length+(qualitySettings(p.quality).mode==="careful"?4000:qualitySettings(p.quality).mode==="balanced"?2000:0))*price.output)/1e6,0);else priced=false;}
+        const edits=pending.flatMap((page:{id:string})=>s.editedPages?.[page.id]?[s.editedPages[page.id]]:[]) as NonNullable<NotebookState["editedPages"]>[string][];
+        if(edits.length){
+          provisional=true;
+          const price=priceFor(p.endpoint,p.model,this.costs.settings);
+          if(price)usd+=(edits.reduce((n,e)=>n+Math.ceil((e.baseText.length+e.text.length)/2),0)*price.input+1000*edits.length*price.output)/1e6;
+          else priced=false;
+        }
       }
     }
     return {pages,usd:this.provider==="api"&&priced?usd:undefined,reservationUsd:this.provider==="api"?(source?this.costs.notebooks.find(n=>n.source===source)?.heldUsd??0:this.costs.total.heldUsd):undefined,samples,provisional:provisional||!samples,seconds:timed?seconds:undefined,requests};
@@ -537,6 +759,21 @@ export default class SupernoteTranscripts extends Plugin implements Controller {
       );
     return new AndroidReadOnlySource(fs, progress);
   }
+  private checkOptions(source:string):NotebookCheckOptions|undefined {
+    if(!this.automaticRun||this.manualSources.has(source))return undefined;
+    const rule=ruleFor(source,this.config.rules);
+    if(!rule)throw Error("This notebook is outside the current source selection.");
+    return automaticCheckOptions(this.config,rule,this.store.notebooks[source]);
+  }
+  private automaticWorkAvailable(entry:SourceEntry):boolean {
+    if(this.sharedHydrationSources.has(entry.path))return true;
+    const options=this.checkOptions(entry.path),state=this.store.notebooks[entry.path];
+    if(!options||!state?.desired.length||state.revision!==(entry.revision??`${entry.mtime}:${entry.size}`)||
+      state.lastAutomaticPolicy!==automaticPolicyKey(options)||this.presentationRefreshSources.has(entry.path))return true;
+    const eligible=automaticPageIds(options,state.desired);
+    return state.desired.some(page=>eligible.has(page.id)&&state.pages[page.id]?.fingerprint!==page.fingerprint&&
+      state.pageIssues?.[page.id]?.fingerprint!==page.fingerprint);
+  }
   async onload() {
     const data = await this.loadData();
     if(this.platform==="desktop"&&localStorage.getItem(`${this.devicePrefix}:ai`)===null){
@@ -547,12 +784,27 @@ export default class SupernoteTranscripts extends Plugin implements Controller {
       this.store = loaded.snapshot.store;
       this.generation = loaded.snapshot.generation;
       this.stateEstablished = true;
+      const abandoned=this.store.queue.filter(task=>task.manual);
+      if(abandoned.length){
+        this.store.queue=this.store.queue.filter(task=>!task.manual);
+        for(const task of abandoned){const state=this.store.notebooks[task.source];if(state?.status==="queued")state.status="partial";}
+        await this.persist();
+      }
     }
     this.stateEstablished ||= data?.stateInitialized === true;
     if (loaded.blocked || (!loaded.snapshot && this.stateEstablished)) this.blockState(loaded.blocked ?? STATE_STORAGE_BLOCK);
     if (data?.config?.version === 1)
       this.config = { ...freshConfig(),showPageHeadings:true, ...data.config };
     else if (data?.config && !this.stateStorageIssue) await this.migratePrototype(data);
+    try{
+      this.activeSupportFolder=validateSupportDestination(this.config.supportFolder??DATA_ROOT,this.config,this.store,this.config.supportFolder??DATA_ROOT);
+      this.storageMove=data?.storageMove;
+      if(this.storageMove)await this.finishStorageMove();
+      await this.refreshStorageLocation();
+    }catch(error){this.supportStorageIssue=readable(error);}
+    if(!this.stateStorageIssue)try{await this.reorganizeStorage();}catch(error){
+      this.blockState(`Support folders could not be reorganized safely. Existing files were preserved. ${readable(error)}`);
+    }
     let migratedFailure = false;
     for (const state of Object.values(this.store.notebooks)) {
       if (state.status === "recognizing" || state.status === "checking")
@@ -590,6 +842,7 @@ export default class SupernoteTranscripts extends Plugin implements Controller {
           : "Choose sources in settings, then update.",
     );
     installUI(this, this);
+    installSupportFileExclusions(this,()=>({root:this.activeSupportFolder,exclude:this.storagePreferences().excludeFromSearch}));
     const pageLinks = installPageLinks(this, async (outputPath, pageId, displayNumber) => {
       try { await this.openNotebookPage(outputPath, pageId, displayNumber); }
       catch (error) { new Notice(readable(error)); }
@@ -598,11 +851,14 @@ export default class SupernoteTranscripts extends Plugin implements Controller {
       if (this.initializing || this.disposed || this.platform !== "nomad") throw Error("Native Digest capture is available on a connected Nomad.");
       const targets = await resolveNotePages(markers.map(marker => ({ outputPath, pageId: marker.pageId, displayNumber: marker.number })), {
         config: this.config, store: this.store, reader: this.reader(false), platform: this.platform,
-        readTranscript: path => this.app.vault.adapter.read(path), sharedIO: this.sharedIO(),
+        readTranscript: path => this.app.vault.adapter.read(path), sharedIO: this.sharedIO(), sharedRoot:this.paths.shared,
       });
       if (!targets[0].fileId || targets.some(target => !target.pageId.startsWith("native:")))
         throw Error("This notebook does not expose the native file and page IDs required for a linked Digest.");
       return { ...targets[0], pageIds: targets.map(target => target.pageId) };
+    }, resolveDigestPreferences: async outputPath => {
+      if (this.initializing || this.disposed) throw Error("Source settings are not ready. Reopen the transcript and try again.");
+      return digestPreferencesForOutput(this.config, this.store, outputPath);
     } });
     this.addCommand({
       id: "toggle-page-links", name: "Show or hide notebook page links by default",
@@ -681,21 +937,31 @@ export default class SupernoteTranscripts extends Plugin implements Controller {
     }
     if(this.app.vault.on)for(const event of ["create", "modify", "delete", "rename"] as const)
       this.registerEvent(this.app.vault.on(event as "modify", file => {
-        if(file.path.startsWith("Supernote Transcripts/Shared Data/Mirrors/"))this.scheduleSharedSettings();
+        if(file.path===STORAGE_LOCATOR||file.path.startsWith(`${this.paths.shared}/Mirrors/`)||this.supportStorageIssue)this.scheduleSharedSettings();
       }));
     this.register(() => { if(this.sharedSettingsTimer)clearTimeout(this.sharedSettingsTimer); });
     if(this.stateStorageIssue)this.stage("Saved state needs attention",this.stateStorageIssue);
+    else if(this.supportStorageIssue)this.stage("Storage needs attention",this.supportStorageIssue);
     this.emit();
   }
   onunload() {
     this.disposed = true;
     this.previewImages.clear();
     this.stop = true;
+    void this.closeReusableNotebooks();
     this.listeners.clear();
     this.chatGPT?.closeCallback();
   }
   async saveConfig() {
     return this.settingsOperation(async () => {
+      validateAutomaticCheck(this.config);
+      for(const rule of this.config.rules) {
+        validateAutomaticCheck(rule);
+        const categoryName = validateDigestCategoryName(rule.digestCategoryName);
+        if (categoryName === undefined) delete rule.digestCategoryName; else rule.digestCategoryName = categoryName;
+      }
+      const requested=this.config.supportFolder??DATA_ROOT;
+      if(requested!==this.activeSupportFolder)await this.changeSupportFolder(requested);
       // Commit the user's intent locally before any other device can observe it.
       // Only this first failure may reject Save and let the form roll back.
       if(!this.initializing)for(const rule of this.config.rules)rule.sharedPending=true;
@@ -720,7 +986,7 @@ export default class SupernoteTranscripts extends Plugin implements Controller {
   }
   private async persistSettings() {
     try {
-      await this.saveData({ config: clone(this.config), ...(this.stateEstablished?{stateInitialized:true}:{}) });
+      await this.saveData({ config: clone(this.config), ...(this.storageMove?{storageMove:clone(this.storageMove)}:{}), ...(this.stateEstablished?{stateInitialized:true}:{}) });
       this.settingsPersistencePending=false;
     } catch(error) {
       this.settingsPersistencePending=true;
@@ -749,7 +1015,11 @@ export default class SupernoteTranscripts extends Plugin implements Controller {
     const profile=this.config.profiles.find(p=>p.id===rule.profileId);
     if(!profile)throw Error("Choose recognition settings for this source.");
     const formatting=resolveFormatting(profile,this.config.profiles.find(p=>p.id==="general")??this.config.profiles[0]);
-    return {profile:{...clone(profile),preserveFormatting:formatting.enabled,formattingGuide:formatting.guide},output:rule.output,recursive:rule.recursive,exclude:[...rule.exclude]};
+    return {profile:{...clone(profile),preserveFormatting:formatting.enabled,formattingGuide:formatting.guide},output:rule.output,recursive:rule.recursive,exclude:[...rule.exclude],
+      ...(rule.notebookIds===undefined?{}:{notebookIds:{...rule.notebookIds}}),
+      ...(rule.automaticCheck===undefined?{}:{automaticCheck:rule.automaticCheck}),
+      ...(rule.automaticCheckRecentPages===undefined?{}:{automaticCheckRecentPages:rule.automaticCheckRecentPages}),
+      ...(rule.digestCategoryName===undefined?{}:{digestCategoryName:validateDigestCategoryName(rule.digestCategoryName)})};
   }
   private applyPortableSettings(rule: FolderRule, value: PortableMirror, profileId: string) {
     const before=this.portableSettings(rule);
@@ -760,11 +1030,15 @@ export default class SupernoteTranscripts extends Plugin implements Controller {
       this.config.profiles.push(profile);
       rule.profileId=profile.id;
       rule.output=value.output;rule.recursive=value.recursive;rule.exclude=[...value.exclude];
+      if(value.notebookIds===undefined)delete rule.notebookIds;else rule.notebookIds={...value.notebookIds};
+      if(value.automaticCheck===undefined)delete rule.automaticCheck;else rule.automaticCheck=value.automaticCheck;
+      if(value.automaticCheckRecentPages===undefined)delete rule.automaticCheckRecentPages;else rule.automaticCheckRecentPages=value.automaticCheckRecentPages;
+      if(value.digestCategoryName===undefined)delete rule.digestCategoryName;else rule.digestCategoryName=value.digestCategoryName;
     }
   }
   private async syncMirrorSettings(publishLocal: boolean) {
     const io=this.sharedIO();if(!io)return;
-    const catalog=new MirrorCatalog(io),available=await catalog.list();
+    const catalog=new MirrorCatalog(io,this.paths.shared),available=await catalog.list();
     const issues: typeof this.sharedSettingsIssues=[];
     for(const rule of this.config.rules) {
       if(publishLocal)rule.sharedId??=crypto.randomUUID();
@@ -816,6 +1090,9 @@ export default class SupernoteTranscripts extends Plugin implements Controller {
     if(this.task||this.disposed||this.initializing)return;
     return this.settingsOperation(async () => {
       if(this.task||this.disposed)return;
+      try{await this.refreshStorageLocation();}catch(error){
+        this.supportStorageIssue=readable(error);this.stage("Storage needs attention",this.supportStorageIssue);throw error;
+      }
       // Retry even if the previous refresh already applied the remote values in
       // memory; equality with the next refresh does not mean they reached disk.
       if(this.settingsPersistencePending)await this.persistSettings();
@@ -831,7 +1108,7 @@ export default class SupernoteTranscripts extends Plugin implements Controller {
     return this.settingsOperation(async () => {
       const rule=this.config.rules.find(r=>r.id===ruleId),io=this.sharedIO();
       if(!rule?.sharedId||!io)throw Error("Shared source is unavailable.");
-      const catalog=new MirrorCatalog(io),remote=await catalog.load(rule.sharedId);
+      const catalog=new MirrorCatalog(io,this.paths.shared),remote=await catalog.load(rule.sharedId);
       const profileId=`shared-${(await hash(rule.sharedId)).slice(0,40)}`;
       const local=this.portableSettings(rule);
       if(choice==="remote"&&!remote)throw Error("Shared settings have not arrived. Wait for Sync and try again.");
@@ -870,14 +1147,14 @@ export default class SupernoteTranscripts extends Plugin implements Controller {
           path,
           encoded,
         );
-        if(!this.stateEstablished){await this.saveData({config:this.config,stateInitialized:true});this.stateEstablished=true;}
+        if(!this.stateEstablished){await this.saveData({config:this.config,...(this.storageMove?{storageMove:clone(this.storageMove)}:{}),stateInitialized:true});this.stateEstablished=true;}
       });
     this.writes = operation;
     try { await operation; }
     catch { this.blockState("Notebook state could not be saved. Recognition is blocked; completed results are retained in memory. Restore writable storage and saved state, then reload Obsidian."); this.assertStateReady(); }
   }
   private blockState(reason:string){this.stateStorageIssue=reason;this.progress.stateBlocked=reason;this.progress.executionBlocked=reason;}
-  private assertStateReady(){if(this.stateStorageIssue)throw new RecognitionFailure("provider",this.stateStorageIssue,{scope:"batch"});}
+  private assertStateReady(){if(this.stateStorageIssue||this.supportStorageIssue)throw new RecognitionFailure("provider",this.stateStorageIssue??this.supportStorageIssue!,{scope:"batch"});}
   private assertAttemptStorageReady(){
     try{this.costBook.recoverableAttempts();this.subscriptionBook.recoverableAttempts();}
     catch(error){this.progress.budgetBlocked=readable(error);throw error;}
@@ -892,7 +1169,7 @@ export default class SupernoteTranscripts extends Plugin implements Controller {
       const state=this.store.notebooks[row.source],page=state?.desired.find(p=>p.id===row.pageId);
       if(!state||!page||page.fingerprint!==row.fingerprint||!row.recipe||!/^[a-f0-9]{64}$/.test(row.recipe)||state.forcePending?.includes(page.id)||state.pages[page.id]?.fingerprint===page.fingerprint)continue;
       const rule=ruleFor(row.source,this.config.rules);if(!rule)continue;
-      const id=await notebookIdentity(rule.sharedId??rule.id,relativeToRule(row.source,rule));
+      const id=await notebookIdentityFor(rule,row.source);
       const result=(await shared.findResult({notebookId:id,pageId:page.id,fingerprint:page.fingerprint,recipe:row.recipe})).chosen;
       if(result){state.pages[page.id]={fingerprint:page.fingerprint,text:result.text,recipe:row.recipe,number:page.number,...(result.recognition?{recognition:result.recognition}:{}),...(isEmptyPage(result.text)?{blank:true}:{})};changed=true;}
     }
@@ -910,19 +1187,23 @@ export default class SupernoteTranscripts extends Plugin implements Controller {
     }
     if(changed)await this.persist();
   }
+  private async closeReusableNotebooks(){
+    const handles=[...this.reusableNotebooks.values()];this.reusableNotebooks.clear();
+    await Promise.allSettled(handles.map(async handle=>{try{await handle.close();}catch{}}));
+  }
   private async migratePrototype(data: any) {
     const legacy = data.config;
     const glossaries: string[] = [];
     // Only migrate reference text the user previously supplied. Fresh setups
     // have no bundled vocabulary, language assumptions or sample notebooks.
     if (typeof legacy.glossary === "string" && legacy.glossary.trim()) {
-      let path = "Supernote Transcripts/Glossaries/Imported glossary.txt";
+      let path = `${this.paths.glossaries}/Imported glossary.txt`;
       await this.ensureFolder(path);
       let suffix = 1;
       while (await this.app.vault.adapter.exists(path)) {
         if ((await this.app.vault.adapter.read(path)) === legacy.glossary)
           break;
-        path = `Supernote Transcripts/Glossaries/Imported glossary (${++suffix}).txt`;
+        path = `${this.paths.glossaries}/Imported glossary (${++suffix}).txt`;
       }
       if (!(await this.app.vault.adapter.exists(path)))
         await this.app.vault.create(path, legacy.glossary);
@@ -946,7 +1227,7 @@ export default class SupernoteTranscripts extends Plugin implements Controller {
           id: "reflections",
           enabled: true,
           source: legacy.source ?? "/storage/emulated/0/Note",
-          output: legacy.output ?? "Supernote Transcripts/Transcripts",
+          output: legacy.output ?? TRANSCRIPTS_ROOT,
           recursive: true,
           exclude: [],
           profileId: "reflections",
@@ -994,6 +1275,7 @@ export default class SupernoteTranscripts extends Plugin implements Controller {
     }
   }
   private validateConfig() {
+    validateAutomaticCheck(this.config);
     for(const profile of this.config.profiles)resolveFormatting(profile,this.config.profiles.find(p=>p.id==="general")??this.config.profiles[0]);
     if(this.config.cleanupPrompt!==undefined&&(typeof this.config.cleanupPrompt!=="string"||this.config.cleanupPrompt.length>20000))
       throw Error("Keep the default cleanup instructions within 20,000 characters.");
@@ -1002,9 +1284,11 @@ export default class SupernoteTranscripts extends Plugin implements Controller {
         "Enable at least one source folder or notebook in settings.",
       );
     for (const rule of this.config.rules.filter((r) => r.enabled)) {
+      validateAutomaticCheck(rule);
       if(rule.autoRecognize!==undefined&&typeof rule.autoRecognize!=="boolean")throw Error("Choose Automatic or Manual updates for this source.");
       rule.source = validateSource(rule.source,this.platform);
       validateDestination(rule.output);
+      if(isDataPath(rule.output,this.activeSupportFolder))throw Error("Choose a transcript folder outside _supernote support data.");
       if (!this.config.profiles.some((p) => p.id === rule.profileId))
         throw new Error(`Choose a profile for ${rule.source}.`);
     }
@@ -1035,7 +1319,10 @@ export default class SupernoteTranscripts extends Plugin implements Controller {
       catch { throw new Error(`Cannot read glossary "${path}". Restore it in this vault or choose another glossary in the mirror settings.`); }
       if (text.length > 100000)
         throw new Error(`Glossary ${path} exceeds 100,000 characters.`);
-      reference += `\n\nReference glossary: ${path}\n${text}`;
+      // Keep the former logical label: storage moves must not invalidate paid cache keys.
+      const recipePath=path.startsWith(`${this.paths.glossaries}/`)
+        ? `Supernote Transcripts/Glossaries/${path.slice(this.paths.glossaries.length+1)}` : path;
+      reference += `\n\nReference glossary: ${recipePath}\n${text}`;
     }
     if (reference.length > 150000)
       throw new Error("Combined glossaries are too large.");
@@ -1054,25 +1341,161 @@ export default class SupernoteTranscripts extends Plugin implements Controller {
     if (task) { task.force ||= force; if(task.pageIds && pageIds)task.pageIds=[...new Set([...task.pageIds,...pageIds])]; }
     else this.store.queue.push({ source, force, ...(pageIds?{pageIds:[...new Set(pageIds)]}:{}) });
   }
+  async requestRecognitionNow(target:{source?:string;ruleId?:string}):Promise<void>{
+    this.assertStateReady();this.assertAttemptStorageReady();
+    if(this.disposed||!this.active)throw Error("Recognition is not available while the plugin is inactive.");
+    if(!this.aiEnabled)throw Error("Switch on AI recognition before starting a manual request.");
+    const exact=typeof target?.source==="string",folder=typeof target?.ruleId==="string";
+    if(exact===folder)throw Error("Choose exactly one notebook or source folder.");
+    const cancelRevision=this.manualCancelRevision,reader=this.reader();let entries:SourceEntry[],targetRule:FolderRule,targetPauseRevision=0;
+    const sourcePauseSnapshot=new Map(Object.keys(this.store.notebooks).map(source=>[source,this.manualPauseRevisions.get(`source:${source}`)??0]));
+    if(exact){
+      const source=validateSource(target.source!,this.platform);
+      if(!/\.note$/i.test(source))throw Error("Choose one .note notebook for Recognize now.");
+      const rule=ruleFor(source,this.config.rules);
+      if(!rule||!this.sourceSelected(source))throw Error("This notebook is excluded from the current source selection.");
+      targetRule=rule;
+      targetPauseRevision=this.manualPauseRevisions.get(`rule:${rule.id}`)??0;
+      entries=(await reader.list(source,false,[])).map(item=>({...item,relative:source.split("/").pop()!,ruleId:rule.id,profileId:rule.profileId,
+        output:this.store.notebooks[source]?.outputOverride??mirrorPath(source,rule)}));
+    }else{
+      const rule=this.config.rules.find(item=>item.id===target.ruleId&&item.enabled);
+      if(!rule)throw Error("Choose an enabled source folder.");
+      targetRule=rule;
+      targetPauseRevision=this.manualPauseRevisions.get(`rule:${rule.id}`)??0;
+      entries=(await reader.list(rule.source,rule.recursive,rule.exclude)).flatMap(item=>{
+        const owner=ruleFor(item.path,this.config.rules);
+        if(owner?.id!==rule.id||!this.sourceSelected(item.path))return [];
+        return [{...item,relative:item.path.split("/").pop()!,ruleId:owner.id,profileId:owner.profileId,
+          output:this.store.notebooks[item.path]?.outputOverride??mirrorPath(item.path,owner)}];
+      });
+    }
+    if(cancelRevision!==this.manualCancelRevision||
+        (this.manualPauseRevisions.get(`rule:${targetRule.id}`)??0)!==targetPauseRevision)
+      throw Error("This manual request was canceled by a pause.");
+    if(!entries.length)throw Error("No included notebooks were found for this Recognize now request.");
+    const manualPriority=Math.max(0,...this.store.queue.map(item=>item.priority??0))+1;
+    const staged=new Map<string,{task:any; existed:boolean; wasAuthorized:boolean; previousEntry?:SourceEntry; manual?:boolean; priority?:number; modified?:number}>();
+    const previousStop=this.stop,previousAuthorization=this.manualAuthorizationRevision;
+    let skippedForced=0;
+    let accepted=0;
+    try{
+    for(const entry of entries){
+      if(cancelRevision!==this.manualCancelRevision)throw Error("This manual request was canceled by a pause.");
+      if((this.manualPauseRevisions.get(`source:${entry.path}`)??0)!==(sourcePauseSnapshot.get(entry.path)??0))throw Error("This manual request was canceled by a notebook pause.");
+      const rule=ruleFor(entry.path,this.config.rules),state=this.store.notebooks[entry.path];
+      if(!rule)continue;
+      if(state?.executionIssue?.code==="automatic_check_requires_manual"){
+        delete state.executionIssue;delete state.error;state.status="queued";
+      }
+      if(state&&!state.executionIssue&&!state.legacyPageFailure&&
+        /Shared publication (?:receipt|metadata) is damaged/i.test(state.error??"")){
+        // An explicit retry revalidates the record; it never bypasses receipt
+        // validation or discards evidence that may still be arriving via Sync.
+        delete state.error;state.status="queued";
+      }
+      if(state&&(["failed","conflict","missing","excluded"].includes(state.status)||state.executionIssue||state.legacyPageFailure))continue;
+      if(state&&(state.forcePending?.length||this.store.queue.some(task=>task.source===entry.path&&(task.force||task.pageIds?.length)))){skippedForced++;continue;}
+      this.assertSharedSettings(entry.path);
+      if(!this.store.notebooks[entry.path]){
+        const id=await hash(entry.path);
+        if(cancelRevision!==this.manualCancelRevision||
+            (this.manualPauseRevisions.get(`rule:${targetRule.id}`)??0)!==targetPauseRevision||
+            (this.manualPauseRevisions.get(`source:${entry.path}`)??0)!==(sourcePauseSnapshot.get(entry.path)??0))
+          throw Error("This manual request was canceled by a pause.");
+        this.store.notebooks[entry.path]={id,source:entry.path,ruleId:entry.ruleId,output:entry.output,revision:"",order:[],desired:[],pages:{},status:"queued"};
+      }
+      const existingTask=this.store.queue.find(item=>item.source===entry.path);
+      this.enqueue(entry.path);
+      const task=this.store.queue.find(item=>item.source===entry.path)!;
+      if(!staged.has(entry.path))staged.set(entry.path,{task,existed:!!existingTask,wasAuthorized:this.manualSources.has(entry.path),previousEntry:this.manualEntries.get(entry.path),manual:task.manual,priority:task.priority,modified:task.modified});
+      task.manual=true;task.priority=Math.max(task.priority??0,manualPriority);task.modified=entry.mtime;
+      this.manualPersistenceCounts.set(entry.path,(this.manualPersistenceCounts.get(entry.path)??0)+1);
+      staged.get(entry.path)!.task=task;
+      this.manualEntries.set(entry.path,entry);
+      accepted++;
+    }
+    if(!accepted)throw Error(skippedForced?"This notebook already has page re-recognition queued. Resume that work from Queue before using Recognize now.":"These notebooks are paused or need attention before recognition can start.");
+    if(cancelRevision!==this.manualCancelRevision)throw Error("This manual request was canceled by a pause.");
+      await this.persist();
+      if(cancelRevision!==this.manualCancelRevision)throw Error("This manual request was canceled by a pause.");
+      this.manualAuthorizationRevision=cancelRevision;
+      // A manual request is a one-run authorization. Keep the saved global pause
+      // preference intact while allowing this run to pass the transient stop gate.
+      this.stop=false;
+      for(const [source,{task}] of staged){
+        this.manualSources.add(source);this.manualEntries.set(source,entries.find(entry=>entry.path===source)!);
+        const remaining=(this.manualPersistenceCounts.get(source)??1)-1;if(remaining)this.manualPersistenceCounts.set(source,remaining);else this.manualPersistenceCounts.delete(source);
+        // The persisted task is now authorized to run, including when it joined
+        // a global update that was already in progress.
+        task.manual=true;
+      }
+      this.progress.manualSources=[...this.manualSources];this.emit();
+      await this.drainManualQueue();
+    }catch(error){
+      for(const [source,prior] of staged){
+        const remaining=(this.manualPersistenceCounts.get(source)??1)-1;if(remaining)this.manualPersistenceCounts.set(source,remaining);else this.manualPersistenceCounts.delete(source);
+        if(!this.manualSources.has(source)){
+          if(prior.previousEntry)this.manualEntries.set(source,prior.previousEntry);else this.manualEntries.delete(source);
+          const task=this.store.queue.find(item=>item.source===source);
+          if(task){if(prior.manual===undefined)delete task.manual;else task.manual=prior.manual;if(prior.priority===undefined)delete task.priority;else task.priority=prior.priority;if(prior.modified===undefined)delete task.modified;else task.modified=prior.modified;if(!prior.existed)this.store.queue=this.store.queue.filter(item=>item!==task);}
+        }
+      }
+      if(cancelRevision===this.manualCancelRevision&&!this.manualSources.size){this.stop=previousStop;this.manualAuthorizationRevision=previousAuthorization;}
+      if(this.manualSources.size)this.progress.manualSources=[...this.manualSources];else delete this.progress.manualSources;
+      this.emit();
+      throw error;
+    }
+  }
+  private async drainManualQueue():Promise<void>{
+    if(this.disposed||!this.active){await this.retireManualQueue();return;}
+    if(this.manualStart){
+      try{await this.manualStart;}catch(error){await this.retireManualQueue();throw error;}
+      if(this.manualSources.size&&!this.stop&&!this.disposed&&this.active&&!this.progress.budgetBlocked&&!this.progress.executionBlocked)return this.drainManualQueue();
+      if(this.progress.budgetBlocked||this.progress.executionBlocked||this.stop||this.disposed||!this.active)await this.retireManualQueue();
+      return;
+    }
+    const operation=this.startUpdate(false,true);this.manualStart=operation;
+    try{await operation;}catch(error){await this.retireManualQueue();throw error;}finally{if(this.manualStart===operation)this.manualStart=null;}
+    if(this.manualSources.size&&!this.stop&&!this.disposed&&this.active&&!this.progress.budgetBlocked&&!this.progress.executionBlocked)return this.drainManualQueue();
+    if(this.progress.budgetBlocked||this.progress.executionBlocked||this.stop||this.disposed||!this.active)await this.retireManualQueue();
+  }
+  private async retireManualQueue(){
+    for(const task of this.store.queue)if(task.manual)delete task.manual;
+    this.manualSources.clear();this.manualEntries.clear();delete this.progress.manualSources;
+    this.emit();
+    if(!this.stateStorageIssue)try{await this.persist();}catch{}
+  }
   async update(automatic = false): Promise<void> {
+    return this.startUpdate(automatic,false);
+  }
+  private async startUpdate(automatic=false,manualOnly=false):Promise<void>{
     await this.subscriptionRecovery;
+    if(this.supportStorageIssue&&!this.task)await this.refreshSharedSettings();
     this.assertStateReady();
     this.assertAttemptStorageReady();
     if (this.task) {
       await this.task;
+      if(manualOnly&&this.manualSources.size&&!this.stop&&!this.progress.budgetBlocked&&!this.progress.executionBlocked)await this.startUpdate(false,true);
       return;
     }
+    if(manualOnly&&this.manualAuthorizationRevision!==this.manualCancelRevision)throw Error("This manual request was canceled by a pause.");
     await this.refreshSharedSettings();
-    if(this.task){await this.task;return;}
+    if(this.task){await this.task;if(manualOnly&&this.manualSources.size&&!this.stop&&!this.progress.budgetBlocked&&!this.progress.executionBlocked)await this.startUpdate(false,true);return;}
     this.historyProtectedSources.clear();
-    this.stop = false;
+    this.presentationRefreshSources.clear();
+    if(manualOnly){if(this.manualAuthorizationRevision!==this.manualCancelRevision)throw Error("This manual request was canceled by a pause.");this.stop=false;}
+    else this.stop = false;
     this.automaticRun = automatic;
+    this.manualOnlyRun=manualOnly;
+    this.updateOperation=true;
     this.callsThisRun = 0;
-    this.progress = { ...emptyProgress(), running: true };
-    for(const state of Object.values(this.store.notebooks))if(state.executionIssue?.scope==="batch")delete state.executionIssue;
+    this.progress = { ...emptyProgress(), running: true, paused:manualOnly?this.progress.paused:false,
+      ...(this.manualSources.size?{manualSources:[...this.manualSources]}:{}) };
+    if(!manualOnly)for(const state of Object.values(this.store.notebooks))if(state.executionIssue?.scope==="batch")delete state.executionIssue;
     this.costBook.beginRun();
-    this.setPaused(false);
-    const operation = this.performUpdate();
+    if(!manualOnly)this.setPaused(false);
+    const operation = this.performUpdate(manualOnly);
     this.task = operation;
     try {
       await operation;
@@ -1081,8 +1504,13 @@ export default class SupernoteTranscripts extends Plugin implements Controller {
       new Notice(readable(error));
       throw error;
     } finally {
-      this.task = null;
-      this.automaticRun = false;
+      await this.closeReusableNotebooks();
+      if(this.task===operation)this.task = null;
+      this.updateOperation=false;
+      this.automaticRun = false;this.manualOnlyRun=false;
+      this.runVisitedSources=undefined;
+      this.runEntries=undefined;
+      if(!this.manualSources.size)delete this.progress.manualSources;
       this.progress.running = false;
       await this.recoverSubscriptionConnection();
       this.emit();
@@ -1095,6 +1523,9 @@ export default class SupernoteTranscripts extends Plugin implements Controller {
   }
   pause() {
     this.stop = true;
+    this.manualCancelRevision++;
+    for(const task of this.store.queue.filter(item=>item.manual))this.store.queue=this.store.queue.filter(item=>item!==task);
+    this.manualSources.clear();this.manualEntries.clear();delete this.progress.manualSources;
     this.setPaused(true);
     this.stage(
       this.task ? "Pausing" : "Paused",
@@ -1164,6 +1595,7 @@ export default class SupernoteTranscripts extends Plugin implements Controller {
     const rule = this.config.rules.find((r) => r.id === ruleId);
     if (!rule) throw new Error("Source not found.");
     rule.paused = paused;
+    if(paused){this.manualPauseRevisions.set(`rule:${ruleId}`,(this.manualPauseRevisions.get(`rule:${ruleId}`)??0)+1);this.cancelManualSources(source=>ruleFor(source,this.config.rules)?.id===ruleId);}
     await this.saveConfig();
     this.emit();
     if (!paused && !this.progress.paused && this.aiEnabled && !this.task)
@@ -1173,6 +1605,7 @@ export default class SupernoteTranscripts extends Plugin implements Controller {
     const state = this.store.notebooks[source];
     if (!state) throw new Error("Notebook not found.");
     state.paused = paused;
+    if(paused){this.manualPauseRevisions.set(`source:${source}`,(this.manualPauseRevisions.get(`source:${source}`)??0)+1);this.cancelManualSources(path=>path===source);}
     await this.persist();
     this.emit();
     if (!paused && !this.progress.paused && this.aiEnabled && !this.task)
@@ -1187,7 +1620,7 @@ export default class SupernoteTranscripts extends Plugin implements Controller {
       const state=displayed[t.source];
       return this.sourceSelected(t.source)&&state&&!state.executionIssue&&!state.legacyPageFailure&&
         !["failed","conflict","missing","excluded"].includes(state.status)&&
-        (!!t.force||!state.desired.length||pendingPages(state).length>0);
+        (!!t.manual||!!t.force||!state.desired.length||pendingPages(state).length>0);
     });
     const page = this.progress.activePage;
     return {
@@ -1200,10 +1633,10 @@ export default class SupernoteTranscripts extends Plugin implements Controller {
           }
         : undefined,
       waiting: selected
-        .filter((t) => t.source !== active && !this.sourcePaused(t.source))
+        .filter((t) => t.source !== active && (t.manual?this.manualCanRun(t.source):!this.sourcePaused(t.source)))
         .map((t) => t.source),
       paused: selected
-        .filter((t) => t.source !== active && this.sourcePaused(t.source))
+        .filter((t) => t.source !== active && (t.manual?!this.manualCanRun(t.source):this.sourcePaused(t.source)))
         .map((t) => t.source),
       attention: Object.values(this.displayStore.notebooks)
         .filter(
@@ -1291,7 +1724,7 @@ export default class SupernoteTranscripts extends Plugin implements Controller {
         if (
           !/\.md$/i.test(path) ||
           path.split("/").some((p) => p.startsWith(".")) ||
-          /^Supernote Transcripts\/(History|Archive)\//i.test(path) || isSharedPath(path)
+          isDataPath(path,this.activeSupportFolder)
         )
           continue;
         const basename = path.split("/").pop()!.toLocaleLowerCase(),
@@ -1328,14 +1761,18 @@ export default class SupernoteTranscripts extends Plugin implements Controller {
     return orderedTasks(this.store.queue).some(
       (t) =>
         t.source !== source &&
+        (!this.manualOnlyRun||t.manual) &&
         (t.priority ?? 0) > (task?.priority ?? 0) &&
+        !this.runVisitedSources?.has(t.source) &&
+        (!this.automaticRun||t.manual||!!this.runEntries?.get(t.source)&&this.automaticWorkAvailable(this.runEntries.get(t.source)!)) &&
         this.sourceSelected(t.source) &&
-        !this.sourcePaused(t.source),
+        (t.manual?this.manualCanRun(t.source):!this.sourcePaused(t.source)),
     );
   }
   private async discover() {
     this.validateConfig();
     this.inventories.clear();
+    this.sharedHydrationSources.clear();
     const rules=clone(this.config.rules),rulesSignature=JSON.stringify(this.config.rules);
     const reader = this.reader(),
       found = new Map<string, SourceEntry>(),
@@ -1390,6 +1827,7 @@ export default class SupernoteTranscripts extends Plugin implements Controller {
     );
     this.progress.total = entries.length;
     for (const entry of entries) {
+      entry.revision=await reader.revision(entry.path);
       let state = this.store.notebooks[entry.path];
       if (!state) {
         state = {
@@ -1405,18 +1843,56 @@ export default class SupernoteTranscripts extends Plugin implements Controller {
         };
         this.store.notebooks[entry.path] = state;
       }
-      if(state.executionIssue?.scope==="source"){
+      if(!this.automaticRun&&state.executionIssue?.code==="automatic_check_requires_manual"){
+        delete state.executionIssue;delete state.error;state.status="queued";
+      }
+      if(state.executionIssue?.scope==="source"&&state.executionIssue.code!=="automatic_check_requires_manual"){
         const resolved=await this.profile(entry.profileId);
         if(state.executionIssue.recipe!==resolved.recipe){delete state.executionIssue;state.status="queued";}
       }
       if(state.legacyPageFailure||state.executionIssue){this.store.queue=this.store.queue.filter(t=>t.source!==entry.path);this.progress.checked++;continue;}
+      // A skipped page is normally excluded from pendingPages(). If a peer
+      // later saves its exact current-recipe result, still schedule this
+      // source once so processNotebook can hydrate the result without AI.
+      // Automatic depth only constrains new recognition requests. Importing an
+      // exact peer success is free and may repair a skipped page outside the
+      // configured new/recent page window. Explicit re-recognition markers
+      // remain owned by their existing queue semantics.
+      if(this.automaticRun&&state.status==="partial"&&!state.forcePending?.length&&
+        !this.store.queue.some(task=>task.source===entry.path&&task.force)){
+        const rule=ruleFor(entry.path,this.config.rules);
+        if(rule){
+          const resolved=await this.profile(entry.profileId),notebookId=await notebookIdentityFor(rule,entry.path),shared=this.shared;
+          if(shared)for(const [pageId,issue] of Object.entries(state.pageIssues??{})){
+            const page=state.desired.find(candidate=>candidate.id===pageId);
+            if(!page||page.fingerprint!==issue.fingerprint||issue.status!=="skipped"||
+              issue.force||state.pages[pageId]?.fingerprint===page.fingerprint)continue;
+            const query={notebookId,pageId,fingerprint:page.fingerprint,recipe:resolved.recipe};
+            let result;
+            try{result=(await shared.findResult(query)).chosen;}catch{break;}
+            if(result&&result.notebookId===query.notebookId&&result.pageId===query.pageId&&
+              result.fingerprint===query.fingerprint&&result.recipe===query.recipe){
+              this.sharedHydrationSources.add(entry.path);break;
+            }
+          }
+        }
+      }
+      // Markdown (including a choice synced from another device) can change
+      // without any new ink. Refresh ownership/presentation on Update too.
+      const outputChanged=!!state.publishedHash&&await this.app.vault.adapter.exists(state.output)&&
+        await hash(await this.app.vault.adapter.read(state.output))!==state.publishedHash;
+      if(outputChanged||state.output!==entry.output||state.ruleId!==entry.ruleId)this.presentationRefreshSources.add(entry.path);
       if (
-        state.revision !== `${entry.mtime}:${entry.size}` ||
+        !this.automaticRun ||
+        state.revision !== entry.revision ||
         state.output !== entry.output ||
         state.ruleId !== entry.ruleId ||
         state.status === "missing" ||
         state.status === "excluded" ||
-        state.status === "queued" ||
+        (state.status === "queued"&&(!this.automaticRun||this.automaticWorkAvailable(entry))) ||
+        (this.automaticRun&&this.automaticWorkAvailable(entry)) ||
+        (!this.automaticRun&&state.status==="partial"&&pendingPages(state).length>0) ||
+        outputChanged ||
         (state.status === "conflict" && state.error?.startsWith("Shared transcript")) ||
         state.legacy
       ) {
@@ -1454,10 +1930,10 @@ export default class SupernoteTranscripts extends Plugin implements Controller {
         state.error =
           "Not found in the completed scan. Previous transcript is kept in the archive.";
         try {
-          if (!state.output.startsWith("Supernote Transcripts/Archive/"))
+          if (!state.output.startsWith(`${this.paths.archive}/`))
             await this.relocateOutput(
               state,
-              `Supernote Transcripts/Archive/${state.id.slice(0, 12)}/${state.output.split("/").pop()}`,
+              `${this.paths.archive}/${state.id.slice(0, 12)}/${state.output.split("/").pop()}`,
             );
         } catch (error) {
           state.status = "conflict";
@@ -1471,30 +1947,37 @@ export default class SupernoteTranscripts extends Plugin implements Controller {
     await this.persist();
     return found;
   }
-  private async performUpdate() {
-    const entries = await this.discover();
+  private async performUpdate(manualOnly=false) {
+    const entries = manualOnly?new Map(this.manualEntries):await this.discover();
+    this.runEntries=entries;
     // Refresh every changed notebook before the first AI request. Unchanged
     // filesystem revisions reuse their last inventory; a model change alone
     // does not invalidate handwriting or trigger historical recognition.
     const changed=[...entries.values()].filter(entry=>{
       const state=this.store.notebooks[entry.path];
-      return !state?.desired.length||state.revision!==`${entry.mtime}:${entry.size}`;
+      return !state?.executionIssue&&!state?.legacyPageFailure&&!this.sourcePaused(entry.path)&&(!this.automaticRun||this.automaticWorkAvailable(entry));
     });
     this.progress.activePage=undefined;this.progress.checked=0;this.progress.total=changed.length;
     this.stage("Checking notebook pages",`Refreshing ${changed.length} changed notebooks before recognition.`);
-    await inventoryNotebooks(changed,this.reader(false),{
+    const inventoryReader=this.reader(false);
+    await inventoryNotebooks(changed,{open:(path:string)=>inventoryReader.open(path,this.checkOptions(path))},{
+      retain:true,
       platform:this.platform,mayStart:()=>!this.stop&&!this.disposed&&this.active,
-      onResult:(entry:SourceEntry,result:{descriptor?:NotebookDescriptor;error?:unknown})=>{
+      onResult:(entry:SourceEntry,result:{descriptor?:NotebookDescriptor;error?:unknown;reusable?:OpenNotebook})=>{
         this.inventories.set(entry.path,result);
-        if(result.error){const state=this.store.notebooks[entry.path];state.status="failed";state.error=readable(result.error);this.store.queue=this.store.queue.filter(t=>t.source!==entry.path);}
+        if(result.reusable)this.reusableNotebooks.set(entry.path,result.reusable);
+        if(result.error){const state=this.store.notebooks[entry.path];state.status="failed";state.error=readable(result.error);
+          if(result.error instanceof Error&&result.error.name==="AutomaticCheckUnavailableError")state.executionIssue={scope:"source",reason:readable(result.error),code:"automatic_check_requires_manual"};
+          this.store.queue=this.store.queue.filter(t=>t.source!==entry.path);}
         this.progress.checked++;
         this.stage("Checking notebook pages",`${this.progress.checked} of ${changed.length} notebooks checked. No AI requests during this step.`);
       },
     });
     await this.persist();
-    let remaining =
+    let remaining = manualOnly?Infinity:
       this.config.continuous === false ? this.config.batchPages : Infinity;
     const visited = new Set<string>();
+    this.runVisitedSources=visited;
     while (true) {
       if (
         this.stop ||
@@ -1505,23 +1988,33 @@ export default class SupernoteTranscripts extends Plugin implements Controller {
         remaining <= 0
       )
         break;
-      const task = orderedTasks(this.store.queue).find(
-        (t) =>
-          entries.has(t.source) &&
-          !visited.has(t.source) &&
-          this.sourceSelected(t.source) &&
-          !this.sourcePaused(t.source),
-      );
+      for(const source of [...this.manualSources])if(!this.manualCanRun(source))this.cancelManualSources(path=>path===source);
+      for(const [source,entry] of this.manualEntries)entries.set(source,entry);
+      const task = orderedTasks(this.store.queue).find(t=>{
+        if(!entries.has(t.source)||visited.has(t.source)||!this.sourceSelected(t.source)||(manualOnly&&!t.manual))return false;
+        if(this.automaticRun&&!t.manual&&!this.automaticWorkAvailable(entries.get(t.source)!))return false;
+        return t.manual?this.manualCanRun(t.source):!this.sourcePaused(t.source);
+      });
       if (!task) break;
-      const entry = entries.get(task.source);
+      const entry = this.manualEntries.get(task.source)??entries.get(task.source);
       if (!entry) continue;
       if (this.sourcePaused(task.source)) continue;
       const startedCalls = this.callsThisRun;
       this.progress.activeSource = task.source;
       this.emit();
       try {
-        await this.processNotebook(entry, task.force, remaining, undefined, task.pageIds);
-        if (task.pageIds || ["current","partial"].includes(this.store.notebooks[task.source]?.status))
+        const automatic=this.automaticRun&&!this.manualSources.has(task.source);
+        await this.processNotebook(entry, automatic?false:task.force, remaining, undefined, automatic?undefined:task.pageIds);
+        // A shared-claim wait leaves the ordinary task queued. Retire this
+        // one-shot manual authorization after that attempted source made no
+        // progress, so it cannot recursively start the same blocked drain.
+        const finishedState=this.store.notebooks[task.source];
+        if(task.manual&&this.callsThisRun===startedCalls&&finishedState?.status==="queued"&&!this.shouldYield(task.source)){
+          delete task.manual;
+          this.manualSources.delete(task.source);this.manualEntries.delete(task.source);
+          if(this.manualSources.size)this.progress.manualSources=[...this.manualSources];else delete this.progress.manualSources;
+        }
+        if ((!automatic&&task.pageIds) || (!task.force&&["current","partial"].includes(this.store.notebooks[task.source]?.status)))
           this.store.queue = this.store.queue.filter(
             (t) => t.source !== task.source,
           );
@@ -1558,6 +2051,12 @@ export default class SupernoteTranscripts extends Plugin implements Controller {
           `${entry.relative}: ${readable(error)}`,
         );
       } finally {
+        const finishedState=this.store.notebooks[task.source];
+        const terminal=!!finishedState&&["current","partial","failed","conflict","missing","excluded"].includes(finishedState.status);
+        if(task.manual&&(terminal||!this.store.queue.some(t=>t.source===task.source&&t.manual))){
+          this.manualSources.delete(task.source);this.manualEntries.delete(task.source);
+          if(this.manualSources.size)this.progress.manualSources=[...this.manualSources];else delete this.progress.manualSources;
+        }
         delete this.progress.activeSource;
         this.emit();
       }
@@ -1600,7 +2099,18 @@ export default class SupernoteTranscripts extends Plugin implements Controller {
   ) {
     const reader = this.reader();
     this.stage("Checking pages", entry.relative);
-    const opened = await reader.open(entry.path);
+    const checkOptions=this.checkOptions(entry.path);
+    let retained=this.reusableNotebooks.get(entry.path);
+    this.reusableNotebooks.delete(entry.path);
+    const retainedChecked=retained?.descriptor.checkedPageIds?new Set(retained.descriptor.checkedPageIds):undefined;
+    const inadequate=retained&&descriptorCheckMode(retained.descriptor.checkMode)!=="all"&&
+      (!checkOptions||[...automaticPageIds(checkOptions,retained.descriptor.pages)].some(id=>!retainedChecked?.has(id)));
+    if(retained&&inadequate){
+      retained.close();retained=undefined;
+    }
+    let opened:OpenNotebook;
+    try{opened=retained?await retained.fork!():await reader.open(entry.path,checkOptions);}
+    catch(error){if(retained)try{retained.close();}catch{}throw error;}
     let recognized = 0;
     const recognizedIds = new Set<string>();
     let lease: LeaseHandle | null = null;
@@ -1608,10 +2118,12 @@ export default class SupernoteTranscripts extends Plugin implements Controller {
     let leaseLost = false;
     const shared=this.shared;
     const rule=this.config.rules.find(r=>r.id===entry.ruleId)!;
-    const sharedId=await notebookIdentity(rule.sharedId??rule.id,relativeToRule(entry.path,rule));
+    let sharedId="";
     try {
+      sharedId=await notebookIdentityFor(rule,entry.path);
       const descriptor = opened.descriptor,
         resolved = await this.profile(entry.profileId);
+      const checkedAt=new Date().toISOString();
       if(force&&selectedIds?.some(id=>!descriptor.pages.some(p=>p.id===id)))throw Error("A selected page was removed or its identity changed. Update this notebook and choose the pages again.");
       let state = this.store.notebooks[entry.path];
       if (!state || (!state.order.length && !Object.keys(state.pages).length)) {
@@ -1643,7 +2155,36 @@ export default class SupernoteTranscripts extends Plugin implements Controller {
       validateDestination(destination);
       if (state.output !== destination)
         await this.relocateOutput(state, destination, true);
-      const before = clone(state);
+      let before = clone(state);
+      state.lastCheckMode=descriptorCheckMode(descriptor.checkMode);
+      if(this.automaticRun&&!this.manualSources.has(entry.path))state.lastAutomaticCheck=checkedAt;
+      if(checkOptions)state.lastAutomaticPolicy=automaticPolicyKey(checkOptions);
+      if(state.lastCheckMode==="all"){
+        state.lastFullCheck=checkedAt;state.lastFullCheckRevision=descriptor.revision;
+      }
+      const automaticEligible=checkOptions?automaticPageIds(checkOptions,descriptor.pages):undefined;
+      if(automaticEligible&&descriptor.checkedPageIds){
+        const checked=new Set(descriptor.checkedPageIds);
+        for(const id of automaticEligible)if(!checked.has(id))automaticEligible.delete(id);
+      }
+      if(automaticEligible)state.automaticPending=[...automaticEligible].filter(id=>{
+        const page=descriptor.pages.find(page=>page.id===id)!;
+        return state.pages[id]?.fingerprint!==page.fingerprint&&state.pageIssues?.[id]?.fingerprint!==page.fingerprint;
+      });
+      // Capture human text before pruning an old inventory or presentation.
+      // An exact shared receipt belongs to synchronization, not manual editing.
+      if(this.forcedPublication?.source!==entry.path&&state.publishedHash&&await this.app.vault.adapter.exists(state.output)){
+        const current=await this.app.vault.adapter.read(state.output),actual=await hash(current);
+        const io=this.sharedIO();
+        const received=io?await new PublicationReceipts(io,this.paths.shared).findHash(sharedId,actual):undefined;
+        if(actual!==state.publishedHash&&!received)await this.captureOutputEdits(state,current,before);
+      }
+      before=clone(state);
+      if(Object.keys(state.editedPages??{}).some(id=>!descriptor.pages.some(p=>p.id===id))){
+        if(this.forcedPublication?.source!==entry.path)
+          throw Error("Generated transcript was manually edited on a removed page. Resolve edits before removing its content.");
+        state.editedPages=Object.fromEntries(Object.entries(state.editedPages??{}).filter(([id])=>descriptor.pages.some(p=>p.id===id)));
+      }
       if (state.publishedHash && !state.publishedPages?.length &&
           (await hash(buildMarkdown(before, this.pageHeadingsFor(before))) === state.publishedHash ||
            await hash(buildMarkdown(before, !this.pageHeadingsFor(before))) === state.publishedHash))
@@ -1682,14 +2223,57 @@ export default class SupernoteTranscripts extends Plugin implements Controller {
         ...new Set([...(state.priorityPages ?? []), ...additions]),
       ].filter((id) => state.order.includes(id));
       state.desired = descriptor.pages;
+      // Cleanup is also meaningful edited text when its original ink changes.
+      for(const [id,cleaned] of Object.entries(state.cleanedPages??{})){
+        const page=descriptor.pages.find(p=>p.id===id);
+        if(page&&page.fingerprint!==cleaned.fingerprint&&!state.editedPages?.[id])
+          (state.editedPages??={})[id]={fingerprint:cleaned.fingerprint,baseText:pageBody(cleaned.baseText),text:cleaned.text};
+      }
+      for(const [id,conflict] of Object.entries(state.editConflicts??{})){
+        const page=descriptor.pages.find(p=>p.id===id);
+        if(!page||conflict.fingerprint!==page.fingerprint)delete state.editConflicts![id];
+        else conflict.number=page.number;
+      }
       this.inventories.delete(entry.path);
       state.deviceOcr = Object.fromEntries(Object.entries(state.deviceOcr ?? {}).filter(([id,p]) => descriptor.pages.some(d => d.id===id && d.fingerprint===p.fingerprint)));
+      const deviceOcr=state.deviceOcr;
       state.cleanedPages = Object.fromEntries(Object.entries(state.cleanedPages ?? {}).filter(([id,p]) => descriptor.pages.some(d => d.id===id && d.fingerprint===p.fingerprint)));
-      if (opened.readOcr) for (const page of descriptor.pages) {
-        if (before.revision === descriptor.revision && state.deviceOcr[page.id]) continue;
-        const text = await opened.readOcr(page.number);
-        if (text?.trim()) state.deviceOcr[page.id] = { fingerprint: page.fingerprint, text };
-        else delete state.deviceOcr[page.id];
+      if (opened.readOcr || opened.readOcrMany) {
+        const ocrPages=descriptor.pages.filter(page=>(!automaticEligible||automaticEligible.has(page.id))&&!(before.revision===descriptor.revision&&deviceOcr[page.id]));
+        const mayReadOcr=()=>!this.stop&&!this.disposed&&this.active;
+        const assertCurrentSource=async(error:unknown)=>{
+          let changed=error instanceof Error&&error.name==="SourceChangedError";
+          try{changed ||= await reader.revision(entry.path)!==descriptor.revision;}catch{changed=true;}
+          if(changed)throw error;
+        };
+        let ocrValues:(string|undefined)[]|undefined;
+        if(mayReadOcr()&&opened.readOcrMany&&ocrPages.length>0){
+          try{
+            ocrValues=await opened.readOcrMany(ocrPages.map(page=>page.number));
+            if(ocrValues.length!==ocrPages.length)throw Error("The notebook reader returned an incomplete OCR batch.");
+          }catch(error){
+            await assertCurrentSource(error);
+            // An ordinary OCR batch failure is isolated with the existing
+            // per-page reader so one unreadable OCR block cannot stop peers.
+          }
+        }
+        if(ocrValues&&mayReadOcr()){
+          for(let index=0;index<ocrPages.length;index++){
+            const page=ocrPages[index],text=ocrValues[index];
+            if(text?.trim())deviceOcr[page.id]={fingerprint:page.fingerprint,text};
+            else delete deviceOcr[page.id];
+          }
+        }else if(mayReadOcr()&&opened.readOcr){
+          for(const page of ocrPages){
+            if(!mayReadOcr())break;
+            try{
+              const text=await opened.readOcr(page.number);
+              if(!mayReadOcr())break;
+              if(text?.trim())deviceOcr[page.id]={fingerprint:page.fingerprint,text};
+              else delete deviceOcr[page.id];
+            }catch(error){await assertCurrentSource(error);}
+          }
+        }
       }
       const selected = typeof selection === "string" ? pagesFromRange(selection, descriptor.pages.length) : selection;
       for(const [id,issue] of Object.entries(state.pageIssues??{})){
@@ -1706,12 +2290,12 @@ export default class SupernoteTranscripts extends Plugin implements Controller {
         this.acknowledgeAttempts(entry.path,page.id,page.fingerprint);
         if(forceEveryPage||Array.isArray(selection)||selectedIds)delete state.pageIssues?.[page.id];
       }
-      if(shared&&!force&&!state.forcePending?.length){
+      if(shared&&!force&&(checkOptions||!state.forcePending?.length)){
         const io=this.sharedIO();
         if(io&&await io.exists(state.output)){
           const text=await io.read(state.output);
           if(isManagedTranscript(text)){
-            const receipt=await new PublicationReceipts(io).find(sharedId,text);
+            const receipt=await new PublicationReceipts(io,this.paths.shared).find(sharedId,text);
             const imported=await hydratePublicationCache({receipt,notebookId:sharedId,
               current:state.desired,before:before.desired,local:state.pages,cache:shared});
             Object.assign(state.pages,imported);
@@ -1734,7 +2318,8 @@ export default class SupernoteTranscripts extends Plugin implements Controller {
         }
       }
       await this.recoverInterruptedAttempts(entry.path);
-      await this.checkOutput(state,before,sharedId);
+      await this.checkOutput(state,before,sharedId,true);
+      this.reconcileCachedEdits(state);
       await this.persist();
       if (force && (selection || selectedIds)) {
         state.forcePending = Array.from(
@@ -1760,7 +2345,8 @@ export default class SupernoteTranscripts extends Plugin implements Controller {
       await this.persist();
       const pending = descriptor.pages.filter(
         (p) =>
-          (state.forcePending?.includes(p.id) ||
+          (!automaticEligible||automaticEligible.has(p.id))&&
+          ((!checkOptions&&state.forcePending?.includes(p.id)) ||
             state.pages[p.id]?.fingerprint !== p.fingerprint) &&
           (!selected || selected.includes(p.number)) && (!selectedIds || selectedIds.includes(p.id)) && state.pageIssues?.[p.id]?.fingerprint!==p.fingerprint,
       );
@@ -1799,10 +2385,10 @@ export default class SupernoteTranscripts extends Plugin implements Controller {
         const refreshTargets=async()=>{
           const remaining=[];
           for(const page of targets){
-            if(!state.forcePending?.includes(page.id)){
+            if(checkOptions||!state.forcePending?.includes(page.id)){
               const local=state.pages[page.id];
               const received=local?.fingerprint===page.fingerprint?local:shared?(await shared.findResult(query(page))).chosen:undefined;
-              if(received){await commit(async()=>{state.pages[page.id]={fingerprint:page.fingerprint,text:received.text,recipe:resolved.recipe,number:page.number,...(received.recognition?{recognition:received.recognition}:{}),...(isEmptyPage(received.text)?{blank:true}:{})};delete state.pageIssues?.[page.id];await this.persist();});continue;}
+              if(received){await commit(async()=>{state.pages[page.id]={fingerprint:page.fingerprint,text:received.text,recipe:resolved.recipe,number:page.number,...(received.recognition?{recognition:received.recognition}:{}),...(isEmptyPage(received.text)?{blank:true}:{})};delete state.pageIssues?.[page.id];this.reconcileCachedEdits(state);await this.persist();});continue;}
             }
             remaining.push(page);
           }
@@ -1814,8 +2400,8 @@ export default class SupernoteTranscripts extends Plugin implements Controller {
         const markFailure=async(page:{id:string;number:number;fingerprint:string},reason:string,kind:string)=>{
           const previous=state.pageIssues?.[page.id],attempt=state.pageAttempts?.[page.id];
           const attempts=(previous?.fingerprint===page.fingerprint?previous.attempts:attempt?.fingerprint===page.fingerprint?attempt.count:0)+1;
-          (state.pageIssues??={})[page.id]={fingerprint:page.fingerprint,number:page.number,status:"failed",kind,reason,attempts,updatedAt:new Date().toISOString(),...(state.forcePending?.includes(page.id)?{force:true}:{})};
-          state.forcePending=state.forcePending?.filter(id=>id!==page.id);
+          (state.pageIssues??={})[page.id]={fingerprint:page.fingerprint,number:page.number,status:"failed",kind,reason,attempts,updatedAt:new Date().toISOString(),...(!checkOptions&&state.forcePending?.includes(page.id)?{force:true}:{})};
+          if(!checkOptions)state.forcePending=state.forcePending?.filter(id=>id!==page.id);
         };
         try{
           let context=contextPages(targets,descriptor.pages,resolved.profile.quality);
@@ -1827,6 +2413,22 @@ export default class SupernoteTranscripts extends Plugin implements Controller {
             if(!mayStart())return false;
             for(const page of targets)activePages.add(page.number);
             this.progress.activePages=[...activePages].sort((a,b)=>a-b);
+            const needed=[...targets,...context].filter(page=>!imageCache.has(page.id));
+            let batchedImages:Map<string,string>|undefined;
+            if(opened.renderMany&&needed.length>1){
+              try{
+                this.progress.activePage={source:entry.path,number:needed[0].number,total:descriptor.pages.length};
+                this.progress.renderingContext=!targets.some(t=>t.id===needed[0].id);
+                this.stage("Rendering",`${entry.relative} — ${needed.length} target and context pages`);
+                const batch=await opened.renderMany(needed.map(page=>page.number));
+                if(batch.length!==needed.length)throw Error("The notebook reader returned an incomplete image batch.");
+                batchedImages=new Map(needed.map((page,index)=>[page.id,batch[index]]));
+              }catch(error){
+                if((error instanceof Error&&error.name==="SourceChangedError")||await reader.revision(entry.path)!==descriptor.revision)throw error;
+                // A batch decode failure should not make otherwise readable
+                // target or context pages fail together. Retry one page at a time.
+              }
+            }
             for(const page of [...targets,...context]){
               if(!mayStart())return false;
               this.progress.activePage={source:entry.path,number:page.number,total:descriptor.pages.length};
@@ -1834,6 +2436,7 @@ export default class SupernoteTranscripts extends Plugin implements Controller {
               try{
                 let image=imageCache.get(page.id);
                 if(image!==undefined){imageCache.delete(page.id);imageCache.set(page.id,image);}
+                else if(batchedImages?.has(page.id)){image=batchedImages.get(page.id)!;rememberImage(page.id,image);}
                 else {
                   this.stage("Rendering",`${entry.relative} — ${targets.some(t=>t.id===page.id)?"page":"context page"} ${page.number}`);
                   image=await opened.render(page.number);rememberImage(page.id,image);
@@ -1849,14 +2452,23 @@ export default class SupernoteTranscripts extends Plugin implements Controller {
           phase="guard";
           if(!mayStart())return;
           if((await reader.revision(entry.path))!==descriptor.revision)throw Error("Notebook changed before recognition. Retry after saving it.");
-          const textContext=[...context.map(p=>{const t=pageTextLayer(state,p);return !t.stale&&t.text?`CONTEXT PAGE ${p.number}: ${t.text}`:"";}),
+          const textContext=[...context.map(p=>{const t=displayedPageText(state,p);return !t.stale&&t.text?`CONTEXT PAGE ${p.number}: ${t.text}`:"";}),
             ...targets.map(p=>state.pages[p.id]?.text?`PREVIOUS VERSION OF TARGET PAGE ${p.number} (may be outdated; the new image is authoritative): ${state.pages[p.id].text}`:""),
             ...[...targets,...context].map(p=>state.deviceOcr?.[p.id]?.text?`UNVERIFIED DEVICE OCR PAGE ${p.number} (image is authoritative): ${state.deviceOcr[p.id].text}`:"")]
             .filter(Boolean).join("\n").slice(0,qualitySettings(resolved.profile.quality).textContextChars);
           // Snapshot group identities and context; late cache arrivals cancel and replan unsent targets in this update.
           const requestTargets=targets.slice();
-          const prompt=recognitionPrompt(resolved.profile.prompt,resolved.reference,targets,context,textContext,resolved.profile.quality,resolveFormatting(resolved.profile));
+          const editInputs=new Map(targets.flatMap(page=>{
+            const edited=state.editedPages?.[page.id];
+            return edited?[[page.id,clone(edited)] as const]:[];
+          }));
+          const prompt=recognitionPrompt(resolved.profile.prompt,resolved.reference,targets,context,textContext,resolved.profile.quality,resolveFormatting(resolved.profile))+
+            reconciliationInstructions(targets.flatMap(page=>{
+              const edited=editInputs.get(page.id);
+              return edited?[{number:page.number,baseText:pageBody(edited.baseText),editedText:pageBody(edited.text)}]:[];
+            }));
           state.status="recognizing";phase="recognize";
+          if(prompt.length>400000)throw new RecognitionFailure("edit_context","This page's edit and reference context is too large for one recognition request. Shorten it or use a smaller page selection; your edits were preserved.");
           this.progress.activePage={source:entry.path,number:targets[0].number,total:descriptor.pages.length};
           this.progress.renderingContext=false;
           const request = { targets:requestTargets, images, prompt, usedModel:resolved.profile.model };
@@ -1875,10 +2487,16 @@ export default class SupernoteTranscripts extends Plugin implements Controller {
               const page=result.page;
               const text=normalizePageText(result.text);
               state.pages[page.id]={fingerprint:page.fingerprint,text,recipe:resolved.recipe,number:page.number,recognition:{provider:this.provider,model:request.usedModel,quality:qualitySettings(resolved.profile.quality).mode as "fast"|"balanced"|"careful",recognizedAt:new Date().toISOString(),promptHash:resolved.promptHash,glossaryHash:resolved.glossaryHash},...(isEmptyPage(text)?{blank:true}:{})};
+              const edit=editInputs.get(page.id);
+              if(edit){
+                if(JSON.stringify(state.editedPages?.[page.id])!==JSON.stringify(edit))
+                  throw Error("The transcript edits changed during recognition. New recognition is cached; review the latest edits before updating.");
+                this.reconcilePageEdit(state,page.id,result.reconciliation);
+              }
               delete state.cleanedPages?.[page.id];
               if(state.cleanup)state.cleanup.stale=true;
               delete state.pageIssues?.[page.id];delete state.pageAttempts?.[page.id];
-              state.forcePending=state.forcePending?.filter(id=>id!==page.id);state.priorityPages=state.priorityPages?.filter(id=>id!==page.id);
+              if(!checkOptions)state.forcePending=state.forcePending?.filter(id=>id!==page.id);state.priorityPages=state.priorityPages?.filter(id=>id!==page.id);
               recognized++;recognizedIds.add(page.id);this.progress.recognized++;
             }
             for(const failure of parsed.failures){const page=failure.page;if(page)await markFailure(page,failure.reason,failure.kind??"incomplete");}
@@ -1907,7 +2525,11 @@ export default class SupernoteTranscripts extends Plugin implements Controller {
         ? "excluded"
         : pendingPages(state).length
           ? "queued"
-          : state.desired.some(p=>state.pageIssues?.[p.id]?.fingerprint===p.fingerprint)?"partial":"current";
+          : state.desired.some(p=>state.pageIssues?.[p.id]?.fingerprint===p.fingerprint)||Object.keys(state.editConflicts??{}).length?"partial":"current";
+      state.automaticPending=(state.automaticPending??[]).filter(id=>{
+        const page=state.desired.find(p=>p.id===id);
+        return !!page&&state.pages[id]?.fingerprint!==page.fingerprint&&state.pageIssues?.[id]?.fingerprint!==page.fingerprint;
+      });
       state.profileOutdated = profileNeedsRefresh(state, resolved.recipe);
       if (leaseLost){state.status="queued";state.error="Another device took priority; completed pages are saved.";}
       if (!leaseLost&&(this.aiEnabled || recognized > 0 || Object.keys(state.pages).length>0 || Object.keys(state.deviceOcr??{}).length>0)) await this.publish(state, before,sharedId);
@@ -1919,6 +2541,7 @@ export default class SupernoteTranscripts extends Plugin implements Controller {
       delete this.progress.activePage;
       delete this.progress.activePages;
       opened.close();
+      if(retained)retained.close();
     }
   }
   private async transcriptRecovery<T>(run: () => Promise<T>): Promise<T> {
@@ -1929,6 +2552,63 @@ export default class SupernoteTranscripts extends Plugin implements Controller {
     this.task = operation;
     try { return await operation; }
     finally { this.task = null; this.emit(); }
+  }
+  getReconciliationConflicts(source:string){
+    return Object.entries(this.store.notebooks[source]?.editConflicts??{}).map(([pageId,value])=>({pageId,...clone(value)}))
+      .sort((a,b)=>a.number-b.number);
+  }
+  async resolveReconciliationConflict(source:string,pageId:string,choice:"keep-edits"|"use-recognition"|"use-proposal",expectedFingerprint:string,expectedEditedText:string):Promise<void>{
+    return this.transcriptRecovery(async()=>{
+      if(!["keep-edits","use-recognition","use-proposal"].includes(choice))throw Error("Choose a valid page version.");
+      const state=this.store.notebooks[source],conflict=state?.editConflicts?.[pageId];
+      const page=state?.desired.find(p=>p.id===pageId);
+      if(!state||!conflict||!page||conflict.fingerprint!==expectedFingerprint||conflict.editedText!==expectedEditedText||
+        page.fingerprint!==expectedFingerprint||state.pages[pageId]?.fingerprint!==expectedFingerprint)
+        throw Error("This page changed since the comparison. Open its latest changes before choosing.");
+      if(await this.reader().revision(source)!==state.revision)throw Error("The notebook changed. Update it before choosing a page version.");
+      await this.checkOutput(state);
+      const before=clone(state),next=clone(state);
+      if(choice==="use-recognition")delete next.editedPages?.[pageId];
+      else{
+        const text=choice==="use-proposal"?conflict.proposedText:conflict.editedText;
+        if(typeof text!=="string")throw Error("There is no saved reconciled proposal for this page.");
+        (next.editedPages??={})[pageId]={fingerprint:page.fingerprint,baseText:pageBody(next.pages[pageId].text),
+          text:pageWithBody(text,next.pages[pageId].text)};
+      }
+      delete next.editConflicts?.[pageId];
+      next.status=pendingPages(next).length?"queued":Object.keys(next.editConflicts??{}).length||Object.keys(next.pageIssues??{}).length?"partial":"current";
+      const rule=ruleFor(source,this.config.rules);
+      const sharedId=rule?await notebookIdentityFor(rule,source):undefined;
+      // Compare-and-save in publish protects against Sync or editing during this choice.
+      this.historyProtectedSources.delete(source);
+      await this.publish(next,before,sharedId);
+      this.store.notebooks[source]=next;
+      await this.persist();
+    });
+  }
+  private reconcilePageEdit(state:NotebookState,pageId:string,proposal?:{status:string;text?:string;reason?:string}){
+    const edited=state.editedPages?.[pageId],page=state.desired.find(p=>p.id===pageId),fresh=state.pages[pageId];
+    if(!edited||!page||fresh?.fingerprint!==page.fingerprint)return;
+    const base=pageBody(edited.baseText),ours=pageBody(edited.text),theirs=pageBody(fresh.text);
+    const merged=mergePageEdits(base,ours,theirs);
+    let body:string|undefined=merged.status==="merged"?merged.text:undefined;
+    let reason=merged.status==="conflict"?merged.reason:"";
+    if(proposal?.status==="conflict"&&ours!==theirs){body=undefined;reason=proposal.reason??reason;}
+    if(body===undefined&&proposal?.status==="merged"&&typeof proposal.text==="string")body=pageBody(proposal.text);
+    if(body!==undefined){const checked=validateReconciledText(ours,body);if(!checked.valid){body=undefined;reason=checked.reason;}}
+    if(body!==undefined){
+      (state.editedPages??={})[pageId]={fingerprint:page.fingerprint,baseText:theirs,text:pageWithBody(body,fresh.text)};
+      delete state.editConflicts?.[pageId];
+    }else (state.editConflicts??={})[pageId]={fingerprint:page.fingerprint,number:page.number,baseText:base,
+      editedText:ours,recognizedText:theirs,reason:(proposal?.status==="conflict"?proposal.reason:reason)||"Your edits and the changed handwriting need a choice."};
+  }
+  private reconcileCachedEdits(state:NotebookState){
+    for(const [id,edited] of Object.entries(state.editedPages??{})){
+      const page=state.desired.find(p=>p.id===id),result=state.pages[id];
+      if(page&&result?.fingerprint===page.fingerprint&&!state.editConflicts?.[id]&&
+        (edited.fingerprint!==page.fingerprint||pageBody(edited.baseText)!==pageBody(result.text)))this.reconcilePageEdit(state,id);
+    }
+    if(Object.keys(state.editConflicts??{}).length&&state.status==="current")state.status="partial";
   }
   private recoverySignature(state: NotebookState) {
     return JSON.stringify([state, this.pageHeadingsFor(state), this.config.rules]);
@@ -1942,7 +2622,7 @@ export default class SupernoteTranscripts extends Plugin implements Controller {
   private async recoveryReceipts(state: NotebookState, current: string, generated: string, id: string) {
     const io = this.sharedIO();
     if (!io) return;
-    const receipts = new PublicationReceipts(io);
+    const receipts = new PublicationReceipts(io,this.paths.shared);
     const hashes = new Set([await hash(current), await hash(generated)]);
     if (state.publishedHash) hashes.add(state.publishedHash);
     for (const h of hashes) {
@@ -1970,7 +2650,7 @@ export default class SupernoteTranscripts extends Plugin implements Controller {
     const rule = ruleFor(source, this.config.rules);
     if (!rule || !this.sourceSelected(source)) throw Error("Restore the enabled notebook selection before recovering its transcript.");
     validateDestination(state.output);
-    if (!/\.md$/i.test(state.output) || isSharedPath(state.output)) throw Error("Invalid transcript recovery destination.");
+    if (!/\.md$/i.test(state.output) || isDataPath(state.output,this.activeSupportFolder)) throw Error("Invalid transcript recovery destination.");
     if (state.legacy) throw Error("No verified cached page text is available for this notebook.");
     const output = state.output;
     const reader = this.reader();
@@ -2010,7 +2690,7 @@ export default class SupernoteTranscripts extends Plugin implements Controller {
     if (!current.startsWith("---\nnomad_transcripts: true\n") ||
         (!/^[a-f0-9]{64}$/.test(state.publishedHash ?? "") && !current.includes(`\n# ${title}\n`)))
       throw Error("Destination is a personal note or a different notebook. Recovery refused.");
-    const id = await notebookIdentity(rule.sharedId ?? rule.id, relativeToRule(source, rule));
+    const id = await notebookIdentityFor(rule, source);
     const endOfFrontmatter = current.indexOf("\n---", 4);
     if (endOfFrontmatter < 0) throw Error("Transcript ownership frontmatter is incomplete. Recovery refused.");
     const frontmatter = current.slice(0, endOfFrontmatter);
@@ -2094,7 +2774,7 @@ export default class SupernoteTranscripts extends Plugin implements Controller {
         if (await this.app.vault.adapter.read(next.output) !== generated)
           throw Error("Generated transcript was manually edited before recovery completed.");
         const io = this.sharedIO();
-        if (io) await new PublicationReceipts(io).save(c.id, generated, next.desired, next.pages,this.presentationFor(next));
+        if (io) await new PublicationReceipts(io,this.paths.shared).save(c.id, generated, next.desired, next.pages,this.presentationFor(next));
         await assertCurrent(action === "replace" ? generated : c.current);
         if (await this.app.vault.adapter.read(next.output) !== generated)
           throw Error("Generated transcript was manually edited before recovery completed.");
@@ -2120,7 +2800,45 @@ export default class SupernoteTranscripts extends Plugin implements Controller {
     });
   }
   private presentationFor(state: NotebookState) {
-    return state.cleanup ? { cleanedPages:state.cleanedPages??{}, cleanup:state.cleanup } : undefined;
+    return state.cleanup || Object.keys(state.editedPages??{}).length || Object.keys(state.editConflicts??{}).length
+      ? { cleanedPages:state.cleanedPages??{}, ...(state.cleanup?{cleanup:state.cleanup}:{}),
+        ...(Object.keys(state.editedPages??{}).length?{editedPages:state.editedPages}:{}),
+        ...(Object.keys(state.editConflicts??{}).length?{editConflicts:state.editConflicts}:{}) } : undefined;
+  }
+  /** Import body-only edits against one verified publication, never a guessed source. */
+  private async captureOutputEdits(state:NotebookState, current:string, before?:NotebookState):Promise<boolean> {
+    if(!state.publishedHash)return false;
+    const candidates=[state.publishedText,before?.publishedText,
+      ...(before?[buildMarkdown(before,this.pageHeadingsFor(before)),buildMarkdown(before,!this.pageHeadingsFor(before))]:[]),
+      buildMarkdown(state,this.pageHeadingsFor(state)),buildMarkdown(state,!this.pageHeadingsFor(state))];
+    let baseline:string|undefined;
+    for(const value of candidates)if(typeof value==="string"&&await hash(value)===state.publishedHash){baseline=value;break;}
+    if(baseline===undefined)return false;
+    const pages=state.publishedPages?.length?state.publishedPages:before?.desired??state.desired;
+    const captured=captureMarkdownEdits(baseline,current,pages);
+    if(captured.status==="conflict")throw Error(`Generated transcript was manually edited: ${captured.reason} Use Resolve edits to preserve both versions.`);
+    const next={...(state.editedPages??{})};
+    for(const edit of captured.pages){
+      const old=pages.find(p=>p.id===edit.id);
+      if(!old || !state.desired.some(p=>p.id===edit.id))throw Error("Generated transcript was manually edited on a removed page. Resolve edits before removing its content.");
+      if(edit.baseText===edit.editedText)continue;
+      const previous=before?.pages[edit.id]??state.pages[edit.id];
+      const prior=next[edit.id];
+      const reference=prior?.text??(before?.cleanedPages?.[edit.id]?.text)??previous?.text??"";
+      const body=pageBody(edit.editedText).replace(/\n\n> Previous transcription; this page has changed\.$/,"");
+      if(body.length>1_000_000)throw Error("Generated transcript was manually edited beyond the per-page reconciliation limit. Resolve edits before updating.");
+      next[edit.id]={fingerprint:old.fingerprint,baseText:prior?.baseText??pageBody(edit.baseText),
+        text:pageWithBody(body,reference)};
+      // An edit made after an unresolved response invalidates that proposal.
+      const conflict=state.editConflicts?.[edit.id];
+      if(conflict){conflict.editedText=pageBody(next[edit.id].text);delete conflict.proposedText;conflict.reason="Your text changed after recognition. Choose which version to keep.";}
+    }
+    state.editedPages=next;
+    state.publishedHash=await hash(current);
+    state.publishedText=current.length<=16*1024*1024?current:undefined;
+    state.publishedPages=clone(pages);
+    await this.persist();
+    return true;
   }
   private async publish(state: NotebookState, before: NotebookState, sharedId?:string) {
     await this.checkOutput(state,before,sharedId);
@@ -2176,13 +2894,14 @@ export default class SupernoteTranscripts extends Plugin implements Controller {
       else await this.app.vault.create(path, text);
     }
     state.publishedHash = await hash(text);
+    state.publishedText=text.length<=16*1024*1024?text:undefined;
     if(this.forcedPublication?.source===state.source)this.forcedPublication.hash=state.publishedHash;
     state.publishedPages = clone(state.desired);
-    const io=this.sharedIO();if(io&&sharedId)await new PublicationReceipts(io).save(sharedId,text,state.desired,state.pages,this.presentationFor(state));
+    const io=this.sharedIO();if(io&&sharedId)await new PublicationReceipts(io,this.paths.shared).save(sharedId,text,state.desired,state.pages,this.presentationFor(state));
     if (previous !== text) state.lastSaved = new Date().toISOString();
     await this.persist();
   }
-  private async checkOutput(state: NotebookState,before?:NotebookState,sharedId?:string) {
+  private async checkOutput(state: NotebookState,before?:NotebookState,sharedId?:string,allowEditCapture=false) {
     if(this.forcedPublication?.source===state.source&&this.forcedPublication.hash!==undefined&&
         !await this.app.vault.adapter.exists(state.output))throw Error("Transcript was removed during Force update. Review before forcing again.");
     if (await this.app.vault.adapter.exists(state.output)) {
@@ -2197,7 +2916,7 @@ export default class SupernoteTranscripts extends Plugin implements Controller {
           throw Error("Transcript changed during Force update. The new edits are preserved; review before forcing again.");
         return;
       }
-      const io=this.sharedIO(),receipt=io&&sharedId?await new PublicationReceipts(io).findHash(sharedId,actual):undefined;
+      const io=this.sharedIO(),receipt=io&&sharedId?await new PublicationReceipts(io,this.paths.shared).findHash(sharedId,actual):undefined;
       const observedInventory = receipt && (canAdvancePublication(receipt,state.desired,before?.desired??[]) ||
         canAdvancePublication(receipt,state.desired,state.publishedPages??[]));
       const legacyAppend = receipt && this.ownedLegacyAppend(state, receipt, actual) &&
@@ -2212,6 +2931,9 @@ export default class SupernoteTranscripts extends Plugin implements Controller {
         if(different.size)throw Error(`Shared transcript recognition versions differ on pages ${[...different].sort((a,b)=>a-b).join(", ")}. Force update can use this device's results after backing up the current transcript.`);
         throw Error("Shared transcript results have not arrived. Check Obsidian Sync, or choose Force update to use this device's available results.");
       }
+      if(receipt&&!receipt.presentation&&state.publishedHash!==actual){
+        delete state.cleanedPages;delete state.cleanup;delete state.editedPages;delete state.editConflicts;
+      }
       if(receipt?.presentation && state.publishedHash !== actual) {
         if(Object.entries(receipt.presentation.cleanedPages).some(([id,p])=>{
           const page=state.desired.find(d=>d.id===id);
@@ -2221,7 +2943,11 @@ export default class SupernoteTranscripts extends Plugin implements Controller {
           const page=state.desired.find(d=>d.id===id);
           return page?.fingerprint===p.fingerprint&&pageTextLayer(state,page).text===p.baseText;
         }));
-        state.cleanup=clone(receipt.presentation.cleanup);
+        if(receipt.presentation.cleanup)state.cleanup=clone(receipt.presentation.cleanup);else delete state.cleanup;
+        state.editedPages=clone(receipt.presentation.editedPages??{});
+        state.editConflicts=Object.fromEntries(Object.entries(receipt.presentation.editConflicts??{}).map(([id,p])=>
+          [id,{...clone(p),number:state.desired.find(d=>d.id===id)?.number??p.number}]));
+        this.reconcileCachedEdits(state);
       }
       if (legacyAppend) {
         state.publishedPages = receipt!.pages.map((p, i) => ({ ...p, number: i + 1 }));
@@ -2230,19 +2956,23 @@ export default class SupernoteTranscripts extends Plugin implements Controller {
       if (state.publishedHash !== actual) {
         if (text === buildMarkdown(state,this.pageHeadingsFor(state)) || text===buildMarkdown(state,!this.pageHeadingsFor(state))) {
           state.publishedHash = actual;
+          state.publishedText=text.length<=16*1024*1024?text:undefined;
           state.publishedPages = clone(state.desired);
           await this.persist();
         } else {
           if(receipt&&observedInventory){
             state.publishedHash=actual;
+            state.publishedText=text.length<=16*1024*1024?text:undefined;
             state.publishedPages=receipt.pages.map((p,i)=>({...p,number:i+1}));
             await this.persist();return;
           }
+          if(allowEditCapture&&await this.captureOutputEdits(state,text,before))return;
           throw new Error(
             "Generated transcript was manually edited or has no ownership record. Preserve it or choose another output folder before retrying.",
           );
         }
       }
+      if(state.publishedHash===actual&&text.length<=16*1024*1024)state.publishedText=text;
     }
   }
   private async relocateOutput(
@@ -2470,11 +3200,26 @@ export default class SupernoteTranscripts extends Plugin implements Controller {
       this.settingsPersistencePending ||
       (this.forcedPublication?.source!==source && (
       this.sharedSettingsIssues.some(issue=>issue.ruleId===rule?.id) ||
-      (this.automaticRun && rule?.autoRecognize === false) ||
-      !!rule?.paused ||
-      !!this.store.notebooks[source]?.paused
+      (this.automaticRun && rule?.autoRecognize === false && !this.manualSources.has(source)) ||
+      (!!rule?.paused&&!this.manualSources.has(source)) ||
+      (!!this.store.notebooks[source]?.paused&&!this.manualSources.has(source))
       ))
     );
+  }
+  private manualCanRun(source:string){
+    const rule=ruleFor(source,this.config.rules),state=this.store.notebooks[source];
+    return this.manualSources.has(source)&&!this.manualPersistenceCounts.has(source)&&!!rule&&this.sourceSelected(source)&&!this.settingsPersistencePending&&
+      !this.sharedSettingsIssues.some(issue=>issue.ruleId===rule.id)&&
+      !state?.executionIssue&&!state?.legacyPageFailure&&!(state&&["failed","conflict","missing","excluded"].includes(state.status))&&
+      !this.stop&&!this.disposed;
+  }
+  private cancelManualSources(matches:(source:string)=>boolean){
+    for(const source of [...this.manualSources])if(matches(source)){
+      this.manualSources.delete(source);this.manualEntries.delete(source);
+      this.store.queue=this.store.queue.filter(task=>!(task.source===source&&task.manual));
+    }
+    if(this.manualSources.size)this.progress.manualSources=[...this.manualSources];else delete this.progress.manualSources;
+    this.emit();
   }
   async openNotebookPage(outputPath: string, pageId: string, displayNumber: number): Promise<void> {
     if (this.initializing || this.disposed) throw Error("The transcription plugin is still loading. Try the page link again shortly.");
@@ -2483,7 +3228,7 @@ export default class SupernoteTranscripts extends Plugin implements Controller {
       const target = await resolveNotePage({ outputPath, pageId, displayNumber }, {
         config: this.config, store: this.store, reader: this.reader(false),
         platform: this.platform,
-        readTranscript: path => this.app.vault.adapter.read(path), sharedIO: this.sharedIO(),
+        readTranscript: path => this.app.vault.adapter.read(path), sharedIO: this.sharedIO(), sharedRoot:this.paths.shared,
       });
       if (this.disposed) return;
       if (this.platform === "nomad") window.open(notePageUrl(target));
@@ -2560,7 +3305,7 @@ export default class SupernoteTranscripts extends Plugin implements Controller {
       const state=this.store.notebooks[source],rule=ruleFor(source,this.config.rules);
       if(!state||!rule||!this.sourceSelected(source))throw Error("Enable this notebook source before forcing an update.");
       if(options.reRecognizeAll&&!this.aiEnabled)throw Error("Enable AI recognition before re-recognizing every page.");
-      const output=state.output,id=await notebookIdentity(rule.sharedId??rule.id,relativeToRule(source,rule));
+      const output=state.output,id=await notebookIdentityFor(rule,source);
       const exists=await this.app.vault.adapter.exists(output),current=exists?await this.app.vault.adapter.read(output):undefined;
       if(current!==undefined){
         if(!isManagedTranscript(current))throw Error("Destination is a personal note. Force update will not overwrite it.");
@@ -2651,10 +3396,11 @@ export default class SupernoteTranscripts extends Plugin implements Controller {
       const explicitCopy=options.saveCopy&&options.copyPath!==undefined?options.copyPath.trim():undefined;
       if(explicitCopy!==undefined){
         validateDestination(explicitCopy);
-        if(!/\.md$/i.test(explicitCopy)||/[<>:"|?*]/.test(explicitCopy)||isSharedPath(explicitCopy.toLowerCase(),"supernote transcripts/shared data")||explicitCopy.toLowerCase()===state.output.toLowerCase())
+        if(!/\.md$/i.test(explicitCopy)||/[<>:"|?*]/.test(explicitCopy)||isDataPath(explicitCopy,this.activeSupportFolder)||explicitCopy.toLowerCase()===state.output.toLowerCase())
           throw Error("Choose a new Markdown copy path inside this vault, outside Shared Data and the original transcript.");
         if(await this.app.vault.adapter.exists(explicitCopy))throw Error("The cleanup copy destination already exists. Choose a new path.");
       }
+      if(Object.keys(state.editConflicts??{}).length)throw Error("Review changed pages before cleaning this document. Your edits are preserved.");
       if(state.desired.some(p=>state.pages[p.id]?.fingerprint!==p.fingerprint))throw Error("Finish AI recognition for every page before cleaning the complete document. Device OCR remains readable meanwhile.");
       const current=await this.app.vault.adapter.read(state.output);
       if(!isManagedTranscript(current))throw Error("Cleanup is available only for this notebook's generated transcript.");
@@ -2671,7 +3417,7 @@ export default class SupernoteTranscripts extends Plugin implements Controller {
         if(this.store.notebooks[source]!==original||signatureNow()!==signature||(await this.profile(rule.profileId)).recipe!==resolved.recipe||await reader.revision(source)!==revision||await this.app.vault.adapter.read(state.output)!==current)
           throw Error("The notebook, its settings, or transcript changed during cleanup. Current text was preserved.");
       };
-      const io=this.sharedIO(),shared=this.shared,id=await notebookIdentity(rule.sharedId??rule.id,relativeToRule(source,rule));
+      const io=this.sharedIO(),shared=this.shared,id=await notebookIdentityFor(rule,source);
       let lease:LeaseHandle|null=null,heartbeat:ReturnType<typeof setInterval>|undefined,lost=false;
       try {
         if(shared){lease=await shared.acquire(id);if(!lease)throw Error("Another device is updating this notebook. Try cleanup after it finishes.");heartbeat=setInterval(()=>{void shared.heartbeat(lease!).then(ok=>{if(!ok)lost=true;}).catch(()=>{lost=true;});},30000);}
@@ -2680,6 +3426,8 @@ export default class SupernoteTranscripts extends Plugin implements Controller {
         const raw=await this.transcribe("",1,cleanupProfile,resolved.reference,source,cleanupRecipe,async()=>{await assertCurrent();if(lost||shared&&lease&&!await shared.checkLease(lease))throw Error("Another device took priority. No cleanup request was sent.");if(explicitCopy!==undefined&&await this.app.vault.adapter.exists(explicitCopy))throw Error("The cleanup copy destination already exists. Choose a new path.");return true;},undefined,request);
         if(raw===null){this.stage("Cleanup cancelled","No cleanup was sent. Your transcript is unchanged.");return;}
         const cleaned=cleanupPages(raw,state);
+        delete state.editedPages;
+        delete state.editConflicts;
         state.cleanedPages=cleaned;
         const text=buildMarkdown(state,this.pageHeadingsFor(state));
         const savedText=options.saveCopy&&options.removePageComments?stripPageComments(text):text;
@@ -2702,13 +3450,13 @@ export default class SupernoteTranscripts extends Plugin implements Controller {
         } else {
           await this.savePrevious(original,current);
           // Cache the paid result before writing. A failed publication can be recovered without another request.
-          original.cleanedPages=state.cleanedPages;original.cleanup=state.cleanup;await this.persist();
+          original.cleanedPages=state.cleanedPages;original.cleanup=state.cleanup;delete original.editedPages;delete original.editConflicts;original.publishedText=savedText.length<=16*1024*1024?savedText:undefined;await this.persist();
           await assertCurrent();
           this.stage("Saving cleanup",state.output);
           await this.app.vault.adapter.process(state.output,value=>{if(value!==current||this.store.notebooks[source]!==original||signatureNow()!==signature)throw Error("Transcript or settings changed before cleanup could save. Its current text was preserved.");return text;});
           original.publishedHash=await hash(text);original.publishedPages=clone(original.desired);original.lastSaved=new Date().toISOString();
           delete original.error;original.status=pendingPages(original).length?"queued":"current";
-          if(io)await new PublicationReceipts(io).save(id,text,original.desired,original.pages,this.presentationFor(original));
+          if(io)await new PublicationReceipts(io,this.paths.shared).save(id,text,original.desired,original.pages,this.presentationFor(original));
           await this.persist();this.stage("Document cleaned","Saved in place. The previous version is in History; new pages can append normally.");
         }
         // The paid result has a verified destination. It no longer needs a second copy.

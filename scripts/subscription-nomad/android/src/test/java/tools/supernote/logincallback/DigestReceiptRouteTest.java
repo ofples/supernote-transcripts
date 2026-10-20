@@ -7,7 +7,13 @@ import static org.junit.Assert.*;
 public final class DigestReceiptRouteTest {
     private static final String REQUEST = repeat('a', 64);
 
-    @Test public void acceptsOnlyTheFixedReceiptRouteAndPositiveKnownIdShape() throws Exception {
+    @Test public void acceptsRequestOnlyAndOptionalPositiveKnownId() throws Exception {
+        DigestReceiptRoute.Request requestOnly = DigestReceiptRoute.parse(
+                "supernote-bridge://digest-receipt?request=" + REQUEST);
+        assertEquals(REQUEST, requestOnly.requestId);
+        assertEquals(-1L, requestOnly.assertedId);
+        assertEquals(123L, DigestReceiptRoute.authorizedSavedId("SAVED", 123L, requestOnly.assertedId));
+
         DigestReceiptRoute.Request request = DigestReceiptRoute.parse(
                 "supernote-bridge://digest-receipt?request=" + REQUEST + "&id=123");
         assertEquals(REQUEST, request.requestId);
@@ -31,7 +37,6 @@ public final class DigestReceiptRouteTest {
     }
 
     @Test public void rejectsMissingMalformedOrNoncanonicalParameters() {
-        rejects("supernote-bridge://digest-receipt?request=" + REQUEST);
         rejects("supernote-bridge://digest-receipt?id=1");
         rejects("supernote-bridge://digest-receipt?request=" + REQUEST.toUpperCase(java.util.Locale.ROOT) + "&id=1");
         rejects("supernote-bridge://digest-receipt?request=%" + REQUEST.substring(1) + "&id=1");
@@ -55,6 +60,7 @@ public final class DigestReceiptRouteTest {
         assertEquals(-1L, DigestReceiptRoute.authorizedSavedId("SAVED", 123L, 124L));
         assertEquals(-1L, DigestReceiptRoute.authorizedSavedId("SAVED", -1L, 123L));
         assertEquals(-1L, DigestReceiptRoute.authorizedSavedId("SAVED", 123L, 0L));
+        assertEquals(-1L, DigestReceiptRoute.authorizedSavedId("SAVED", 123L, -2L));
         assertEquals(-1L, DigestReceiptRoute.authorizedSavedId(null, 123L, 123L));
     }
 

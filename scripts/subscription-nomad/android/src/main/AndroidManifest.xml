@@ -10,7 +10,7 @@
   <activity android:name=".OpenNoteActivity" android:exported="true" android:noHistory="true" android:excludeFromRecents="true">
    <intent-filter><action android:name="android.intent.action.VIEW"/><category android:name="android.intent.category.DEFAULT"/><category android:name="android.intent.category.BROWSABLE"/><data android:scheme="supernote-transcripts" android:host="open-note"/></intent-filter>
   </activity>
-  <activity android:name=".DigestActivity" android:exported="true" android:excludeFromRecents="true" android:windowSoftInputMode="adjustResize">
+  <activity android:name=".DigestActivity" android:exported="true" android:noHistory="true" android:excludeFromRecents="true" android:theme="@android:style/Theme.Translucent.NoTitleBar">
    <intent-filter><action android:name="android.intent.action.VIEW"/><category android:name="android.intent.category.DEFAULT"/><category android:name="android.intent.category.BROWSABLE"/><data android:scheme="supernote-bridge" android:host="digest"/></intent-filter>
    <intent-filter><action android:name="android.intent.action.VIEW"/><category android:name="android.intent.category.DEFAULT"/><category android:name="android.intent.category.BROWSABLE"/><data android:scheme="supernote-bridge" android:host="digest-settings"/></intent-filter>
    <intent-filter><action android:name="android.intent.action.VIEW"/><category android:name="android.intent.category.DEFAULT"/><category android:name="android.intent.category.BROWSABLE"/><data android:scheme="supernote-bridge" android:host="digest-receipt"/></intent-filter>

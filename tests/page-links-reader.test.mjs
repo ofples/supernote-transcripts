@@ -359,3 +359,15 @@ test("async reader refresh rejection is contained", async () => {
   assert.equal(unhandled, undefined);
   plugin.app.plugins = originalPlugins;
 });
+
+test("optional Reader Digest preferences remain independent of page-chip visibility", async () => {
+  const resolver = async path => path === "Transcript.md" ? { categoryName: "Study" } : null;
+  installPageLinks(plugin, async () => {}, () => false, { resolveDigestPreferences: resolver });
+  assert.equal(plugin.pageLinks.apiVersion, 1);
+  assert.equal(plugin.pageLinks.capabilities.includes("digestPreferences"), true);
+  assert.deepEqual(await plugin.pageLinks.digestPreferences("Transcript.md"), { categoryName: "Study" });
+  assert.equal(await plugin.pageLinks.digestPreferences("Other.md"), null);
+  installPageLinks(plugin, async () => {}, () => true);
+  assert.equal(plugin.pageLinks.capabilities.includes("digestPreferences"), false);
+  assert.equal(plugin.pageLinks.digestPreferences, undefined);
+});

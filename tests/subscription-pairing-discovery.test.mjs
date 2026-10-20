@@ -25,7 +25,7 @@ function sharedIO(initial = {}) {
 test('advertise writes only the expiring locator under the session id', async () => {
   const { io, files } = sharedIO();
   await advertise(io, { sid, addresses: [address, address], expiresAt: expiry, code: 'NEVER-WRITE' }, publisher, 0);
-  const path = `Supernote Transcripts/Shared Data/Pairing/${publisher}.md`;
+  const path = `_supernote/Shared Data/Pairing/${publisher}.md`;
   const value = JSON.parse(files.get(path));
   assert.deepEqual(value, { v: 1, sid, addresses: [address], expiresAt: expiry });
   assert.doesNotMatch(files.get(path), /code|NEVER-WRITE/i);
@@ -33,6 +33,13 @@ test('advertise writes only the expiring locator under the session id', async ()
   await advertise(io, { sid: nextSid, addresses: [address], expiresAt: expiry }, publisher, 0);
   assert.equal(files.size, 1);
   assert.equal(JSON.parse(files.get(path)).sid, nextSid);
+});
+test('pairing discovery reads and writes beneath an explicit shared root', async () => {
+  const { io, files } = sharedIO();
+  await advertise(io, { sid, addresses: [address], expiresAt: expiry }, publisher, 0, "Device Data/Shared Data");
+  assert.ok(files.has(`Device Data/Shared Data/Pairing/${publisher}.md`));
+  const found = await discover(io, async () => ({ status: 200, json: { v: 1, sid, expiresIn: 600 } }), 0, "Device Data/Shared Data");
+  assert.deepEqual(found.map(x => x.sid), [sid]);
 });
 
 test('discover checks only fresh private locators and requires matching live session info', async () => {

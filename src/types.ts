@@ -1,3 +1,11 @@
+export type AutomaticCheckMode = "new" | "recent" | "all";
+export interface NotebookCheckOptions {
+  mode: AutomaticCheckMode;
+  recentPages: number;
+  previous: PageDescriptor[];
+  /** Previously discovered eligible pages awaiting completion of this policy. */
+  pendingPageIds?: string[];
+}
 export interface Profile {
   id: string;
   name: string;
@@ -18,12 +26,19 @@ export interface FolderRule {
   paused?: boolean;
   /** False means explicit Update only; the device's global automatic switch still applies. */
   autoRecognize?: boolean;
+  /** Omitted inherits Reader; empty means the native Uncategorized category. */
+  digestCategoryName?: string;
+  /** Omitted values inherit this device's automatic-check defaults. */
+  automaticCheck?: AutomaticCheckMode;
+  automaticCheckRecentPages?: number;
   source: string;
   output: string;
   recursive: boolean;
   exclude: string[];
   profileId: string;
   sharedId?: string;
+  /** Stable shared notebook identities retained when individual sources join a folder. */
+  notebookIds?: Record<string, string>;
   /** Last agreed portable settings; paths and execution preferences remain local. */
   sharedBaseline?: import("./catalog").PortableMirror;
   /** Local durable intent to retry a saved settings publication. */
@@ -34,11 +49,17 @@ export interface FolderRule {
 }
 export interface ConfigV1 {
   version: 1;
+  /** Shared vault-relative support-data folder; ordinary Markdown locator carries changes. */
+  supportFolder?: string;
+  /** Last storage-layout revision accepted on this device. */
+  storageRevision?: string;
   profiles: Profile[];
   rules: FolderRule[];
   intervalMinutes: number;
   batchPages: number;
   continuous?: boolean;
+  automaticCheck?: AutomaticCheckMode;
+  automaticCheckRecentPages?: number;
   showPageHeadings?: boolean;
   /** Default semantic instructions used by whole-document cleanup. */
   cleanupPrompt?: string;
@@ -51,6 +72,8 @@ export interface SourceEntry {
   output: string;
   size: number;
   mtime: number;
+  /** Adapter-specific freshness token, including desktop ctime and inode. */
+  revision?: string;
 }
 export interface PageDescriptor {
   id: string;
@@ -65,11 +88,20 @@ export interface NotebookDescriptor {
   height: number;
   /** Native file identity, when present in the current .note header. */
   fileId?: string;
+  /** Partial automatic inventories retain old fingerprints for unchecked pages. */
+  checkMode?: AutomaticCheckMode;
+  checkedPageIds?: string[];
 }
 export interface OpenNotebook {
   descriptor: NotebookDescriptor;
   render(pageNumber: number): Promise<string>;
+  /** Open an independent reader over the same verified index, when supported. */
+  fork?(): Promise<OpenNotebook>;
+  /** Read several verified bitmaps in one scan while preserving request order. */
+  renderMany?(pageNumbers: number[]): Promise<string[]>;
   readOcr?(pageNumber: number): Promise<string | undefined>;
+  /** Read OCR blocks for several pages through one verified source scan. */
+  readOcrMany?(pageNumbers: number[]): Promise<(string | undefined)[]>;
   close(): void;
 }
 export interface ReadOnlySource {
@@ -79,7 +111,7 @@ export interface ReadOnlySource {
     exclude: string[],
   ): Promise<{ path: string; size: number; mtime: number }[]>;
   revision(path: string): Promise<string>;
-  open(path: string): Promise<OpenNotebook>;
+  open(path: string, options?: NotebookCheckOptions): Promise<OpenNotebook>;
   preview?(path: string, pageNumber: number): Promise<string>;
 }
 export type ItemStatus =
@@ -111,6 +143,17 @@ export interface RecognitionMetadata {
 }
 export interface DeviceOcrPage { fingerprint: string; text: string }
 export interface CleanedPage { fingerprint: string; baseText: string; text: string }
+/** Human/presentation edits are separate from immutable recognition results. */
+export interface EditedPage { fingerprint: string; baseText: string; text: string }
+export interface PageEditConflict {
+  fingerprint: string;
+  number: number;
+  baseText: string;
+  editedText: string;
+  recognizedText: string;
+  reason: string;
+  proposedText?: string;
+}
 export interface DocumentCleanup {
   updatedAt: string;
   inputHash: string;
@@ -143,11 +186,21 @@ export interface NotebookState {
   pages: Record<string, TranscriptPage>;
   deviceOcr?: Record<string, DeviceOcrPage>;
   cleanedPages?: Record<string, CleanedPage>;
+  editedPages?: Record<string, EditedPage>;
+  editConflicts?: Record<string, PageEditConflict>;
+  /** One current publication baseline; not an accumulating document history. */
+  publishedText?: string;
   cleanup?: DocumentCleanup;
   status: ItemStatus;
   paused?: boolean;
   error?: string;
   lastSaved?: string;
+  lastAutomaticCheck?: string;
+  lastFullCheck?: string;
+  lastFullCheckRevision?: string;
+  lastCheckMode?: AutomaticCheckMode;
+  lastAutomaticPolicy?: string;
+  automaticPending?: string[];
   publishedHash?: string;
   /** Last inventory published or adopted from a locally observed snapshot. */
   publishedPages?: PageDescriptor[];
@@ -167,6 +220,8 @@ export interface NotebookState {
 export interface QueueTask {
   source: string;
   force: boolean;
+  /** One-time user request; stripped after restart. */
+  manual?: boolean;
   priority?: number;
   modified?: number;
   pageIds?: string[];
@@ -207,6 +262,7 @@ export interface Progress {
   stateBlocked?: string;
   activePages?: number[];
   renderingContext?: boolean;
+  manualSources?: string[];
 }
 export interface QueueEstimate {
   pages: number;
@@ -251,8 +307,11 @@ export interface Controller {
   apiKey: string;
   autoEnabled: boolean;
   saveConfig(): Promise<void>;
+  storagePreferences?(): {hideInExplorer:boolean;excludeFromSearch:boolean};
+  setStoragePreferences?(preferences:{hideInExplorer:boolean;excludeFromSearch:boolean}):Promise<void>;
   subscribe(listener: () => void): () => void;
   update(): Promise<void>;
+  requestRecognitionNow(target: { source?: string; ruleId?: string }): Promise<void>;
   pause(): void;
   resume(): Promise<void>;
   retry(): Promise<void>;
@@ -275,6 +334,8 @@ export interface Controller {
   storageSummary?(): Promise<{ historyFiles: number; cacheFiles: number; bytes: number; removableFiles: number; removableBytes: number }>;
   pruneStorage?(): Promise<{ removedFiles: number; removedBytes: number }>;
   openOutput(path: string): Promise<void>;
+  getReconciliationConflicts(source: string): (PageEditConflict & { pageId: string })[];
+  resolveReconciliationConflict(source: string, pageId: string, choice: "keep-edits" | "use-recognition" | "use-proposal", expectedFingerprint: string, expectedEditedText: string): Promise<void>;
   previewTranscriptRecovery(source: string): Promise<{ current: string; generated: string; output: string; revision: string }>;
   resolveTranscriptConflict(source: string, action: "replace" | "keep", expectedCurrent: string, expectedRevision?: string): Promise<{ backup?: string; output: string }>;
 }

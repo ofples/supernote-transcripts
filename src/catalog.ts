@@ -2,8 +2,8 @@ import type { Profile } from "./types";
 import { SHARED_ROOT, sharedHash } from "./shared";
 import type { SharedIO } from "./shared";
 import { validateDestination } from "./reconcile.mjs";
+import { validateDigestCategoryName } from "./digest-preferences";
 
-const FOLDER = `${SHARED_ROOT}/Mirrors`;
 const HEADER = "<!-- nomad-transcripts-mirror-v1 -->\n```json\n";
 const FOOTER = "\n```\n";
 export interface PortableMirror {
@@ -11,6 +11,14 @@ export interface PortableMirror {
   output: string;
   recursive: boolean;
   exclude: string[];
+  /** Retained cache/publication identities when notebook sources join a folder. */
+  notebookIds?: Record<string, string>;
+  /** Optional source-specific automatic update check; omitted values inherit locally. */
+  automaticCheck?: "new" | "recent" | "all";
+  /** Optional source-specific page limit used when automaticCheck is recent. */
+  automaticCheckRecentPages?: number;
+  /** Native category name is portable; device-local native row IDs are not. */
+  digestCategoryName?: string;
 }
 export interface SharedMirror extends PortableMirror {
   id: string;
@@ -28,6 +36,7 @@ function text(value: unknown, max: number): value is string {
 }
 function portable(input: PortableMirror): PortableMirror {
   if (!input || !input.profile) throw new Error("A shared mirror requires a profile.");
+  const digestCategoryName = validateDigestCategoryName(input.digestCategoryName);
   const p = input.profile;
   if (!identity(p.id) || !text(p.name, 300) || !text(p.model, 300) || !text(p.prompt, 100_000))
     throw new Error("Invalid shared transcription profile.");
@@ -57,6 +66,20 @@ function portable(input: PortableMirror): PortableMirror {
       throw new Error("Shared exclusions cannot contain native source paths.");
     return pattern;
   });
+  let notebookIds: Record<string, string> | undefined;
+  if (input.notebookIds !== undefined) {
+    if (!input.notebookIds || typeof input.notebookIds !== "object" || Array.isArray(input.notebookIds) || Object.keys(input.notebookIds).length > 20_000)
+      throw Error("Invalid retained notebook identities.");
+    notebookIds = {};
+    for (const [relative, id] of Object.entries(input.notebookIds).sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0)) {
+      if (!relative || relative.startsWith("/") || /^[a-z]:/i.test(relative) || /[\\\u0000-\u001f]/.test(relative) ||
+        relative.split("/").some(part => !part || part === "." || part === ".." || ["__proto__", "prototype", "constructor"].includes(part)) ||
+        !/\.note$/i.test(relative) || typeof id !== "string" || !/^[a-f0-9]{64}$/.test(id))
+        throw Error("Invalid retained notebook identity.");
+      notebookIds[relative] = id;
+    }
+    if (new Set(Object.values(notebookIds)).size !== Object.keys(notebookIds).length) throw Error("Retained notebook identities must be unique.");
+  }
   // Explicit whitelist strips API keys, source mounts, pauses and execution settings.
   if (p.quality !== undefined && !["fast", "balanced", "careful"].includes(p.quality))
     throw new Error("Invalid shared transcription quality.");
@@ -64,10 +87,19 @@ function portable(input: PortableMirror): PortableMirror {
     throw new Error("Invalid shared formatting preference.");
   if (p.formattingGuide !== undefined && (typeof p.formattingGuide !== "string" || p.formattingGuide.length > 10_000 || p.formattingGuide.includes("\0")))
     throw new Error("Invalid shared formatting cues.");
+  if (input.automaticCheck !== undefined && !["new", "recent", "all"].includes(input.automaticCheck))
+    throw new Error("Invalid shared automatic update check.");
+  if (input.automaticCheckRecentPages !== undefined &&
+      (!Number.isInteger(input.automaticCheckRecentPages) || input.automaticCheckRecentPages < 1 || input.automaticCheckRecentPages > 100))
+    throw new Error("Invalid shared recent page limit.");
   return { profile: { id: p.id, name: p.name, model: p.model, endpoint: p.endpoint,
     prompt: p.prompt, glossaries, ...(p.quality === undefined ? {} : { quality: p.quality }),
     ...(p.preserveFormatting === undefined ? {} : { preserveFormatting: p.preserveFormatting }),
-    ...(p.formattingGuide === undefined ? {} : { formattingGuide: p.formattingGuide }) }, output: input.output, recursive: input.recursive, exclude };
+    ...(p.formattingGuide === undefined ? {} : { formattingGuide: p.formattingGuide }) }, output: input.output, recursive: input.recursive, exclude,
+    ...(notebookIds === undefined ? {} : { notebookIds }),
+    ...(input.automaticCheck === undefined ? {} : { automaticCheck: input.automaticCheck }),
+    ...(input.automaticCheckRecentPages === undefined ? {} : { automaticCheckRecentPages: input.automaticCheckRecentPages }),
+    ...(digestCategoryName === undefined ? {} : { digestCategoryName }) };
 }
 async function validate(value: any): Promise<SharedMirror> {
   if (!value || value.kind !== "mirror" || value.version !== 1 ||
@@ -104,9 +136,9 @@ const writes = new WeakMap<SharedIO, Promise<SharedMirror>>();
 
 /** Logical source definitions only. Each device chooses its own local source mount. */
 export class MirrorCatalog {
-  readonly folder = FOLDER;
+  readonly folder: string;
   problems: CatalogProblem[] = [];
-  constructor(private io: SharedIO) {}
+  constructor(private io: SharedIO, sharedRoot = SHARED_ROOT) { this.folder = `${sharedRoot}/Mirrors`; }
   async list(): Promise<SharedMirror[]> {
     this.problems = [];
     if (!await this.io.exists(this.folder)) return [];

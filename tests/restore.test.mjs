@@ -57,6 +57,10 @@ test("restore writes one fixed managed backup containing only transcript state",
   assert.doesNotMatch(JSON.stringify(point.snapshot), /source|output|ruleId|apiKey|accountEmail|executionIssue|private@example/);
   assert.equal((await readRestore(io, path, notebookId, first)).text, managedText);
 });
+test("restore path accepts an explicit history root and keeps its legacy default", () => {
+  assert.equal(restorePath(notebookId, "a.note", "Device Data/History"), `Device Data/History/a.note--${notebookId.slice(0, 12)}/Previous version.md`);
+  assert.equal(restorePath(notebookId, "a.note").startsWith("_supernote/History/"), true);
+});
 
 test("a failed replacement write preserves the existing previous-version record", async () => {
   const { io, files } = memoryIO();

@@ -24,7 +24,7 @@ function fixture() {
 const portable = () => ({
   profile: { id: "general", name: "General", model: "vision-model", endpoint: "https://example.test/v1/responses", quality: "balanced", preserveFormatting: true, formattingGuide: "Use marked headings and highlights.",
     prompt: "Transcribe this page faithfully.", glossaries: ["References/Glossary.md", "References/Terms.txt"] },
-  output: "Supernote Transcripts/Transcripts", recursive: true, exclude: ["existing/a.note", "Private/**", "literal\\*.note"],
+  output: "Supernote Transcripts", recursive: true, exclude: ["existing/a.note", "Private/**", "literal\\*.note"],
 });
 const parse = (body) => JSON.parse(body.split("```json\n")[1].split("\n```\n")[0]);
 const envelope = (value) => "<!-- nomad-transcripts-mirror-v1 -->\n```json\n" + JSON.stringify(value) + "\n```\n";
@@ -33,8 +33,15 @@ test("catalog carries readable logical mirrors and portable glossary references 
   await f.catalog.save("rule-uuid", "Satsang", portable());
   const mirror = await f.make().load("rule-uuid");
   assert.deepEqual(settings(mirror), { id: "rule-uuid", name: "Satsang", ...portable() });
-  assert.match([...f.files.keys()][0], /^Supernote Transcripts\/Shared Data\/Mirrors\/[a-f0-9]{64}\.md$/);
+  assert.match([...f.files.keys()][0], /^_supernote\/Shared Data\/Mirrors\/[a-f0-9]{64}\.md$/);
   assert.equal((await f.catalog.list()).length, 1);
+});
+test("catalog accepts a per-instance shared root while retaining the default root", async () => {
+  const f = fixture(), custom = new MirrorCatalog(f.io, "Device Data/Shared Data");
+  await custom.save("custom", "Custom", portable());
+  assert.equal([...f.files.keys()][0].startsWith("Device Data/Shared Data/Mirrors/"), true);
+  assert.equal((await custom.list()).length, 1);
+  assert.deepEqual(await f.catalog.list(), []);
 });
 test("catalog round-trips quality and keeps old records without quality readable as fast-compatible", async () => {
   const f = fixture();
@@ -53,6 +60,61 @@ test("catalog round-trips formatting defaults, including an explicit empty guide
   await f.catalog.save("formatting","Formatting",input);
   const saved=await f.make().load("formatting");
   assert.equal(saved.profile.preserveFormatting,false);assert.equal(saved.profile.formattingGuide,"");
+});
+test("catalog round-trips per-source automatic checks and leaves inherited fields omitted", async () => {
+  const f=fixture(), inherited=portable();
+  await f.catalog.save("inherited","Inherited",inherited);
+  const inheritedBody=[...f.files.values()][0],legacy=parse(inheritedBody);
+  assert.equal("automaticCheck" in legacy,false);
+  assert.equal("automaticCheckRecentPages" in legacy,false);
+  // This revision shape remains readable without materializing local defaults.
+  assert.deepEqual(await f.make().load("inherited"),{
+    id:"inherited",name:"Inherited",...inherited,
+    revision:await mirrorRevision({id:"inherited",name:"Inherited",...inherited}),ancestors:[],
+  });
+  const source=portable();source.automaticCheck="recent";source.automaticCheckRecentPages=12;
+  await f.catalog.save("override","Override",source);
+  const saved=await f.make().load("override");
+  assert.equal(saved.automaticCheck,"recent");assert.equal(saved.automaticCheckRecentPages,12);
+  assert.deepEqual(parse([...f.files.values()][1]).automaticCheckRecentPages,12);
+});
+test("catalog round-trips portable notebook identity mappings", async () => {
+  const f = fixture(), input = portable();
+  input.notebookIds = { "One.note": "a".repeat(64), "Nested/Two.NOTE": "b".repeat(64) };
+  await f.catalog.save("folder", "Folder", input);
+  assert.deepEqual((await f.make().load("folder")).notebookIds, input.notebookIds);
+  assert.deepEqual(parse([...f.files.values()][0]).notebookIds, input.notebookIds);
+});
+
+test("catalog shares native category names and preserves inheritance versus Uncategorized", async () => {
+  const f = fixture();
+  for (const [id, category] of [["inherit", undefined], ["uncategorized", ""], ["named", "Study notes"]]) {
+    const value = portable();
+    if (category !== undefined) value.digestCategoryName = category;
+    await f.catalog.save(id, id, value);
+    const restored = await f.make().load(id);
+    assert.equal(restored.digestCategoryName, category);
+    assert.equal(Object.hasOwn(restored, "digestCategoryName"), category !== undefined);
+  }
+  for (const category of [null, 2, "bad\nname", "x".repeat(129)]) {
+    const value = portable(); value.digestCategoryName = category;
+    await assert.rejects(f.catalog.save("invalid", "invalid", value), /Digest category/);
+  }
+});
+test("catalog rejects unsafe or absolute notebook identity keys and duplicate hashes", async () => {
+  const invalidMaps = [
+    { "../Outside.note": "a".repeat(64) },
+    { "/Absolute.note": "a".repeat(64) },
+    { "C:/Private/One.note": "a".repeat(64) },
+    { "Nested/../One.note": "a".repeat(64) },
+    Object.fromEntries([["__proto__/One.note", "a".repeat(64)]]),
+    { "One.note": "a".repeat(64), "Nested/Two.note": "a".repeat(64) },
+  ];
+  for (const notebookIds of invalidMaps) {
+    const f = fixture(), input = portable(); input.notebookIds = notebookIds;
+    await assert.rejects(f.catalog.save("folder", "Folder", input));
+    assert.equal(f.files.size, 0);
+  }
 });
 test("only portable whitelist fields are written, never source mounts, credentials or execution settings", async () => {
   const f = fixture(), input = portable();
@@ -98,6 +160,10 @@ test("catalog rejects native paths, traversal, nonportable references and secret
     (r) => { r.profile.preserveFormatting = "yes"; },
     (r) => { r.profile.formattingGuide = 100; },
     (r) => { r.profile.formattingGuide = "x".repeat(10_001); },
+    (r) => { r.automaticCheck = "never"; },
+    (r) => { r.automaticCheckRecentPages = 0; },
+    (r) => { r.automaticCheckRecentPages = 101; },
+    (r) => { r.automaticCheckRecentPages = 2.5; },
   ];
   for (const change of modifications) {
     const f = fixture(), input = portable();

@@ -58,6 +58,13 @@ test("receipts match notebook and exact output content and preserve immutable me
   for(const [path,text] of before)assert.equal(io.files.get(path),text);
   assert.deepEqual((await book.find(id,"Markdown")).pages,[{id:p1.id,fingerprint:p1.fingerprint}]);
 });
+test("publication receipts accept a per-instance shared root",async()=>{
+  const io=memoryIO(),id=await notebookIdentity("r","custom.note"),book=new PublicationReceipts(io,"Device Data/Shared Data");
+  await book.save(id,"Markdown",[p1]);
+  assert.ok([...io.files.keys()].every(path=>path.startsWith(`Device Data/Shared Data/${id}/publications/`)));
+  assert.deepEqual((await book.find(id,"Markdown")).pages,[{id:p1.id,fingerprint:p1.fingerprint}]);
+  assert.equal(await new PublicationReceipts(io).find(id,"Markdown"),undefined);
+});
 test("malformed receipt structures return no ownership evidence",async()=>{
   const io=memoryIO(),book=new PublicationReceipts(io),id=await notebookIdentity("r","a.note");
   await book.save(id,"Markdown",[p1]);const path=[...io.files.keys()][0],body=io.files.get(path);
@@ -126,10 +133,11 @@ test("runtime saves every successful in-flight result when a page fails, and con
   const persisted=[...f.io.files].filter(([path])=>/\/state-[ab]\.json$/.test(path)).map(([,body])=>JSON.parse(body)).sort((a,b)=>b.generation-a.generation)[0];
   assert.equal(persisted.store.notebooks[source].pages[p2.id].text,"second paid success");
 });
-test("runtime keeps generated Markdown manual edits and makes no new inference request",async()=>{
+test("runtime keeps generated Markdown edits while retrying changed handwriting",async()=>{
   const f=runtimeFixture();await f.plugin.update();const state=f.plugin.store.notebooks[source],original=f.io.files.get(state.output);
   f.io.files.set(state.output,original+"\nManual correction\n");f.change([page(p1.id,"edited")]);await f.plugin.update();
-  assert.equal(f.io.files.get(state.output),original+"\nManual correction\n");assert.deepEqual(f.calls,[1]);assert.equal(state.status,"conflict");
+  assert.match(f.io.files.get(state.output),/Manual correction/);assert.deepEqual(f.calls,[1,1]);assert.equal(state.status,"current");
+  assert.equal(state.editedPages[p1.id].text.includes("Manual correction"),true);
 });
 test("same-text sequential snapshots preserve both immutable records and tolerate delayed prior delivery",async()=>{
   const io=memoryIO(),book=new PublicationReceipts(io,()=>1_000),id=await sharedKey();

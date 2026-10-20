@@ -5,7 +5,7 @@ const built = await build({ entryPoints: ["src/storage.ts"], bundle: true, platf
 const { inspectStorage, cleanStorage } = await import("data:text/javascript;base64," + Buffer.from(built.outputFiles[0].text).toString("base64"));
 
 const H = "a".repeat(64), H2 = "b".repeat(64), NOTEBOOK = "c".repeat(64), UNKNOWN = "d".repeat(64);
-const HISTORY = "Supernote Transcripts/History", SHARED = "Supernote Transcripts/Shared Data";
+const HISTORY = "_supernote/History", SHARED = "_supernote/Shared Data";
 const RESULT_HEADER = "<!-- nomad-transcripts-shared-v1 -->\n```json\n";
 const RESULT_FOOTER = "\n```\n";
 async function hash(value) { return [...new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(value)))].map(b => b.toString(16).padStart(2, "0")).join(""); }
@@ -24,11 +24,11 @@ function memoryIO() {
   };
 }
 function resultBody(r) { return RESULT_HEADER + JSON.stringify({ ...r, recordId: r.recordId }) + RESULT_FOOTER; }
-async function addResult(io, { notebookId=NOTEBOOK, pageId="p1", fingerprint=H, recipe=H2, text="result", deviceId="device", createdAt=1, mtime=1 }={}) {
+async function addResult(io, { notebookId=NOTEBOOK, pageId="p1", fingerprint=H, recipe=H2, text="result", deviceId="device", createdAt=1, mtime=1, sharedRoot=SHARED }={}) {
   const payload = { kind:"result", version:1, notebookId, pageId, fingerprint, recipe, text, textHash:await hash(text), deviceId, createdAt, nonce:`nonce-${deviceId}-${createdAt}` };
   const recordId = await hash(JSON.stringify(payload));
   const query = await hash(JSON.stringify([pageId, fingerprint, recipe]));
-  const path = `${SHARED}/${notebookId}/results/${query}/${recordId}.md`;
+  const path = `${sharedRoot}/${notebookId}/results/${query}/${recordId}.md`;
   await io.write(path, resultBody({ ...payload, recordId })); io.mtimes.set(path, mtime);
   return { path, ...payload, recordId };
 }
@@ -200,4 +200,73 @@ test("cleaning rejects forged claims and mirror paths even when listed as candid
   const plan={candidates:[{path:claim,text:"claim",bytes:5},{path:mirror,text:"mirror",bytes:6}],emptyFolders:[]};
   assert.deepEqual(await cleanStorage(io,plan),{removedFiles:0,removedBytes:0});
   assert.equal(io.files.get(claim),"claim");assert.equal(io.files.get(mirror),"mirror");
+});
+
+test("custom data root scopes inspection and cleanup to its own History and Shared Data", async () => {
+  const io = memoryIO(), custom = "Device Data", old = `${custom}/History/Notebook/old.md`;
+  await io.write(old, "old");
+  await io.write(`${HISTORY}/Notebook/keep.md`, "keep");
+  const options = opts({ dataRoot: custom, trackedHistory: [old] });
+  const plan = await inspectStorage(io, options);
+  assert.equal(plan.dataRoot, custom);
+  assert.equal(plan.historyFiles, 1);
+  assert.deepEqual(plan.candidates.map(x => x.path), []); // The newest backup is retained.
+  const forgedPlan = { dataRoot: custom, candidates: [{ path: old, text: "old", bytes: 3 }], emptyFolders: [] };
+  assert.deepEqual(await cleanStorage(io, forgedPlan), { removedFiles: 1, removedBytes: 3 });
+  assert.equal(io.files.get(`${HISTORY}/Notebook/keep.md`), "keep");
+});
+
+async function nestedPublicationFixture(retainOldPublication) {
+  const io = memoryIO(), dataRoot = "System/Supernote", sharedRoot = `${dataRoot}/Shared Data`;
+  const oldResult = await addResult(io, { text: "old publication result", createdAt: 1, mtime: 1, sharedRoot });
+  const newestResult = await addResult(io, { recipe: "f".repeat(64), text: "latest page result", createdAt: 10, mtime: 1, sharedRoot });
+  const { PublicationReceipts } = await import("data:text/javascript;base64," + Buffer.from((await build({
+    entryPoints: ["src/publication.ts"], bundle: true, platform: "node", format: "esm", write: false,
+  })).outputFiles[0].text).toString("base64"));
+  let createdAt = 1;
+  const receipts = new PublicationReceipts(io, sharedRoot, () => createdAt);
+  await receipts.save(NOTEBOOK, "old publication output", [{ id: "p1", number: 1, fingerprint: H }], {
+    p1: { text: oldResult.text, fingerprint: H, recipe: H2 },
+  });
+  const oldHash = await hash("old publication output");
+  createdAt = 2;
+  await receipts.save(NOTEBOOK, "latest publication output", [], {});
+  const newestHash = await hash("latest publication output");
+  const oldPublication = [...io.files.keys()].find(path => path.startsWith(`${sharedRoot}/${NOTEBOOK}/publications/${oldHash}/`));
+  const newestPublication = [...io.files.keys()].find(path => path.startsWith(`${sharedRoot}/${NOTEBOOK}/publications/${newestHash}/`));
+  io.mtimes.set(oldPublication, 1); io.mtimes.set(newestPublication, 2);
+  const plan = await inspectStorage(io, opts({ dataRoot, knownNotebooks: [{ notebookId: NOTEBOOK, results: [], publicationHashes: retainOldPublication ? [oldHash] : [] }] }));
+  return { io, plan, oldHash, oldPublication, oldResult, newestResult };
+}
+
+test("nested support roots validate receipts and preserve their referenced cache results", async () => {
+  const { plan, oldPublication, oldResult, newestResult } = await nestedPublicationFixture(true);
+  assert.equal(plan.historyFiles, 0);
+  assert.ok(!plan.candidates.some(candidate => candidate.path === oldPublication));
+  assert.ok(!plan.candidates.some(candidate => candidate.path === oldResult.path));
+  assert.ok(!plan.candidates.some(candidate => candidate.path === newestResult.path));
+});
+
+test("nested support roots prune old validated publication folders and unreferenced results", async () => {
+  const { io, plan, oldPublication, oldResult, newestResult } = await nestedPublicationFixture(false);
+  assert.ok(plan.candidates.some(candidate => candidate.path === oldPublication));
+  assert.ok(plan.candidates.some(candidate => candidate.path === oldResult.path));
+  assert.ok(!plan.candidates.some(candidate => candidate.path === newestResult.path));
+  await cleanStorage(io, plan);
+  assert.equal(io.files.has(oldPublication), false);
+  assert.equal(io.files.has(oldResult.path), false);
+  assert.equal(await io.exists(oldPublication.slice(0, oldPublication.lastIndexOf("/"))), false);
+  assert.equal(await io.exists(oldResult.path.slice(0, oldResult.path.lastIndexOf("/"))), false);
+});
+
+test("nested support roots keep dependent cache results when receipt deletion fails", async () => {
+  const { io, plan, oldPublication, oldResult } = await nestedPublicationFixture(false);
+  const remove = io.remove;
+  io.remove = async path => {
+    if (path === oldPublication) throw Error("simulated locked receipt");
+    return remove(path);
+  };
+  await cleanStorage(io, plan);
+  assert.ok(io.files.has(oldPublication));
+  assert.ok(io.files.has(oldResult.path));
 });

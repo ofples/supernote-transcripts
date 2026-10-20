@@ -5,7 +5,7 @@ import java.net.URISyntaxException;
 import java.util.HashMap;
 import java.util.Map;
 
-/** Strict, Android-independent route for opening an existing locally saved Digest. */
+/** Strict route for opening an existing locally saved Digest. */
 final class DigestReceiptRoute {
     static final int MAX_URI_LENGTH = 256;
     private static final String SCHEME = "supernote-bridge";
@@ -26,7 +26,7 @@ final class DigestReceiptRoute {
         String rawQuery = uri.getRawQuery();
         if (rawQuery == null || rawQuery.isEmpty()) throw invalid();
         String[] pairs = rawQuery.split("&", -1);
-        if (pairs.length != 2) throw invalid();
+        if (pairs.length < 1 || pairs.length > 2) throw invalid();
         Map<String, String> query = new HashMap<>();
         for (String pair : pairs) {
             int equals = pair.indexOf('=');
@@ -38,18 +38,20 @@ final class DigestReceiptRoute {
         }
         String requestId = query.get("request");
         String idText = query.get("id");
-        if (requestId == null || !requestId.matches("[0-9a-f]{64}")
-                || idText == null || !idText.matches("[1-9][0-9]{0,18}")) throw invalid();
-        final long assertedId;
-        try { assertedId = Long.parseLong(idText); }
-        catch (NumberFormatException ignored) { throw invalid(); }
-        if (assertedId <= 0) throw invalid();
+        if (requestId == null || !requestId.matches("[0-9a-f]{64}")) throw invalid();
+        long assertedId = -1L;
+        if (idText != null) {
+            if (!idText.matches("[1-9][0-9]{0,18}")) throw invalid();
+            try { assertedId = Long.parseLong(idText); }
+            catch (NumberFormatException ignored) { throw invalid(); }
+            if (assertedId <= 0) throw invalid();
+        }
         return new Request(requestId, assertedId);
     }
 
-    /** Returns the local saved ID only when it exactly matches the Reader's assertion. */
+    /** Resolves a local SAVED ID, checking the Reader assertion when one is supplied. */
     static long authorizedSavedId(String status, long savedId, long assertedId) {
-        return "SAVED".equals(status) && savedId > 0 && assertedId > 0 && savedId == assertedId
+        return "SAVED".equals(status) && savedId > 0 && (assertedId == -1L || savedId == assertedId)
                 ? savedId : -1L;
     }
 

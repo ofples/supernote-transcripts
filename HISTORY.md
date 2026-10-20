@@ -1,5 +1,13 @@
 # Supernote Transcripts
 
+## 0.16.0 — storage consolidation, safer updates and Reader integration
+
+Support files now live under `_supernote/`, with preflight checks and retry-safe migration from earlier folders. Existing transcript output stays in its configured destination. Automatic check modes, one-shot notebook checks, queue controls and shared-result hydration give more control over updates while preserving local pause and provider settings. Page reading reuses bounded indexes, and transcript edit reconciliation protects manual changes.
+
+Reader integration now supports persistent Highlights and source-aware selection actions. Highlight relocation requires a unique quote and matching context; ambiguous matches stay unresolved. Native Digest category defaults are configurable per source, and the optional Bridge handoff remains separate from ordinary reading and transcription.
+
+The release candidate is versioned 0.16.0. Automated release checks and current device evidence are recorded in [Validation](VALIDATION.md); unresolved sync-record diagnosis and activation/reload follow-up remain listed there.
+
 ## 0.12 — shared source settings and clearer forms
 
 Portable source settings now reconcile through Obsidian Sync while queues, source mounts, sign-in and execution controls remain local. Independent field changes merge; conflicting or causally unrelated edits require an explicit choice. Settings refresh never starts recognition or reprocesses saved pages. See [settings synchronization](SETTINGS-SYNC.md) for setup and limits.

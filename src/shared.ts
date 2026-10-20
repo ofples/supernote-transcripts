@@ -1,4 +1,6 @@
 import type { RecognitionMetadata } from "./types";
+import { SHARED_ROOT } from "./storage-paths";
+export { SHARED_ROOT } from "./storage-paths";
 // @ts-ignore JavaScript provenance helper is shared with the runtime.
 import { recognitionFields, validRecognition } from "./provenance.mjs";
 
@@ -6,7 +8,6 @@ import { recognitionFields, validRecognition } from "./provenance.mjs";
  * Leases reduce duplicate work; local files plus delayed Sync cannot provide an
  * atomic lock or exactly-once requests. Never store credentials in these files.
  */
-export const SHARED_ROOT = "Supernote Transcripts/Shared Data";
 const HEADER = "<!-- nomad-transcripts-shared-v1 -->\n```json\n";
 const FOOTER = "\n```\n";
 const HASH = /^[a-f0-9]{64}$/;

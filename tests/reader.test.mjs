@@ -156,6 +156,42 @@ test("open notebook reads bounded optional device OCR without changing page fing
   opened.close();
 });
 
+test("readOcrMany reads and parses several OCR blocks in one metadata-checked scan", async () => {
+  const ocr = { elements: [{ label: "Fixture text", type: "Text", words: [{ label: "Fixture", "bounding-box": { x: 1, y: 1, width: 30, height: 10 } }, { label: "text", "bounding-box": { x: 32, y: 1, width: 20, height: 10 } }] }] };
+  const bytes = notebook({ ids: ["one", "two", "three"], order: [0, 1, 2], ink: ["a", "b", "c"], recognition: ocr });
+  const source = streamed(bytes), scan = source.scan.bind(source), events = [];
+  source.scan = async (addresses, consume) => { events.push("scan"); return scan(addresses, consume); };
+  const revision = "1:100";
+  const opened = await openByteNotebook("fixture.note", revision, source, async () => revision, undefined,
+    detail => events.push(detail));
+  events.length = 0;
+  assert.deepEqual(await opened.readOcrMany([3, 1, 2]), ["Fixture text", "Fixture text", "Fixture text"]);
+  assert.equal(events.filter(event => event === "scan").length, 1);
+  assert.equal(events[0], "Reading device OCR text", "progress stage is reported before the combined scan");
+  opened.close();
+});
+
+test("readOcrMany rejects changed metadata and preserves per-page invalid OCR results", async () => {
+  const ocr = { elements: [{ label: "Fixture text", type: "Text", words: [{ label: "Fixture", "bounding-box": { x: 1, y: 1, width: 30, height: 10 } }, { label: "text", "bounding-box": { x: 32, y: 1, width: 20, height: 10 } }] }] };
+  let bytes = notebook({ ids: ["one", "two", "three"], order: [0, 1, 2], ink: ["a", "b", "c"], recognition: ocr });
+  const revision = "1:100";
+  const source = new StreamingFile(bytes.length, "fixture", async () => new Response(bytes));
+  const opened = await openByteNotebook("fixture.note", revision, source, async () => revision);
+  bytes = notebook({ ids: ["one", "two", "three"], order: [0, 1, 2], ink: ["a", "b", "c"], recognition: ocr, style: "1" });
+  await assert.rejects(opened.readOcrMany([1, 2]), error => error.name === "SourceChangedError");
+  opened.close();
+
+  let scans = 0;
+  const emptySource = streamed(notebook({ ids: ["one", "two", "three"], order: [0, 1, 2], ink: ["a", "b", "c"], recognitionAddress: "999999" }));
+  const originalScan = emptySource.scan.bind(emptySource);
+  emptySource.scan = async (...args) => { scans++; return originalScan(...args); };
+  const noOcr = await openByteNotebook("fixture.note", revision, emptySource, async () => revision);
+  scans = 0;
+  assert.deepEqual(await noOcr.readOcrMany([1, 2, 3]), [undefined, undefined, undefined]);
+  assert.equal(scans, 0, "no valid OCR addresses means no OCR or metadata scan");
+  noOcr.close();
+});
+
 test("missing or out-of-bounds recognition address is optional", async () => {
   const absent = await openByteNotebook("fixture.note", "1:100", streamed(notebook()), async () => "1:100");
   assert.equal(await absent.readOcr(1), undefined);
@@ -367,6 +403,72 @@ test("render refuses changed bitmap or metadata even when Android stat time and 
   }
 });
 
+test("fork reuses indexed bitmap hashes, survives original close, and releases the shared index", async () => {
+  const bytes = notebook({ ink: [uniformRle(0x65), uniformRle(0x61)] });
+  const source = streamed(bytes, 65536), scan = source.scan.bind(source), counts = new Map();
+  source.scan = async (addresses, consume) => {
+    for (const address of new Set(addresses)) counts.set(address, (counts.get(address) || 0) + 1);
+    return scan(addresses, consume);
+  };
+  const revision = "1:100";
+  const original = await openByteNotebook("fixture.note", revision, source, async () => revision);
+  const bitmapAddress = bytes.blockAddresses.pages[0].bitmap;
+  assert.equal(counts.get(bitmapAddress), 1, "index reads each bitmap once");
+
+  const fork = await original.fork();
+  assert.equal(counts.get(bitmapAddress), 1, "fork validates metadata without reading bitmap payloads");
+  original.close();
+  assert.match(await fork.render(1), /^data:image\/png;base64,/);
+  assert.equal(counts.get(bitmapAddress), 2, "render reads the requested bitmap and checks its index-time hash");
+  fork.close();
+  await assert.rejects(original.fork(), /closed/);
+});
+
+test("fork rejects changed metadata or revision and render still rejects same-stat bitmap edits", async () => {
+  const revision = "1:100";
+  for (const mode of ["metadata", "footer", "revision", "bitmap"]) {
+    let bytes = notebook({ ink: [uniformRle(0x65), uniformRle(0x61)] });
+    let currentRevision = revision;
+    const source = new StreamingFile(bytes.length, "fixture", async () => new Response(bytes));
+    const opened = await openByteNotebook("fixture.note", revision, source, async () => currentRevision);
+    if (mode === "metadata") bytes = notebook({ ink: [uniformRle(0x65), uniformRle(0x61)], style: "1" });
+    if (mode === "footer") new DataView(bytes.buffer).setUint32(bytes.length - 4, bytes.blockAddresses.header, true);
+    if (mode === "revision") currentRevision = "2:100";
+    if (mode === "bitmap") bytes = notebook({ ink: [uniformRle(0x66), uniformRle(0x61)] });
+    if (mode === "bitmap") {
+      const fork = await opened.fork();
+      await assert.rejects(fork.render(1), error => error.name === "SourceChangedError");
+      fork.close();
+    } else {
+      await assert.rejects(opened.fork(), error => /changed/.test(error.message) &&
+        (mode !== "footer" || error.name === "SourceChangedError"));
+    }
+    opened.close();
+  }
+});
+
+test("renderMany scans eligible pages once in order and retains bitmap change guards", async () => {
+  const ink = [uniformRle(0x65), uniformRle(0x61), uniformRle(0x63)];
+  let bytes = notebook({ ids: ["one", "two", "three"], ink, order: [0, 1, 2] });
+  const source = new StreamingFile(bytes.length, "fixture", async () => new Response(bytes));
+  let scans = 0;
+  const scan = source.scan.bind(source);
+  source.scan = async (addresses, consume) => { scans++; return scan(addresses, consume); };
+  const revision = "1:100";
+  const opened = await openByteNotebook("fixture.note", revision, source, async () => revision);
+  const before = scans;
+  const images = await opened.renderMany([3, 1, 2]);
+  assert.equal(scans - before, 1);
+  assert.equal(images.length, 3);
+  assert.ok(images.every(image => image.startsWith("data:image/png;base64,")));
+
+  const fork = await opened.fork();
+  bytes = notebook({ ids: ["one", "two", "three"], ink: [uniformRle(0x66), ink[1], ink[2]], order: [0, 1, 2] });
+  await assert.rejects(fork.renderMany([1, 2]), error => error.name === "SourceChangedError");
+  fork.close();
+  opened.close();
+});
+
 test("all hidden layers render a full native white page", async () => {
   const bytes = notebook({
     ids: ["hidden"],
@@ -457,4 +559,112 @@ test("selective preview rejects a source revision change during its read",async(
     if(addresses.includes(bytes.blockAddresses.pages[1].bitmap))revision="2:100";
   };
   await assert.rejects(previewByteNotebook("fixture.note",2,"1:100",source,async()=>revision),/changed|revision/i);
+});
+
+test("automatic new check hashes only new page bitmaps and preserves skipped fingerprints", async () => {
+  const previousIndex = await indexNotebook(streamed(notebook()));
+  const bytes = notebook({ ids: ["one", "new", "two"], ink: ["a", "fresh", "b"], order: [0, 1, 2] });
+  const source = streamed(bytes), scan = source.scan.bind(source), scanned = [];
+  source.scan = async (addresses, consume) => { scanned.push(...addresses); return scan(addresses, consume); };
+  const options = { mode: "new", recentPages: 0, previous: previousIndex.pages.map((p, i) => ({ id: previousIndex.ids[i], number: i + 1, fingerprint: p.fingerprint })) };
+  const result = await indexNotebook(source, () => {}, undefined, options);
+  const bitmap = bytes.blockAddresses.pages;
+  assert.deepEqual([...new Set(scanned.filter(a => bitmap.some(p => p.bitmap === a)))], [bitmap[1].bitmap]);
+  assert.equal(result.pages[0].fingerprint, previousIndex.pages[0].fingerprint);
+  assert.equal(result.pages[2].fingerprint, previousIndex.pages[1].fingerprint);
+  assert.deepEqual(result.checkedPageIds, ["native:new"]);
+  assert.equal(result.checkMode, "new");
+});
+
+test("new-only automatic check resumes pending current IDs and ignores unknown pending IDs", async () => {
+  const previousIndex = await indexNotebook(streamed(notebook()));
+  const bytes = notebook({ ids: ["one", "two"], ink: ["a", "b"] });
+  const source = streamed(bytes), scan = source.scan.bind(source), scanned = [];
+  source.scan = async (addresses, consume) => { scanned.push(...addresses); return scan(addresses, consume); };
+  const previous = previousIndex.pages.map((p, i) => ({ id: previousIndex.ids[i], number: i + 1, fingerprint: p.fingerprint }));
+  const result = await indexNotebook(source, () => {}, undefined,
+    { mode: "new", recentPages: 0, previous, pendingPageIds: ["native:two", "native:deleted"] });
+  const bitmaps = bytes.blockAddresses.pages;
+  assert.deepEqual([...new Set(scanned.filter(a => bitmaps.some(p => p.bitmap === a)))], [bitmaps[1].bitmap]);
+  assert.deepEqual(result.checkedPageIds, ["native:two"]);
+  assert.equal(result.pages[0].fingerprint, previousIndex.pages[0].fingerprint);
+});
+
+test("recent automatic check includes new middle pages and the last N ordinals", async () => {
+  const priorBytes = notebook({ ids: ["one", "two", "three"], ink: ["a", "b", "c"], order: [0, 1, 2] });
+  const prior = await indexNotebook(streamed(priorBytes));
+  const bytes = notebook({ ids: ["one", "new", "two", "three"], ink: ["a", "fresh", "b", "c"], order: [0, 1, 2, 3] });
+  const source = streamed(bytes), scan = source.scan.bind(source), scanned = [];
+  source.scan = async (addresses, consume) => { scanned.push(...addresses); return scan(addresses, consume); };
+  const previous = prior.pages.map((p, i) => ({ id: prior.ids[i], number: i + 1, fingerprint: p.fingerprint }));
+  const result = await indexNotebook(source, () => {}, undefined, { mode: "recent", recentPages: 1, previous });
+  const bitmaps = bytes.blockAddresses.pages;
+  assert.deepEqual([...new Set(scanned.filter(a => bitmaps.some(p => p.bitmap === a)))].sort((a,b)=>a-b), [bitmaps[1].bitmap, bitmaps[3].bitmap].sort((a,b)=>a-b));
+  assert.deepEqual(result.checkedPageIds, ["native:new", "native:three"]);
+  assert.equal(result.checkMode, "recent");
+  assert.equal(result.pages[0].fingerprint, prior.pages[0].fingerprint);
+  assert.equal(result.pages[2].fingerprint, prior.pages[1].fingerprint);
+});
+
+test("manual and all-mode indexing retain full fingerprints and bitmap coverage", async () => {
+  const bytes = notebook({ ids: ["one", "two"] });
+  const manual = await indexNotebook(streamed(bytes));
+  const all = await indexNotebook(streamed(bytes), () => {}, undefined, { mode: "all", recentPages: 0, previous: [] });
+  assert.deepEqual(all.pages.map(p => p.fingerprint), manual.pages.map(p => p.fingerprint));
+  assert.deepEqual(all.ids, manual.ids);
+  assert.equal(all.checkMode, "all");
+  assert.equal(all.checkedPageIds.length, 2);
+});
+
+test("automatic checks refuse current fallback IDs and previous content fallback IDs", async () => {
+  const prior = await indexNotebook(streamed(notebook()));
+  const previous = prior.pages.map((p, i) => ({ id: prior.ids[i], number: i + 1, fingerprint: p.fingerprint }));
+  await assert.rejects(indexNotebook(streamed(notebook({ ids: ["duplicate", "duplicate"] })), () => {}, undefined,
+    { mode: "new", recentPages: 0, previous }), error => error.name === "AutomaticCheckUnavailableError" && /Run Update to check this notebook/.test(error.message));
+  const current = await indexNotebook(streamed(notebook({ ids: ["one"], order: [0] })));
+  await assert.rejects(indexNotebook(streamed(notebook({ ids: ["one"], order: [0] })), () => {}, undefined,
+    { mode: "new", recentPages: 0, previous: [{ id: "content:old:1", number: 1, fingerprint: current.pages[0].fingerprint }] }),
+  error => error.name === "AutomaticCheckUnavailableError" && /Run Update to check this notebook/.test(error.message));
+  const firstBaseline = await indexNotebook(streamed(notebook({ ids: ["duplicate", "duplicate"] })), () => {}, undefined,
+    { mode: "new", recentPages: 0, previous: [] });
+  assert.equal(firstBaseline.checkMode, "all");
+  assert.equal(firstBaseline.pages.every(p => p.fingerprint.length > 0), true);
+});
+
+test("automatic checked page still rejects same-stat bitmap mutation at render", async () => {
+  const prior = await indexNotebook(streamed(notebook({ ids: ["one"], order: [0] })));
+  let bytes = notebook({ ids: ["one", "new"], ink: ["a", "b"] });
+  const size = bytes.length, revision = "1:100";
+  const source = new StreamingFile(bytes.length, "fixture", async () => new Response(bytes));
+  const opened = await openByteNotebook("fixture.note", revision, source, async () => revision, undefined, undefined, undefined,
+    { mode: "new", recentPages: 0, previous: [{ id: prior.ids[0], number: 1, fingerprint: prior.pages[0].fingerprint }] });
+  bytes = notebook({ ids: ["one", "new"], ink: ["a", "c"] });
+  assert.equal(bytes.length, size);
+  await assert.rejects(opened.render(2), error => error.name === "SourceChangedError");
+  opened.close();
+});
+
+test("renderMany reads new and unchecked context pages in one scan and snapshots context bitmap", async () => {
+  const prior = await indexNotebook(streamed(notebook({
+    ids: ["one", "two"], ink: [uniformRle(0x65), uniformRle(0x63)],
+  })));
+  const bytes = notebook({
+    ids: ["one", "new"], ink: [uniformRle(0x65), uniformRle(0x61)],
+  });
+  const source = streamed(bytes), scan = source.scan.bind(source), calls = [];
+  source.scan = async (addresses, consume) => { calls.push([...addresses]); return scan(addresses, consume); };
+  const previous = prior.pages.map((p, i) => ({ id: prior.ids[i], number: i + 1, fingerprint: p.fingerprint }));
+  const opened = await openByteNotebook("fixture.note", "1:100", source, async () => "1:100", undefined, undefined, undefined,
+    { mode: "new", recentPages: 0, previous });
+  const [contextBitmap, newBitmap] = bytes.blockAddresses.pages.map(p => p.bitmap);
+  const count = (address) => calls.filter(addresses => addresses.includes(address)).length;
+  assert.equal(count(contextBitmap), 0, "unchecked context is not read while indexing");
+  assert.equal(count(newBitmap), 1, "selected new page is read while indexing");
+  const before = calls.length;
+  const images = await opened.renderMany([1, 2]);
+  assert.equal(calls.length - before, 1, "both pages share one bitmap scan");
+  assert.equal(count(contextBitmap), 1);
+  assert.equal(count(newBitmap), 2);
+  assert.ok(images.every(image => image.startsWith("data:image/png;base64,")));
+  opened.close();
 });

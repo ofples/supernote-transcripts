@@ -281,6 +281,30 @@
   border-bottom: 1px solid var(--st-rule);
 }
 .st-fullscreen-modal .st-working {
+  cursor: pointer;
+}
+.st-fullscreen-modal .st-working:focus-visible {
+  outline: 2px solid var(--text-normal);
+  outline-offset: 3px;
+}
+.st-fullscreen-modal .st-working-controls {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+}
+.st-fullscreen-modal .st-working-details[hidden] {
+  display: none;
+}
+.st-fullscreen-modal .st-working-details:not([hidden]) {
+  margin-top: 10px;
+}
+.st-fullscreen-modal .st-queue-attention {
+  margin-top: 24px;
+}
+.st-fullscreen-modal .st-queue-attention > .st-section-heading {
+  margin-bottom: 0;
+}
+.st-fullscreen-modal .st-working {
   border-top: 1px solid var(--st-rule);
 }
 .st-fullscreen-modal .st-queue-copy {
@@ -378,6 +402,17 @@
   justify-content: center;
   gap: 2px;
 }
+.st-fullscreen-modal .st-source-actions {
+  grid-column: 1 / -1;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin-top: 4px;
+}
+.st-fullscreen-modal .st-source-actions > .st-button {
+  margin: 0 !important;
+}
 .st-fullscreen-modal .st-row-controls .st-icon-button {
   flex: 0 0 48px;
 }
@@ -385,6 +420,10 @@
   margin-left: 28px;
   padding: 18px 0 20px;
   border-bottom: 1px solid var(--st-rule);
+}
+.st-fullscreen-modal .st-rule-row:has(> .st-progress),
+.st-fullscreen-modal .st-queue-row:has(.st-progress) {
+  border-bottom: 0;
 }
 .st-fullscreen-modal .st-cost-screen {
   max-width: 720px;
@@ -615,6 +654,8 @@
   outline: 2px solid var(--text-normal);
   outline-offset: 3px;
 }
+.st-fullscreen-modal .st-automatic-check-count-field[hidden] { display: none !important; }
+.st-fullscreen-modal .st-automatic-check-count-field:not([hidden]) { grid-column: 1 / -1; }
 .st-fullscreen-modal .st-subscription-breakdown {
   margin-top: 12px;
 }
@@ -821,6 +862,54 @@
 }
 .st-fullscreen-modal .st-detail-live {
   padding: 20px 0 28px;
+}
+.st-fullscreen-modal .st-reconciliation-summary {
+  margin: 8px 0 18px;
+  padding: 14px 0;
+  border-top: 1px solid var(--st-rule);
+  border-bottom: 1px solid var(--st-rule);
+}
+.st-fullscreen-modal .st-reconciliation-summary > :first-child {
+  margin-top: 0;
+}
+.st-fullscreen-modal .st-reconciliation-summary > :last-child {
+  margin-bottom: 0;
+}
+.st-fullscreen-modal .st-page-reconciliation {
+  padding-bottom: 12px;
+}
+.st-fullscreen-modal .st-reconciliation-source {
+  overflow-wrap: anywhere;
+}
+.st-fullscreen-modal .st-page-conflict {
+  margin-top: 20px;
+  padding-top: 16px;
+  border-top: 1px solid var(--st-rule);
+}
+.st-fullscreen-modal .st-page-conflict-heading {
+  margin: 0 0 6px;
+  font: inherit;
+  font-weight: 600;
+}
+.st-fullscreen-modal .st-page-conflict-reason {
+  margin: 0 0 12px;
+}
+.st-fullscreen-modal .st-page-conflict-version-title {
+  margin: 8px 0;
+  font-size: 0.9em;
+  font-weight: 600;
+}
+.st-fullscreen-modal .st-page-conflict-text {
+  max-height: 240px;
+}
+.st-fullscreen-modal .st-page-conflict-actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-start;
+  margin-top: 12px;
+}
+.st-fullscreen-modal .st-reconciliation-back {
+  min-width: min(100%, 240px);
 }
 .st-fullscreen-modal .st-recovery-note,
 .st-fullscreen-modal .st-recovery-path {
@@ -1274,6 +1363,75 @@
 }
 .st-fullscreen-modal .st-document-action-toolbar > button.st-danger {
   margin-top: 0;
+}
+.st-fullscreen-modal .st-document-action-group {
+  margin: 16px 0;
+  padding: 12px 0 0;
+  border-top: 1px solid var(--st-rule);
+}
+.st-fullscreen-modal .st-document-action-group > .st-section-heading {
+  margin: 0 0 10px;
+  font-size: 1em;
+}
+.st-fullscreen-modal .st-detail-action-grid > .st-button {
+  flex: initial;
+  min-width: 0;
+  width: 100%;
+  min-height: 48px;
+  height: 48px;
+  justify-content: center;
+  padding-inline: 6px;
+  font-size: 0.88em;
+  font-weight: 600;
+  text-align: center;
+  white-space: nowrap;
+}
+.st-fullscreen-modal .st-detail-action-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px 10px;
+  align-items: stretch;
+}
+.st-fullscreen-modal.st-desktop .st-detail-action-grid > button.st-button {
+  min-width: 0;
+  min-height: 48px;
+  height: 48px;
+}
+.st-fullscreen-modal .st-settings-section > .st-support-folder-field,
+.st-fullscreen-modal.st-desktop .st-settings-section > .st-support-folder-field {
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 4px 12px;
+}
+.st-fullscreen-modal .st-support-folder-field > label {
+  grid-column: 1;
+  grid-row: 1;
+}
+.st-fullscreen-modal .st-support-folder-field > .st-help-button {
+  grid-column: 2;
+  grid-row: 1;
+}
+.st-fullscreen-modal .st-support-folder-field > .st-help-text {
+  grid-column: 1 / -1;
+  grid-row: 2;
+}
+.st-fullscreen-modal .st-support-folder-controls {
+  grid-column: 1 / -1;
+  grid-row: 3;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 8px;
+  min-width: 0;
+}
+.st-fullscreen-modal .st-support-folder-controls > input {
+  min-width: 0;
+  width: 100%;
+}
+.st-fullscreen-modal .st-support-folder-controls > button {
+  margin: 0 !important;
+}
+.st-fullscreen-modal .st-settings-panel[hidden] {
+  display: none;
 }
 .st-fullscreen-modal .st-history-details {
   min-height: 40px;
@@ -1765,15 +1923,23 @@
   margin: 4px 0 0;
 }
 .st-fullscreen-modal .st-queue-estimate-info {
+  display: block;
   margin: 8px 0 0;
   padding: 0;
   border: 0;
 }
-.st-fullscreen-modal .st-queue-estimate-info > summary {
+.st-fullscreen-modal .st-queue-estimate-info .st-help-button {
+  min-width: 44px;
   min-height: 44px;
-  padding: 8px 0;
 }
-.st-fullscreen-modal .st-queue-estimate-info > p {
+.st-fullscreen-modal .st-queue-estimate-info .st-help-text {
+  position: static;
+  width: 100%;
+  padding: 12px;
+  border: 1px solid var(--st-rule);
+  background: var(--background-primary);
+}
+.st-fullscreen-modal .st-queue-estimate-info .st-help-text > p {
   margin: 4px 0;
 }
 .st-fullscreen-modal .st-blocker-action {
@@ -2622,6 +2788,12 @@
   }
 }
 @media (max-width: 600px) {
+  .st-fullscreen-modal .st-support-folder-controls {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .st-fullscreen-modal .st-support-folder-controls > button {
+    justify-self: start;
+  }
   .st-fullscreen-modal .st-output-folder-controls {
     grid-template-columns: minmax(0, 1fr);
   }

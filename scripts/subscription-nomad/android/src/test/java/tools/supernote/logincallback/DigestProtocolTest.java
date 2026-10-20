@@ -17,11 +17,11 @@ public final class DigestProtocolTest {
         DigestProtocol.DigestPayload p = DigestProtocol.parseDeepLink(link(BASE));
         assertEquals("Digest line\nsecond\tline 😀", p.text);
         assertEquals("Satsang/2610.md", p.origin.file);
-        assertTrue(DigestProtocol.manualComment(p).startsWith("Obsidian: Satsang/2610.md\nobsidian://open?"));
+        assertEquals("Source: Satsang/2610 | Heading: Reflection", DigestProtocol.manualComment(p));
         assertTrue(DigestProtocol.metadataJson(p).contains("\"supernote_bridge\""));
         assertFalse(DigestProtocol.metadataJson(p).contains(p.text));
         String withNote = DigestProtocol.manualComment(p, "My observation");
-        assertTrue(withNote.startsWith("Note: My observation\n\nObsidian: Satsang/2610.md\n"));
+        assertEquals("Note: My observation\n\nSource: Satsang/2610 | Heading: Reflection", withNote);
         assertTrue(withNote.length() <= 2000);
     }
 
@@ -33,7 +33,7 @@ public final class DigestProtocolTest {
         assertEquals("native:P-fixture-page-2", p.note.pageIds.get(0));
         String metadata = DigestProtocol.metadataJson(p);
         assertTrue(metadata.contains("\"note\":{\"path\":\"/storage/emulated/0/Note/Book/1.note\",\"page\":\"2\",\"fileId\":\"opaque-header-id\",\"pageId\":\"native:P-fixture-page-2\",\"pageIds\":[\"native:P-fixture-page-2\",\"native:P-fixture-page-1\"]}"));
-        assertTrue(DigestProtocol.manualComment(p).startsWith("Supernote: 1.note · page 2\nObsidian: Satsang/2610.md\n"));
+        assertEquals("Book/1 | Page 2", DigestProtocol.manualComment(p));
         assertFalse(metadata.contains("note_fileId"));
         assertFalse(metadata.contains("note_pageId"));
         assertFalse(metadata.contains("note_page\""));
@@ -42,6 +42,51 @@ public final class DigestProtocolTest {
                 + ",\"unique_identifier\":\"0123456789abcdef0123456789abcdef\"}";
         assertTrue(DigestProtocol.metadataMatches(p, providerMetadata));
         assertFalse(DigestProtocol.metadataMatches(p, providerMetadata.replace("\"page\":\"2\"", "\"page\":\"3\"")));
+    }
+
+    @Test public void plainMarkdownCaptureUsesFriendlyNotebookNameAndHeadingWithoutInventingPage() throws Exception {
+        DigestProtocol.DigestPayload p = DigestProtocol.parseDeepLink(link(BASE));
+        String comment = DigestProtocol.manualComment(p, "A thought");
+
+        assertTrue(comment.startsWith("Note: A thought\n\nSource: Satsang/2610 | Heading: Reflection"));
+        assertFalse(comment.contains("Page:"));
+        assertFalse(comment.contains("obsidian://"));
+        assertFalse(comment.contains("Satsang/2610.md"));
+    }
+
+    @Test public void plainMarkdownWithoutHeadingKeepsFriendlyNameAndOmitsPageAndHeadingPlaceholders() throws Exception {
+        String json = BASE.replace(",\"heading\":\"Reflection\"", "");
+        String comment = DigestProtocol.manualComment(DigestProtocol.parseDeepLink(link(json)));
+        assertEquals("Source: Satsang/2610", comment);
+        assertFalse(comment.contains("Page:"));
+        assertFalse(comment.contains("Heading:"));
+    }
+
+    @Test public void legacySavedReceiptFallbackKeepsExactPreProvenanceCommentFormat() throws Exception {
+        DigestProtocol.DigestPayload markdown = DigestProtocol.parseDeepLink(link(BASE));
+        assertEquals("Obsidian: Satsang/2610.md\nobsidian://open?vault=Vedas&file=Satsang%2F2610.md",
+                DigestProtocol.legacyManualComment(markdown));
+
+        String json = BASE.substring(0, BASE.length() - 1)
+                + ",\"note\":{\"path\":\"/storage/emulated/0/Note/Book/Reflection.note\",\"page\":9,\"fileId\":\"file-id\",\"pageId\":\"native:P-fixture-page-9\"}}";
+        DigestProtocol.DigestPayload supernote = DigestProtocol.parseDeepLink(link(json));
+        assertEquals("Supernote: Reflection.note · page 9\nObsidian: Satsang/2610.md\nobsidian://open?vault=Vedas&file=Satsang%2F2610.md",
+                DigestProtocol.legacyManualComment(supernote));
+        assertNotEquals(DigestProtocol.legacyManualComment(supernote), DigestProtocol.manualComment(supernote, ""));
+        String exactStoredComment = "Note: preserved old note\n\nSupernote: Reflection.note · page 9\nObsidian: Satsang/2610.md\nold-link";
+        assertEquals(exactStoredComment, DigestProtocol.savedReceiptComment(supernote, exactStoredComment));
+        assertEquals(DigestProtocol.legacyManualComment(supernote), DigestProtocol.savedReceiptComment(supernote, null));
+    }
+
+    @Test public void notebookCommentLimitIncludesFriendlyProvenanceAndKeepsUserNoteBounded() throws Exception {
+        String json = BASE.substring(0, BASE.length() - 1)
+                + ",\"note\":{\"path\":\"/storage/emulated/0/Note/Book/Reflection.note\",\"page\":9,\"fileId\":\"file-id\",\"pageId\":\"native:P-fixture-page-9\"}}";
+        DigestProtocol.DigestPayload p = DigestProtocol.parseDeepLink(link(json));
+        String comment = DigestProtocol.manualComment(p, repeat('n', 1700));
+        assertTrue(comment.length() <= 2000);
+        assertTrue(comment.contains("Book/Reflection | Page 9"));
+        try { DigestProtocol.manualComment(p, repeat('n', 2000)); fail("Expected comment bound"); }
+        catch (DigestProtocol.InvalidPayloadException expected) { assertEquals("comment length", expected.reason); }
     }
 
     @Test public void acceptsOnlyFixedProviderAcknowledgementItemRoutes() {
@@ -178,6 +223,63 @@ public final class DigestProtocolTest {
         assertTrue(DigestProtocol.quickSignatureMatches(client, now, BASE, secret, signature));
         assertFalse(DigestProtocol.quickSignatureMatches(client, now, BASE + " ", secret, signature));
         assertFalse(DigestProtocol.quickSignatureMatches(client, now, BASE, secret, repeat('d', 64)));
+    }
+
+    @Test public void signedDeliveryOptionsPreservePayloadIdentityAndBindRoutingAndCategory() throws Exception {
+        String client = repeat('b', 32), secretHex = repeat('c', 64), time = "1792291200000";
+        byte[] secret = DigestProtocol.parseHexSecret(secretHex);
+        String delivery = "{\"openNative\":false,\"categoryName\":\"Study Notes\"}";
+        String signature = DigestProtocol.quickSignature(client, Long.parseLong(time), BASE, secret, delivery);
+        assertEquals("ec5426dee0a752cd78da56a324114a47c0e345e34020b38d673b7ca690473898", signature);
+        String quick = "supernote-bridge://digest?payload=" + encode(BASE) + "&mode=quick&client=" + client
+                + "&time=" + time + "&signature=" + signature + "&setup=" + secretHex + "&delivery=" + encode(delivery);
+
+        DigestProtocol.RequestEnvelope parsed = DigestProtocol.parseEnvelope(quick);
+        assertEquals(BASE, parsed.payload.rawJson);
+        assertEquals(ID, parsed.payload.requestId);
+        assertFalse(parsed.shouldOpenNative());
+        assertEquals("Study Notes", parsed.categoryName());
+        assertEquals(delivery, parsed.rawDeliveryJson);
+        assertTrue(DigestProtocol.quickSignatureMatches(client, Long.parseLong(time), BASE, secret, delivery, signature));
+
+        String changedDelivery = delivery.replace("Study Notes", "Another list");
+        assertFalse(DigestProtocol.quickSignatureMatches(client, Long.parseLong(time), BASE, secret, changedDelivery, signature));
+        String strippedDelivery = "supernote-bridge://digest?payload=" + encode(BASE) + "&mode=quick&client=" + client
+                + "&time=" + time + "&signature=" + signature + "&setup=" + secretHex;
+        assertFalse(DigestProtocol.quickSignatureMatches(client, Long.parseLong(time), BASE, secret, null, signature));
+        assertTrue(DigestProtocol.parseEnvelope(strippedDelivery).shouldOpenNative());
+
+        String legacySignature = DigestProtocol.quickSignature(client, Long.parseLong(time), BASE, secret);
+        assertEquals(legacySignature, DigestProtocol.quickSignature(client, Long.parseLong(time), BASE, secret, null));
+        assertTrue(DigestProtocol.quickSignatureMatches(client, Long.parseLong(time), BASE, secret, legacySignature));
+    }
+
+    @Test public void deliverySupportsExplicitUncategorizedAndDefaultsOpenForLegacy() throws Exception {
+        String client = repeat('b', 32), secretHex = repeat('c', 64), time = "1792291200000";
+        byte[] secret = DigestProtocol.parseHexSecret(secretHex);
+        String delivery = "{\"openNative\":true,\"categoryName\":\"\"}";
+        String signature = DigestProtocol.quickSignature(client, Long.parseLong(time), BASE, secret, delivery);
+        String quick = "supernote-bridge://digest?payload=" + encode(BASE) + "&mode=quick&client=" + client
+                + "&time=" + time + "&signature=" + signature + "&setup=" + secretHex + "&delivery=" + encode(delivery);
+        DigestProtocol.RequestEnvelope parsed = DigestProtocol.parseEnvelope(quick);
+        assertTrue(parsed.shouldOpenNative());
+        assertEquals("", parsed.categoryName());
+    }
+
+    @Test public void deliveryRejectsMalformedFieldsAndIsQuickOnly() throws Exception {
+        String client = repeat('b', 32), secretHex = repeat('c', 64), time = "1792291200000";
+        byte[] secret = DigestProtocol.parseHexSecret(secretHex);
+        String valid = "{\"openNative\":false}";
+        String signature = DigestProtocol.quickSignature(client, Long.parseLong(time), BASE, secret, valid);
+        String prefix = "supernote-bridge://digest?payload=" + encode(BASE) + "&mode=quick&client=" + client
+                + "&time=" + time + "&signature=" + signature + "&setup=" + secretHex + "&delivery=";
+        rejects(prefix + encode("{\"openNative\":\"false\"}"));
+        rejects(prefix + encode("{\"openNative\":false,\"extra\":1}"));
+        rejects(prefix + encode("{\"categoryName\":\"Study\"}"));
+        rejects(prefix + encode("{\"openNative\":false,\"openNative\":true}"));
+        String review = "supernote-bridge://digest?payload=" + encode(BASE) + "&mode=review&delivery=" + encode(valid);
+        rejects(review);
+        rejects(prefix + encode(repeat('x', DigestProtocol.MAX_DELIVERY_JSON_LENGTH + 1)));
     }
 
     @Test public void quickEnvelopeRejectsUnknownDuplicateAndMalformedFields() throws Exception {

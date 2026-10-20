@@ -20,6 +20,10 @@ export function pageTextLayer(notebook, page) {
   return { text: "", provisional: false, stale: false };
 }
 export function displayedPageText(notebook, page) {
+  const edited = notebook.editedPages?.[page.id];
+  if (edited && typeof edited.text === "string")
+    return { text: edited.text, provisional: false, stale: edited.fingerprint !== page.fingerprint,
+      cleaned: false, edited: true };
   const layer = pageTextLayer(notebook, page), cleaned = notebook.cleanedPages?.[page.id];
   if (!layer.stale && cleaned?.fingerprint === page.fingerprint && cleaned.baseText === layer.text)
     return { ...layer, text: cleaned.text, cleaned: true };

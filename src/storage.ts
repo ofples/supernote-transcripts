@@ -1,10 +1,9 @@
-import { sharedHash, SHARED_ROOT, type SharedIO } from "./shared";
+import { sharedHash, type SharedIO } from "./shared";
+import { DATA_ROOT, HISTORY_ROOT, SHARED_ROOT } from "./storage-paths";
 import { PublicationReceipts } from "./publication";
 // @ts-ignore provenance is shared with the JavaScript runtime.
 import { recognitionFields, validRecognition } from "./provenance.mjs";
 
-const HISTORY = "Supernote Transcripts/History";
-const SHARED = SHARED_ROOT;
 const DAY = 24 * 60 * 60 * 1000;
 const MAX_FILES = 20_000;
 const HASH = /^[a-f0-9]{64}$/;
@@ -27,6 +26,7 @@ export interface KnownNotebook {
 }
 export interface StorageOptions {
   now?: number;
+  dataRoot?: string;
   knownNotebooks: KnownNotebook[];
   trackedHistory: string[];
   protectedHistory?: string[];
@@ -34,7 +34,7 @@ export interface StorageOptions {
 export interface StorageCandidate { path: string; text: string; bytes: number }
 export interface StoragePlan {
   historyFiles: number; cacheFiles: number; bytes: number; removableFiles: number;
-  removableBytes: number; candidates: StorageCandidate[]; emptyFolders: string[];
+  removableBytes: number; candidates: StorageCandidate[]; emptyFolders: string[]; dataRoot?: string;
 }
 
 const lexical = (a: string, b: string) => a < b ? -1 : a > b ? 1 : 0;
@@ -109,8 +109,12 @@ async function validResult(io: StorageIO, path: string, notebookId: string, scan
 }
 
 export async function inspectStorage(io: StorageIO, options: StorageOptions): Promise<StoragePlan> {
+  const dataRoot = options.dataRoot ?? DATA_ROOT;
+  if (!safePath(dataRoot)) throw Error("Invalid support data root.");
+  const HISTORY = options.dataRoot === undefined ? HISTORY_ROOT : `${dataRoot}/History`;
+  const SHARED = options.dataRoot === undefined ? SHARED_ROOT : `${dataRoot}/Shared Data`;
   const plan: StoragePlan = { historyFiles: 0, cacheFiles: 0, bytes: 0, removableFiles: 0,
-    removableBytes: 0, candidates: [], emptyFolders: [] };
+    removableBytes: 0, candidates: [], emptyFolders: [], ...(options.dataRoot === undefined ? {} : { dataRoot }) };
   const now = Number.isFinite(options.now) ? options.now! : Date.now();
   const known = new Map(options.knownNotebooks.map(n => [n.notebookId, n]));
   const candidatePaths = new Set<string>();
@@ -162,24 +166,24 @@ export async function inspectStorage(io: StorageIO, options: StorageOptions): Pr
     observedTexts.set(path, text);
     const bytes = await sizeOf(io, path, text); plan.bytes += bytes;
     if (!beneath(path, SHARED)) continue;
-    const parts = path.split("/");
-    const notebookId = parts[2], notebook = known.get(notebookId);
+    const parts = path.slice(SHARED.length + 1).split("/");
+    const notebookId = parts[0], notebook = known.get(notebookId);
     if (!notebook || !HASH.test(notebookId)) continue;
-    if (parts[3] === "results" && parts.length === 6) {
+    if (parts[1] === "results" && parts.length === 4) {
       try {
         const r = await validResult(io, path, notebookId, text);
-        if (parts[5] !== `${r.recordId}.md`) continue; // Sync conflict copies are evidence, never cleanup targets.
+        if (parts[3] !== r.recordId + ".md") continue; // Sync conflict copies are evidence, never cleanup targets.
         const list = cacheRecords.get(notebookId) ?? [];
         list.push({ r, path, text, bytes, mtime: await mtimeOf(io, path) }); cacheRecords.set(notebookId, list);
       } catch { /* Damaged, malformed, or conflict data stays protected. */ }
-    } else if (parts[3] === "publications" && parts.length === 6 && HASH.test(parts[4])) {
-      const key = `${notebookId}/${parts[4]}`;
+    } else if (parts[1] === "publications" && parts.length === 4 && HASH.test(parts[2])) {
+      const key = `${notebookId}/${parts[2]}`;
       const group = publicationHashes.get(key) ?? { paths: [], records: [], times: [], invalid: false };
       group.paths.push(path);
       group.records.push({ path, text });
-      if (!/^[a-f0-9]{64}\.md$/i.test(parts[5])) group.invalid = true;
+      if (!/^[a-f0-9]{64}\.md$/i.test(parts[3])) group.invalid = true;
       publicationHashes.set(key, group);
-    } else if (parts[3] === "claims" || parts[3] === "mirrors" || parts[3] === "pairing") {
+    } else if (parts[1] === "claims" || parts[1] === "mirrors" || parts[1] === "pairing") {
       // Operational and identity metadata is never a cleanup target.
     }
   }
@@ -189,7 +193,7 @@ export async function inspectStorage(io: StorageIO, options: StorageOptions): Pr
   for (const [key, group] of publicationHashes) {
     const [notebookId, hash] = key.split("/");
     try {
-      const receipt = await new PublicationReceipts(receiptIO).findHash(notebookId, hash);
+      const receipt = await new PublicationReceipts(receiptIO, SHARED).findHash(notebookId, hash);
       if (!receipt || group.invalid) { group.invalid = true; continue; }
       // findHash validates every record, including causally superseded history.
       // Re-read and compare the scanned bytes before extracting all its references.
@@ -269,21 +273,25 @@ export async function inspectStorage(io: StorageIO, options: StorageOptions): Pr
     if (!safePath(path) || !(beneath(path, HISTORY) || beneath(path, SHARED)) || keep.has(path)) continue;
     let text: string;
     try { text = await io.read(path); } catch {
-      const parts = path.split("/");
-      if (beneath(path, SHARED) && parts[3] === "publications") changedPublicationNotebooks.add(parts[2]);
+      if (beneath(path, SHARED)) {
+        const relative = path.slice(SHARED.length + 1).split("/");
+        if (relative[1] === "publications") changedPublicationNotebooks.add(relative[0]);
+      }
       continue;
     }
     if (text !== observedTexts.get(path)) {
-      const parts = path.split("/");
-      if (beneath(path, SHARED) && parts[3] === "publications") changedPublicationNotebooks.add(parts[2]);
+      if (beneath(path, SHARED)) {
+        const relative = path.slice(SHARED.length + 1).split("/");
+        if (relative[1] === "publications") changedPublicationNotebooks.add(relative[0]);
+      }
       continue;
     }
     const bytes = await sizeOf(io, path, text);
     finalCandidates.set(path, { path, text, bytes });
   }
   for (const [path, candidate] of finalCandidates) {
-    const parts = path.split("/");
-    if (beneath(path, SHARED) && parts[3] === "results" && changedPublicationNotebooks.has(parts[2])) continue;
+    const parts = beneath(path, SHARED) ? path.slice(SHARED.length + 1).split("/") : [];
+    if (parts[1] === "results" && changedPublicationNotebooks.has(parts[0])) continue;
     plan.candidates.push(candidate); plan.removableFiles++; plan.removableBytes += candidate.bytes;
   }
   plan.candidates.sort((a, b) => lexical(a.path, b.path));
@@ -302,12 +310,16 @@ export async function inspectStorage(io: StorageIO, options: StorageOptions): Pr
 }
 
 export async function cleanStorage(io: StorageIO, plan: StoragePlan): Promise<{ removedFiles: number; removedBytes: number }> {
+  const dataRoot = plan.dataRoot ?? DATA_ROOT;
+  if (!safePath(dataRoot)) throw Error("Invalid support data root.");
+  const HISTORY = plan.dataRoot === undefined ? HISTORY_ROOT : `${dataRoot}/History`;
+  const SHARED = plan.dataRoot === undefined ? SHARED_ROOT : `${dataRoot}/Shared Data`;
   let removedFiles = 0, removedBytes = 0;
   const blockedNotebooks = new Set<string>();
   const allowedFile = (path: string) => {
-    const parts = path.split("/");
+    const parts = beneath(path, SHARED) ? path.slice(SHARED.length + 1).split("/") : [];
     return beneath(path, HISTORY) ||
-      (beneath(path, SHARED) && parts.length === 6 && (parts[3] === "results" || parts[3] === "publications"));
+      (beneath(path, SHARED) && parts.length === 4 && (parts[1] === "results" || parts[1] === "publications"));
   };
   const removeCandidate = async (candidate: StorageCandidate): Promise<boolean> => {
     const path = candidate.path.replace(/\\/g, "/");
@@ -319,26 +331,27 @@ export async function cleanStorage(io: StorageIO, plan: StoragePlan): Promise<{ 
   };
   const publicationCandidates = plan.candidates.filter(c => {
     const path = c.path.replace(/\\/g, "/");
-    return beneath(path, SHARED) && path.split("/")[3] === "publications";
+    return beneath(path, SHARED) && path.slice(SHARED.length + 1).split("/")[1] === "publications";
   });
   // Receipts are deleted before cache results so a changed or undeletable receipt
   // can still protect the results it may reference.
   for (const candidate of publicationCandidates) {
     const removed = await removeCandidate(candidate);
-    if (!removed) blockedNotebooks.add(candidate.path.replace(/\\/g, "/").split("/")[2]);
+    if (!removed) blockedNotebooks.add(candidate.path.split(String.fromCharCode(92)).join("/").slice(SHARED.length + 1).split("/")[0]);
   }
   for (const candidate of plan.candidates) {
-    const path = candidate.path.replace(/\\/g, "/"), parts = path.split("/");
-    if (beneath(path, SHARED) && parts[3] === "publications") continue;
-    if (beneath(path, SHARED) && parts[3] === "results" && blockedNotebooks.has(parts[2])) continue;
+    const path = candidate.path.replace(/\\/g, "/");
+    const parts = beneath(path, SHARED) ? path.slice(SHARED.length + 1).split("/") : [];
+    if (parts[1] === "publications") continue;
+    if (parts[1] === "results" && blockedNotebooks.has(parts[0])) continue;
     await removeCandidate(candidate);
   }
   if (io.rmdir) for (const folder0 of plan.emptyFolders) {
     const folder = folder0.replace(/\\/g, "/");
-    const parts = folder.split("/");
+    const parts = beneath(folder, SHARED) ? folder.slice(SHARED.length + 1).split("/") : [];
     const allowed = beneath(folder, HISTORY) ||
-      (beneath(folder, SHARED) && (parts.length === 4 || parts.length === 5) &&
-        (parts[3] === "results" || parts[3] === "publications"));
+      (beneath(folder, SHARED) && (parts.length === 2 || parts.length === 3) &&
+        (parts[1] === "results" || parts[1] === "publications"));
     if (!safePath(folder) || !allowed) continue;
     try {
       if (!await io.exists(folder)) continue;

@@ -1,7 +1,7 @@
 import type { SharedIO } from "./shared";
 import { pairingAddress } from "./subscription-pairing-crypto.mjs";
+import { SHARED_ROOT } from "./storage-paths";
 
-const FOLDER = "Supernote Transcripts/Shared Data/Pairing";
 const MAX_ADDRESSES = 8;
 const MAX_FILES = 64;
 const MAX_PROBES = 12;
@@ -15,13 +15,14 @@ export type PairingDiscoveryCandidate = { address: string; sid: string; expiresA
 export type PairingInfoRequest = (url: string) => Promise<{ status: number; json?: unknown }>;
 
 /** Write the public, short-lived LAN locator. Pairing codes and account data are never serialized. */
-export async function advertise(io: SharedIO, state: PairingState, deviceId: string, now = Date.now()): Promise<void> {
+export async function advertise(io: SharedIO, state: PairingState, deviceId: string, now = Date.now(), sharedRoot = SHARED_ROOT): Promise<void> {
   if (typeof deviceId !== "string" || !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(deviceId)) {
     throw new Error("Invalid pairing discovery publisher");
   }
   const descriptor = createDescriptor(state, now);
-  await ensureFolder(io, FOLDER);
-  const path = `${FOLDER}/${deviceId}.md`;
+  const folder = `${sharedRoot}/Pairing`;
+  await ensureFolder(io, folder);
+  const path = `${folder}/${deviceId}.md`;
   const text = JSON.stringify(descriptor);
   if (await io.exists(path)) {
     await io.write(path, text);
@@ -35,11 +36,12 @@ export async function advertise(io: SharedIO, state: PairingState, deviceId: str
 }
 
 /** Read synced locators and probe only their validated private IPv4 addresses. */
-export async function discover(io: SharedIO, request: PairingInfoRequest, now = Date.now()): Promise<PairingDiscoveryCandidate[]> {
-  if (!await io.exists(FOLDER)) return [];
-  const { files } = await io.list(FOLDER);
-  const descriptorFiles = files.filter(path => path.startsWith(`${FOLDER}/`) && !path.slice(FOLDER.length + 1).includes("/")
-    && /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\.md$/i.test(path.slice(FOLDER.length + 1)))
+export async function discover(io: SharedIO, request: PairingInfoRequest, now = Date.now(), sharedRoot = SHARED_ROOT): Promise<PairingDiscoveryCandidate[]> {
+  const folder = `${sharedRoot}/Pairing`;
+  if (!await io.exists(folder)) return [];
+  const { files } = await io.list(folder);
+  const descriptorFiles = files.filter(path => path.startsWith(`${folder}/`) && !path.slice(folder.length + 1).includes("/")
+    && /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\.md$/i.test(path.slice(folder.length + 1)))
     .sort().slice(-MAX_FILES);
   const descriptors: PairingDiscoveryDescriptor[] = [];
   for (const path of descriptorFiles) {
