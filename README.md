@@ -2,7 +2,7 @@
 
 Supernote Transcripts is an Obsidian plugin that reads selected Supernote `.note` notebooks and creates or updates Markdown transcripts using an AI provider you configure. It keeps notebook files as read-only source material. You choose which notebooks to mirror and where to save the Markdown.
 
-Version **0.16.0** is an early prerelease. Download the Transcripts manual-install ZIP from the [v0.16.0 GitHub release](https://github.com/ofples/supernote-transcripts/releases/tag/v0.16.0). The optional **Supernote Bridge 0.6.1** Android app is distributed separately; download its APK from the [Bridge 0.6.1 release](https://github.com/ofples/supernote-transcripts/releases/tag/bridge-v0.6.1). There is no confirmed Community Plugins listing. See [installation](docs/installation.md) and [validation notes](VALIDATION.md) for setup and build/device verification boundaries.
+Version **0.17.0** is available as a prerelease. Download the manual-install ZIP from the [v0.17.0 GitHub release](https://github.com/ofples/supernote-transcripts/releases/tag/v0.17.0). The optional **Supernote Bridge 0.6.1** Android app is available from the [Bridge 0.6.1 release](https://github.com/ofples/supernote-transcripts/releases/tag/bridge-v0.6.1). See [installation](docs/installation.md) and [validation notes](VALIDATION.md) for setup and compatibility.
 
 ## Start here
 
@@ -10,7 +10,7 @@ Version **0.16.0** is an early prerelease. Download the Transcripts manual-insta
 - [Installation](docs/installation.md): manual ZIP installation on desktop or Nomad, with source-build steps as an alternative.
 - [User guide](docs/user-guide.md): add notebooks, configure recognition, manage the queue, and maintain transcripts.
 - [Troubleshooting](docs/troubleshooting.md): common source, sync, provider, and recovery problems.
-- [Screenshots](docs/screenshots/README.md): synthetic examples of the current interface.
+- [Workflow screenshots](docs/screenshots/README.md)
 - [Project history](HISTORY.md): earlier release notes and development record.
 - [Native Digest workflow](docs/native-digests.md): optional Android handoff from a selected Reader excerpt.
 

@@ -1,7 +1,8 @@
 import { editorInfoField, editorLivePreviewField, MarkdownRenderer, MarkdownRenderChild, MarkdownView, Notice, TFile, type Component, type Plugin } from "obsidian";
 import { Decoration, EditorView, ViewPlugin, WidgetType } from "@codemirror/view";
-import { RangeSetBuilder, StateEffect, StateField, type EditorState } from "@codemirror/state";
+import { StateEffect, StateField, type EditorState, type Range as DecorationRange } from "@codemirror/state";
 import { pageMarkerGroups, pageMarkerTableAnchor, parsePageLinkToken, parsePageMarkers } from "./page-links.mjs";
+import { parseManualSections } from "./manual-sections.mjs";
 import { createPageLinkVisibility } from "./page-link-visibility.mjs";
 import { isManagedTranscript } from "./page-navigation";
 import type { DigestPreferences } from "./digest-preferences";
@@ -151,6 +152,19 @@ class PageLinkGroupWidget extends WidgetType {
     return group;
   }
   ignoreEvent() { return false; }
+}
+
+class ManualSectionWidget extends WidgetType {
+  constructor(private readonly name: string) { super(); }
+  eq(other: ManualSectionWidget) { return this.name === other.name; }
+  toDOM() {
+    const chip = document.createElement("span");
+    chip.className = "st-manual-section-chip";
+    chip.textContent = this.name ? `Manual section · ${this.name}` : "Manual section";
+    chip.setAttribute("aria-label", chip.textContent);
+    return chip;
+  }
+  ignoreEvent() { return true; }
 }
 
 function sectionElementForGroup(root: ParentNode, sectionStart: number, sectionEnd: number,
@@ -327,18 +341,24 @@ export function installPageLinks(plugin: Plugin, onOpen: PageLinkOpen, enabled: 
   );
   const isEnabled = (sourcePath?: string) => visibility.enabled(sourcePath);
   const editorViews = new Set<EditorView>();
-  type DecorationState = { source: string; markers: ReturnType<typeof parsePageMarkers>; decorations: ReturnType<RangeSetBuilder<Decoration>["finish"]> };
+  type DecorationState = { source: string; markers: ReturnType<typeof parsePageMarkers>; manual: ReturnType<typeof parseManualSections>; decorations: ReturnType<typeof Decoration.set> };
   const buildDecorations = (state: EditorState, previous?: DecorationState): DecorationState => {
       const source = state.doc.toString();
       const sameSource = previous?.source === source;
-      const markers = sameSource ? previous.markers : (isManagedTranscript(source) ? parsePageMarkers(source) : []);
-      const builder = new RangeSetBuilder<Decoration>();
-      const empty = () => ({ source, markers, decorations: builder.finish() });
-      if (state.field(editorLivePreviewField, false) !== true) return empty();
+      const managed = isManagedTranscript(source);
+      const markers = sameSource ? previous.markers : (managed ? parsePageMarkers(source) : []);
+      const manual = sameSource ? previous.manual : (managed ? parseManualSections(source) : []);
+      const ranges: DecorationRange<Decoration>[] = [];
+      const finish = () => ({ source, markers, manual, decorations: Decoration.set(ranges, true) });
+      if (state.field(editorLivePreviewField, false) !== true) return finish();
       const path = state.field(editorInfoField, false)?.file?.path;
-      if (!path || !isEnabled(path) || !markers.length) return empty();
       const selected = (from: number, to: number) => state.selection.ranges.some(range => range.empty
         ? range.head >= from && range.head < to : range.from < to && range.to > from);
+      for (const section of manual) {
+        if (selected(section.from, section.to)) continue;
+        ranges.push(Decoration.replace({ widget: new ManualSectionWidget(section.name), inclusive: false }).range(section.from, section.to));
+      }
+      if (!path || !isEnabled(path) || !markers.length) return finish();
       const groups = pageMarkerGroups(source, markers);
       const grouped = new Set(groups.flatMap(group => group.markers.map(marker => marker.from)));
       const items: Array<{ from: number; to: number; marker: (typeof markers)[number]; group?: (typeof groups)[number]; empty?: boolean; anchor?: boolean }> = [];
@@ -365,23 +385,23 @@ export function installPageLinks(plugin: Plugin, onOpen: PageLinkOpen, enabled: 
       for (const item of items) {
         if (item.from < previousTo) continue;
         if (item.empty) {
-          builder.add(item.from, item.to, Decoration.replace({ inclusive: false }));
+          ranges.push(Decoration.replace({ inclusive: false }).range(item.from, item.to));
           previousTo = item.to;
           continue;
         }
         if (item.anchor) {
-          builder.add(item.from, item.to, Decoration.widget({ widget: new PageLinkGroupWidget(path, item.group!.markers, onOpen), side: 1 }));
+          ranges.push(Decoration.widget({ widget: new PageLinkGroupWidget(path, item.group!.markers, onOpen), side: 1 }).range(item.from, item.to));
           continue;
         }
-        builder.add(item.from, item.to, Decoration.replace({
+        ranges.push(Decoration.replace({
           widget: item.group
             ? new PageLinkGroupWidget(path, item.group.markers, onOpen)
             : new PageLinkWidget(path, item.marker.pageId, item.marker.number, onOpen),
           inclusive: false,
-        }));
+        }).range(item.from, item.to));
         previousTo = item.to;
       }
-      return { source, markers, decorations: builder.finish() };
+      return finish();
   };
   const pageLinkField = StateField.define<DecorationState>({
     create: state => buildDecorations(state),
@@ -613,7 +633,6 @@ export function installPageLinks(plugin: Plugin, onOpen: PageLinkOpen, enabled: 
 
   plugin.registerMarkdownPostProcessor(async (el, ctx) => {
     if (el.closest("[data-st-page-links-render]") || el.hasAttribute("data-st-page-links-render")) return;
-    if (!isEnabled(ctx.sourcePath)) return;
     const section = ctx.getSectionInfo(el);
     if (!section) return;
     let fullSource = section.text;
@@ -624,16 +643,20 @@ export function installPageLinks(plugin: Plugin, onOpen: PageLinkOpen, enabled: 
       try { fullSource = await plugin.app.vault.cachedRead(file); } catch { return; }
     }
     if (!isManagedTranscript(fullSource)) return;
-    if (!isEnabled(ctx.sourcePath)) return;
+    const linksEnabled = isEnabled(ctx.sourcePath);
     const allMarkers = parsePageMarkers(fullSource);
-    if (!allMarkers.length) return;
-    const groups = pageMarkerGroups(fullSource, allMarkers);
+    const allManual = parseManualSections(fullSource);
+    if (!allMarkers.length && !allManual.length) return;
+    const groups = linksEnabled ? pageMarkerGroups(fullSource, allMarkers) : [];
     const fullLines = fullSource.split(/\r?\n/);
     const startLine = section.lineStart;
     const endLine = section.lineEnd;
-    const source = fullLines.slice(startLine, endLine + 1).join("\n");
+    const source = fullLines.slice(startLine, endLine + 1).join(fullSource.includes("\r\n") ? "\r\n" : "\n");
     if (!source) return;
-    const sectionMarkers = allMarkers.filter(marker => marker.line >= startLine && marker.line <= endLine);
+    const sectionMarkers = linksEnabled ? allMarkers.filter(marker => marker.line >= startLine && marker.line <= endLine) : [];
+    const manualRows = allManual.map(item => ({ ...item, line: fullSource.slice(0, item.from).split("\n").length - 1,
+      endLine: fullSource.slice(0, Math.max(item.from, item.to - 1)).split("\n").length - 1 })).filter(item => item.line <= endLine && item.endLine >= startLine);
+    if (!linksEnabled && !manualRows.length) return;
     const markerOnlyLines = new Set(groups.flatMap(group => group.markerLines));
     const isMarkerOnlySection = fullLines.slice(startLine, endLine + 1).every((line, index) => {
       if (!line.trim()) return true;
@@ -646,12 +669,12 @@ export function installPageLinks(plugin: Plugin, onOpen: PageLinkOpen, enabled: 
       return;
     }
     const groupedLines = new Set(groups.flatMap(group => group.markerLines));
-    const inlineMarkers = parsePageMarkers(source).filter(marker => !groupedLines.has(marker.line + startLine));
-    const targetGroups = groups.filter(group => group.targetLine !== null && group.targetLine >= startLine && group.targetLine <= endLine);
-    if (!inlineMarkers.length && !targetGroups.length) return;
+    const inlineMarkers = linksEnabled ? parsePageMarkers(source).filter(marker => !groupedLines.has(marker.line + startLine)) : [];
+    const targetGroups = linksEnabled ? groups.filter(group => group.targetLine !== null && group.targetLine >= startLine && group.targetLine <= endLine) : [];
+    if (!inlineMarkers.length && !targetGroups.length && !manualRows.length) return;
     const linkTokens = new Map<string, (typeof allMarkers)[number]>();
     let renderRoot: ParentNode = el;
-    if (inlineMarkers.length) {
+    if (inlineMarkers.length || manualRows.length) {
       const child = new MarkdownRenderChild(el);
       ctx.addChild(child);
       let rendered = "";
@@ -662,16 +685,33 @@ export function installPageLinks(plugin: Plugin, onOpen: PageLinkOpen, enabled: 
         linkTokens.set(token, marker);
         replacements.push({ at: marker.from, to: marker.to, token });
       }
+      const newlineSize = fullSource.includes("\r\n") ? 2 : 1;
+      const sectionStart = fullLines.slice(0, startLine).reduce((length, line) => length + line.length + newlineSize, 0);
+      const sectionEnd = sectionStart + source.length;
+      for (const manual of manualRows) {
+        const markerText = fullSource.slice(manual.from, manual.to).replace(/\r?\n$/, "");
+        const startMatch = /^<!--[ \t]*supernote-manual:start:[^\n]+-->/.exec(markerText);
+        const endAtInBlock = markerText.lastIndexOf("<!--");
+        const endMatch = /<!--[ \t]*supernote-manual:end:[^\n]+-->[ \t]*$/.exec(markerText.slice(endAtInBlock));
+        if (!startMatch || !endMatch) continue;
+        const startAt = manual.from, startTo = startAt + startMatch[0].length;
+        const endAt = manual.from + endAtInBlock, endTo = endAt + endMatch[0].length;
+        const esc = (value: string) => value.replace(/[&<>"']/g, char => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[char]!));
+        const chip = `<span class="st-manual-section-chip">Manual section${manual.name ? ` · ${esc(manual.name)}` : ""}</span>`;
+        if (startAt >= sectionStart && startTo <= sectionEnd) replacements.push({ at: startAt - sectionStart, to: startTo - sectionStart, token: chip });
+        if (endAt >= sectionStart && endTo <= sectionEnd) replacements.push({ at: endAt - sectionStart, to: endTo - sectionStart, token: "" });
+      }
       replacements.sort((a, b) => a.at - b.at);
       for (const item of replacements) {
-        rendered += source.slice(offset, item.at) + `[p.${linkTokens.get(item.token)!.number} ↗](obsidian://nomad-transcripts-page-link?token=${encodeURIComponent(item.token)})`;
+        rendered += source.slice(offset, item.at) + (linkTokens.has(item.token)
+          ? `[p.${linkTokens.get(item.token)!.number} ↗](obsidian://nomad-transcripts-page-link?token=${encodeURIComponent(item.token)})` : item.token);
         offset = item.to;
       }
       rendered += source.slice(offset);
       const fragment = document.createElement("div");
       fragment.dataset.stPageLinksRender = "true";
       await MarkdownRenderer.render(plugin.app, rendered, fragment, ctx.sourcePath, child);
-      if (!isEnabled(ctx.sourcePath)) return;
+      if (linksEnabled !== isEnabled(ctx.sourcePath)) return;
       for (const anchor of Array.from(fragment.querySelectorAll<HTMLAnchorElement>("a[href]"))) {
         const token = parsePageLinkToken(anchor.getAttribute("href")) ?? parsePageLinkToken(anchor.getAttribute("data-href"));
         const marker = token ? linkTokens.get(token) : undefined;

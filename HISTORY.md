@@ -1,5 +1,9 @@
 # Supernote Transcripts
 
+## 0.17.0 — source selection, transcription and settings
+
+Obsidian's command palette can add saved sources or start one-time transcription for a file or folder. The desktop status bar opens activity and actionable issues. Settings organize provider connection, recognition, updates, and storage. Recognition and cleanup prompts can be saved as reusable revisions. See the [0.17.0 release notes](release-notes/0.17.0.md).
+
 ## 0.16.0 — storage consolidation, safer updates and Reader integration
 
 Support files now live under `_supernote/`, with preflight checks and retry-safe migration from earlier folders. Existing transcript output stays in its configured destination. Automatic check modes, one-shot notebook checks, queue controls and shared-result hydration give more control over updates while preserving local pause and provider settings. Page reading reuses bounded indexes, and transcript edit reconciliation protects manual changes.

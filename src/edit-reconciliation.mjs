@@ -43,7 +43,7 @@ function anchors(source, pages) {
     return lo > 0 && at < ignored[lo - 1][1];
   };
   const markerStarts = new Set();
-  const marker = /<!--[ \t]*supernote-page:([^\s]+)[ \t]+number:([^\s]+)[ \t]*-->/g;
+  const marker = /<!--[ \t]*(?:supernote|transcript)-page:([^\s]+)[ \t]+number:([^\s]+)[ \t]*-->/g;
   for (let m; (m = marker.exec(source));) {
     if (inside(m.index)) continue;
     let id;
@@ -55,7 +55,7 @@ function anchors(source, pages) {
     result.push({ from: m.index, to: marker.lastIndex, id, number, kind: "marker" });
   }
   // Reject marker-like comments that did not match the complete supported grammar.
-  const mentions = /<!--[ \t]*supernote-page:/g;
+  const mentions = /<!--[ \t]*(?:supernote|transcript)-page:/g;
   for (let m; (m = mentions.exec(source));) if (!inside(m.index) && !markerStarts.has(m.index))
     return { error: "A malformed page marker makes the page boundaries unsafe." };
   const heading = /^## Page ([^\r\n]+)[ \t]*$/gm;
@@ -173,7 +173,7 @@ export function validateReconciledText(edited, proposal) {
   const proposedAnchors = anchors(proposal, []);
   if (proposedAnchors.error || proposedAnchors.anchors.length)
     return { valid: false, reason: "A page reconciliation cannot add or move a page boundary." };
-  const reserved = /<!--[ \t]*(?:supernote-page:[\s\S]*?|supernote-empty-page[\s\S]*?|supernote-continue[\s\S]*?)-->/g;
+  const reserved = /<!--[ \t]*(?:(?:supernote|transcript)-page:[\s\S]*?|supernote-empty-page[\s\S]*?|supernote-continue[\s\S]*?)-->/g;
   const before = [...edited.matchAll(reserved)].map(m => m[0]);
   const after = [...proposal.matchAll(reserved)].map(m => m[0]);
   if (JSON.stringify(after) !== JSON.stringify(before))
@@ -181,7 +181,7 @@ export function validateReconciledText(edited, proposal) {
   const constructs = (text) => {
     const result = [];
     for (const pattern of [/==[\s\S]*?==/g, /~~[\s\S]*?~~/g, /\[[^\]\n]*\]\([^\s)]+(?:\s+[^)]*)?\)/g, /!?\[\[[^\]\n]+\]\]/g, /<!--[\s\S]*?-->/g])
-      for (const match of text.matchAll(pattern)) if (!/<!--[ \t]*(?:supernote-page:|supernote-empty-page|supernote-continue)/.test(match[0])) result.push(match[0]);
+      for (const match of text.matchAll(pattern)) if (!/<!--[ \t]*(?:(?:supernote|transcript)-page:|supernote-empty-page|supernote-continue)/.test(match[0])) result.push(match[0]);
     return result;
   };
   const required = constructs(edited), offered = constructs(proposal);

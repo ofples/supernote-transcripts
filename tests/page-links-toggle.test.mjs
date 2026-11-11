@@ -47,42 +47,35 @@ class FakeButton extends FakeElement {
   constructor(className = "view-action") { super(className); }
 }
 
-globalThis.HTMLButtonElement = FakeButton;
-globalThis.document = { createElement: tag => tag === "button" ? new FakeButton() : new FakeElement() };
-
-const mocks = {
-  obsidian: `
-    export const editorInfoField = {};
-    export const editorLivePreviewField = {};
-    export const MarkdownRenderer = { async render() {} };
+const obsidianMock = `
+    import { StateField } from "@codemirror/state";
+    export const editorInfoField = StateField.define({ create: () => null, update: value => value });
+    export const editorLivePreviewField = StateField.define({ create: () => true, update: value => value });
+    export const MarkdownRenderer = { async render(app, ...args) { await app.render?.(...args); } };
     export class MarkdownRenderChild {}
     export class MarkdownView {}
     export class Notice { constructor(message) { globalThis.notices.push(message); } }
     export class TFile { static [Symbol.hasInstance](value) { return value?.isTFile === true; } }
-  `,
-  "@codemirror/view": `
-    export class Decoration { static replace(value) { return value; } static widget(value) { return value; } }
-    export class WidgetType {}
-    export class EditorView { static decorations = { from() {} }; }
-    export class ViewPlugin { static fromClass(value) { return value; } }
-  `,
-  "@codemirror/state": `
-    export class RangeSetBuilder { add() {} finish() { return []; } }
-    export class StateEffect { static define() { return { of(value) { return { value }; }, is() { return false; } }; } }
-    export class StateField { static define(value) { return value; } }
-  `,
-};
+`;
 const bundled = await build({
-  entryPoints: ["src/page-links-ui.ts"], bundle: true, platform: "node", format: "esm", write: false,
+  stdin: { contents: `
+    export { installPageLinks } from "./src/page-links-ui.ts";
+    export { EditorState } from "@codemirror/state";
+    export { editorInfoField, editorLivePreviewField } from "obsidian";
+  `, resolveDir: process.cwd() }, bundle: true, platform: "node", format: "esm", write: false,
   plugins: [{ name: "test-mocks", setup(buildApi) {
-    buildApi.onResolve({ filter: /^(obsidian|@codemirror\/view|@codemirror\/state)$/ }, args => ({ path: args.path, namespace: "test-mock" }));
-    buildApi.onLoad({ filter: /.*/, namespace: "test-mock" }, args => ({ contents: mocks[args.path], loader: "js" }));
+    buildApi.onResolve({ filter: /^obsidian$/ }, args => ({ path: args.path, namespace: "test-mock" }));
+    buildApi.onLoad({ filter: /.*/, namespace: "test-mock" }, () => ({ contents: obsidianMock, loader: "js", resolveDir: process.cwd() }));
   } }],
 });
-const { installPageLinks } = await import("data:text/javascript;base64," + Buffer.from(bundled.outputFiles[0].text).toString("base64"));
+const { installPageLinks, EditorState, editorInfoField, editorLivePreviewField } = await import("data:text/javascript;base64," + Buffer.from(bundled.outputFiles[0].text).toString("base64"));
+globalThis.HTMLButtonElement = FakeButton;
+globalThis.document = { createElement: tag => tag === "button" ? new FakeButton() : new FakeElement() };
 
 const linkedSource = ["---", "nomad_transcripts: true", "---", "", "# Notebook", "<!-- supernote-page:native%3Apage number:1 -->"].join("\n");
 const ordinarySource = ["---", "nomad_transcripts: true", "---", "", "No page links."].join("\n");
+const manualSource = ["---", "nomad_transcripts: true", "---", "", "<!-- supernote-page:first number:1 -->",
+  "Page text.", "", "<!-- supernote-manual:start:local:name:Review -->", "Manual text.", "<!-- supernote-manual:end:local -->", ""].join("\n");
 const makeFile = (path, mtime = 1) => ({ path, extension: "md", stat: { mtime }, isTFile: true });
 
 function setup() {
@@ -231,3 +224,52 @@ test("file switches reject stale clicks, modified reader files rescan, and close
 });
 
 function linkedSourceText() { return linkedSource; }
+
+test("heading-free Live Preview renders page and manual chips in source order", () => {
+  const { plugin, linkedFile } = setup();
+  let extensions;
+  plugin.registerEditorExtension = value => { extensions = value; };
+  let enabled = true;
+  installPageLinks(plugin, async () => {}, () => enabled);
+  const [field] = extensions;
+  const state = EditorState.create({ doc: manualSource, extensions: [
+    editorLivePreviewField, editorInfoField.init(() => ({ file: linkedFile })), ...extensions,
+  ] });
+  const widgetStarts = current => {
+    const ranges = current.field(field).decorations.iter();
+    const starts = [];
+    for (; ranges.value; ranges.next()) if (ranges.value.widget) starts.push(ranges.from);
+    return starts;
+  };
+  const pageStart = manualSource.indexOf("<!-- supernote-page");
+  const manualStart = manualSource.indexOf("<!-- supernote-manual:start");
+  assert.deepEqual(widgetStarts(state), [pageStart, manualStart]);
+  assert.deepEqual(widgetStarts(state.update({ selection: { anchor: manualStart } }).state), [pageStart]);
+  enabled = false;
+  assert.deepEqual(widgetStarts(state.update({ selection: { anchor: 1 } }).state), [manualStart]);
+});
+
+test("Reading View keeps the manual-section chip with page links hidden", async () => {
+  const { plugin, linkedFile } = setup();
+  let processSection;
+  plugin.registerMarkdownPostProcessor = callback => { processSection = callback; };
+  installPageLinks(plugin, async () => {}, () => false);
+  const originalDocument = globalThis.document;
+  const fragment = { dataset: {}, children: [], childNodes: [], querySelectorAll: () => [] };
+  const el = { tagName: "DIV", closest: () => null, hasAttribute: () => false,
+    replaceChildren(...nodes) { this.childNodes = nodes; } };
+  globalThis.document = { createElement: () => fragment };
+  plugin.app.render = async (markdown, target) => { target.childNodes = [markdown]; };
+  try {
+    await processSection(el, { sourcePath: linkedFile.path, addChild() {},
+      getSectionInfo: () => ({ text: manualSource, lineStart: 4, lineEnd: 10 }),
+    });
+  } finally {
+    globalThis.document = originalDocument;
+  }
+  assert.equal(el.childNodes?.length, 1);
+  assert.match(el.childNodes[0], /<span class="st-manual-section-chip">Manual section · Review<\/span>/);
+  assert.match(el.childNodes[0], /Manual text\./);
+  assert.doesNotMatch(el.childNodes[0], /<!-- supernote-manual:/);
+  assert.doesNotMatch(el.childNodes[0], /obsidian:\/\/nomad-transcripts-page-link/);
+});

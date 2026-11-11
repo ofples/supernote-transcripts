@@ -27,7 +27,7 @@ export function restoredState(point: RestorePoint, current: NotebookState): Note
     delete state[key];
     if (point.snapshot[key] !== undefined) (state as any)[key] = point.snapshot[key];
   }
-  for (const key of ["error", "executionIssue", "legacyPageFailure", "forcePending", "priorityPages", "pageIssues", "pageAttempts", "historyRevision"] as const) delete state[key];
+  for (const key of ["error", "executionIssue", "legacyPageFailure", "forcePending", "priorityPages", "pageIssues", "pageAttempts", "historyRevision", "retryRun"] as const) delete state[key];
   if(Object.keys(state.editConflicts??{}).length)state.status="partial";
   validateStateSnapshot({generation: 0, store: {version: 1, notebooks: {[state.source]: state}, queue: [], history: []}});
   return state;

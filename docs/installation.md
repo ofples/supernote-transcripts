@@ -1,6 +1,6 @@
 # Installation
 
-Supernote Transcripts is an Obsidian community plugin package. The plugin ID is `nomad-transcripts`; its manifest requires Obsidian 1.7.2 or later. Install version 0.16.0 from the [GitHub prerelease](https://github.com/ofples/supernote-transcripts/releases/tag/v0.16.0). There is no confirmed Community Plugins listing, and BRAT is not a supported installation path.
+Supernote Transcripts is an Obsidian community plugin package with the ID `nomad-transcripts`. Install version 0.17.0 manually from the [GitHub prerelease](https://github.com/ofples/supernote-transcripts/releases/tag/v0.17.0).
 
 For the complete Nomad-to-desktop setup, including the roles of both Supernote Cloud Sync and Obsidian Sync, follow the [end-to-end workflow](workflow.md) first.
 
@@ -14,12 +14,12 @@ For the complete Nomad-to-desktop setup, including the roles of both Supernote C
 
 ## Install the prerelease ZIP
 
-Download `supernote-transcripts-0.16.0.zip` from the [GitHub v0.16.0 release](https://github.com/ofples/supernote-transcripts/releases/tag/v0.16.0) and extract it. The archive contains a `nomad-transcripts` folder with the three plugin runtime files plus its license and notices. Copy that folder into the active vault configuration's `plugins` directory:
+Download `supernote-transcripts-0.17.0.zip` from the [GitHub v0.17.0 release](https://github.com/ofples/supernote-transcripts/releases/tag/v0.17.0) and extract it. The archive contains a `nomad-transcripts` folder with the three plugin runtime files plus its license and notices. Copy that folder into the active vault configuration's `plugins` directory.
 
 - Desktop: `.obsidian/plugins/nomad-transcripts/`
 - Nomad: `.obsidian-supernote/plugins/nomad-transcripts/` after setting **Settings → Files and links → Override config folder** to `.obsidian-supernote` and restarting Obsidian.
 
-For an existing installation, back up the plugin folder, then replace only `main.js`, `manifest.json`, and `styles.css`. Keep the folder and its `data.json` intact. Enable or reload **Supernote Transcripts** in **Settings → Community plugins**, then confirm the version shown by Obsidian. Keep updates paused while reviewing sources and settings. The release is an early prerelease.
+For an existing installation, back up the plugin folder, then replace only `main.js`, `manifest.json`, and `styles.css`. Keep the saved settings and state files intact. Reload **Supernote Transcripts** in **Settings → Community plugins**, then confirm the version shown by Obsidian. Keep updates paused while reviewing sources and settings.
 
 ## Build from source
 

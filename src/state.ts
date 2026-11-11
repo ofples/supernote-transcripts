@@ -3,6 +3,8 @@ import { validateDestination, validateSource } from "./reconcile.mjs";
 import { sharedHash } from "./shared";
 // @ts-ignore JavaScript provenance helper is shared with runtime validation.
 import { validRecognition } from "./provenance.mjs";
+import { validPromptReference } from "./prompt-library.mjs";
+import { validRecognitionRun } from "./run-settings.mjs";
 
 export interface StateSnapshot { generation: number; store: Store; checksum?: string }
 const record = (v: any): v is Record<string, any> => !!v && typeof v === "object" && !Array.isArray(v);
@@ -37,10 +39,14 @@ function keyedPageText(value: any, desired: any[], baseRequired: boolean): boole
 function cleanup(value: any): boolean {
   return record(value) && date(value.updatedAt) && hash(value.inputHash) && hash(value.outputHash) &&
     boundedText(value.model, 200) && value.quality === "careful" && ["api", "subscription"].includes(value.provider) &&
-    descriptors(value.basePages) && value.basePages.length <= 20000 && optional(value.stale, x => typeof x === "boolean");
+    descriptors(value.basePages) && value.basePages.length <= 20000 && optional(value.stale, x => typeof x === "boolean") &&
+    optional(value.promptRevision, validPromptReference);
 }
 function notebook(v: any, source: string): boolean {
-  if (!record(v) || v.source !== source || !path(source, true) || !/\.note$/i.test(source) ||
+  if (!record(v) || v.source !== source || !path(source, true) ||
+      (v.documentFormat===undefined ? !/\.note$/i.test(source)
+        : !v.oneTime || /\.note$/i.test(source) || typeof v.documentFormat!=="string" ||
+          !/^[a-z0-9][a-z0-9-]{0,79}$/.test(v.documentFormat) || v.documentFormat==="supernote") ||
       !nonempty(v.id) || !nonempty(v.ruleId) || !path(v.output) || !/\.md$/i.test(v.output) ||
       !text(v.revision) || !strings(v.order) || !descriptors(v.desired) || !record(v.pages) ||
       !["queued", "checking", "recognizing", "current", "failed", "partial", "missing", "conflict", "excluded"].includes(v.status)) return false;
@@ -51,6 +57,7 @@ function notebook(v: any, source: string): boolean {
       (nonempty(p.recipe) || (v.legacy === true && p.recipe === undefined)) &&
       optional(p.legacyRenderHash, nonempty) && optional(p.blank, x => typeof x === "boolean"))) return false;
   if (!["paused", "profileOutdated", "legacy"].every(key => optional(v[key], x => typeof x === "boolean")) ||
+      !optional(v.oneTime, value => record(value) && boundedText(value.profileId, 200) && /^one-time:[a-f0-9]{64}$/.test(v.ruleId)) ||
       !["error", "historyRevision", "legacyPageFailure"].every(key => optional(v[key], text)) ||
       !optional(v.lastSaved, date) || !optional(v.lastAutomaticCheck, date) || !optional(v.lastFullCheck, date) ||
       !optional(v.lastFullCheckRevision, text) || !optional(v.lastCheckMode, x => ["new", "recent", "all"].includes(x)) ||
@@ -60,9 +67,11 @@ function notebook(v: any, source: string): boolean {
       !["forcePending", "priorityPages", "automaticPending"].every(key => optional(v[key], strings))) return false;
   if (!optional(v.pageIssues, issues => record(issues) && Object.values(issues).every((p: any) => record(p) &&
       nonempty(p.fingerprint) && integer(p.number, 1) && ["failed", "skipped"].includes(p.status) &&
-      nonempty(p.kind) && nonempty(p.reason) && integer(p.attempts) && date(p.updatedAt) && optional(p.force, x => typeof x === "boolean"))) ||
+      nonempty(p.kind) && nonempty(p.reason) && integer(p.attempts) && date(p.updatedAt) && optional(p.force, x => typeof x === "boolean") &&
+      optional(p.run, validRecognitionRun))) ||
       !optional(v.pageAttempts, attempts => record(attempts) && Object.values(attempts).every((p: any) =>
         record(p) && nonempty(p.fingerprint) && integer(p.count))) ||
+      !optional(v.retryRun, validRecognitionRun) ||
       !optional(v.executionIssue, issue => record(issue) && ["source", "batch"].includes(issue.scope) &&
         nonempty(issue.reason) && optional(issue.recipe, nonempty) && optional(issue.code, nonempty))) return false;
   if (!optional(v.deviceOcr, pages => keyedPageText(pages, v.desired, false)) ||
@@ -85,12 +94,15 @@ export function validateStateSnapshot(value: unknown): StateSnapshot {
   if (!record(v) || !safeKeys(v) || !integer(v.generation) || !optional(v.checksum, hash) || !record(v.store) || v.store.version !== 1 ||
       !record(v.store.notebooks) || !Array.isArray(v.store.queue) || !Array.isArray(v.store.history) ||
       !optional(v.store.lastChecked, date) || !v.store.history.every((p: any) => path(p) && /\.md$/i.test(p)) ||
+      !optional(v.store.sourceIssues, issues => record(issues) && Object.entries(issues).every(([id, issue]) =>
+        nonempty(id) && record(issue) && path(issue.source, true) && boundedText(issue.reason, 4000) && date(issue.observedAt))) ||
       !Object.entries(v.store.notebooks).every(([source, n]) => notebook(n, source))) throw Error("Invalid notebook state snapshot.");
   const tasks = new Set<string>();
   for (const t of v.store.queue) {
     if (!record(t) || !path(t.source, true) || !v.store.notebooks[t.source] || tasks.has(t.source) ||
         typeof t.force !== "boolean" || !optional(t.manual,x => typeof x === "boolean") || !optional(t.priority, x => Number.isFinite(x)) ||
-        !optional(t.modified, x => Number.isFinite(x)) || !optional(t.pageIds, strings)) throw Error("Invalid notebook queue snapshot.");
+        !optional(t.modified, x => Number.isFinite(x)) || !optional(t.pageIds, strings) ||
+        !optional(t.run, validRecognitionRun)) throw Error("Invalid notebook queue snapshot.");
     tasks.add(t.source);
   }
   return v as StateSnapshot;

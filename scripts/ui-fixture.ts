@@ -131,6 +131,15 @@ export default class UIFixture extends Plugin {
         c.store.notebooks[source].paused = paused;
         emit();
       },
+      resumeNotebook: async (source: string) => {
+        c.store.notebooks[source].paused = false;
+        emit();
+      },
+      resumeSourceFolder: async (id: string) => {
+        const rule = c.config.rules.find((item: any) => item.id === id);
+        if (rule) rule.paused = false;
+        emit();
+      },
       subscribe: (fn: () => void) => {
         listeners.add(fn);
         return () => listeners.delete(fn);

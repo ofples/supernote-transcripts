@@ -4,7 +4,7 @@
 
 | Component | Candidate | Distribution |
 | --- | --- | --- |
-| Supernote Transcripts | 0.16.0 | Manual-install ZIP from `ofples/supernote-transcripts` |
+| Supernote Transcripts | 0.17.0 | Manual-install ZIP from `ofples/supernote-transcripts` |
 | MD Reader fork | 2.2.1 | Separate plugin release from `ofples/obsidian-md-reader` |
 | Paper theme | 0.5.14 | Separate theme release |
 | Sidebar companion | 0.4.1 | Separate plugin release |

@@ -1,11 +1,13 @@
 import { createRequire } from "node:module";
+import { execFileSync } from "node:child_process";
 import { pathToFileURL } from "node:url";
 import { resolve, join } from "node:path";
 import { mkdir, writeFile } from "node:fs/promises";
 
-const moduleRoot = "C:/Users/pless/.cache/codex-runtimes/codex-primary-runtime/dependencies/node/node_modules";
 const require = createRequire(import.meta.url);
-const { chromium } = require(join(moduleRoot, "playwright"));
+const moduleRoot = process.env.PLAYWRIGHT_MODULE_ROOT;
+const { chromium } = require(moduleRoot ? join(resolve(moduleRoot), "playwright") : "playwright");
+const executablePath = process.env.CHROME_EXECUTABLE_PATH;
 const out = resolve("test-artifacts/streamlined-ui-screenshots");
 await mkdir(out, { recursive: true });
 const platforms = ["desktop", "nomad"];
@@ -14,7 +16,8 @@ const assert = (condition, message) => { if (!condition) throw new Error(message
 const pause = (ms = 80) => new Promise((resolve) => setTimeout(resolve, ms));
 
 for (const platform of platforms) {
-  const browser = await chromium.launch({ headless: true, executablePath: "C:/Program Files/Google/Chrome/Application/chrome.exe" });
+  execFileSync(process.execPath, ["scripts/build-streamlined-ui-fixture.mjs", `--platform=${platform}`], { stdio: "ignore" });
+  const browser = await chromium.launch({ headless: true, executablePath });
   const page = await browser.newPage({ viewport: { width: 1280, height: 900 }, deviceScaleFactor: 1 });
   const errors = [];
   page.setDefaultTimeout(6000);
@@ -35,8 +38,10 @@ for (const platform of platforms) {
     };
     return { viewport: { width: innerWidth, height: innerHeight }, modal: modal && rect(modal), header: header && rect(header), settings: settings && rect(settings) };
   });
-  assert(initialLayout.modal?.width >= Math.min(initialLayout.viewport.width, 960) - 8 && initialLayout.modal?.height >= Math.min(initialLayout.viewport.height, 860) - 8, `${platform}: main modal is too small for the synthetic viewport: ${JSON.stringify(initialLayout)}`);
-  const compactTarget = platform === "desktop" ? 36 : 48;
+  const { modal, viewport, header } = initialLayout;
+  assert(modal && header && modal.x >= 0 && modal.y >= 0 && modal.x + modal.width <= viewport.width + 1 && modal.y + modal.height <= viewport.height + 1 && header.width >= 320,
+    `${platform}: source dialog must fit the viewport with a usable header: ${JSON.stringify(initialLayout)}`);
+  const compactTarget = platform === "desktop" ? 30 : 48;
   assert(initialLayout.settings?.width >= compactTarget && initialLayout.settings?.height >= compactTarget, `${platform}: Settings gear target is smaller than ${compactTarget}px`);
   const sourceText = await root.innerText();
   assert(sourceText.includes("Sources") && sourceText.includes("Journal") && sourceText.includes("Research"), `${platform}: synthetic sources missing`);
@@ -78,11 +83,11 @@ for (const platform of platforms) {
   await slider.fill("2");
   await slider.dispatchEvent("input");
   assert((await slider.getAttribute("aria-valuetext")) === "Careful", `${platform}: quality control did not select Careful`);
-  await root.getByRole("button", { name: "Choose existing folder" }).click();
+  await root.getByRole("button", { name: "Choose folder", exact: true }).click();
   await root.locator(".st-output-browser").waitFor();
   await root.locator(".st-output-browser .st-browser-entry").filter({ hasText: "Fixture Output" }).click();
   await root.getByRole("button", { name: "Choose this folder" }).click();
-  assert(await root.getByText("Instructions and reference files", { exact: true }).isVisible(), `${platform}: instructions and reference files are not directly accessible in the editor`);
+  assert(await root.getByRole("textbox", { name: "Instructions", exact: true }).isVisible(), `${platform}: instructions are not directly accessible in the editor`);
   await root.getByRole("button", { name: "Choose reference files" }).click();
   await root.locator(".st-glossary-picker").waitFor();
   const glossaryLabel = root.locator(".st-glossary-picker label").filter({ hasText: "Fixture glossary.md" }).first();
@@ -110,15 +115,16 @@ for (const platform of platforms) {
 
   await root.locator("button[aria-label=\"Settings\"]").click();
   assert((await root.locator("h1").innerText()) === "Settings", `${platform}: Settings header navigation failed`);
-  assert(await root.locator(".st-run-behavior").getByText("Automatic catch-up", { exact: true }).count() === 1, `${platform}: automatic catch-up setting is missing`);
+  await root.getByRole("tab", { name: "Recognition" }).click();
   assert(await root.locator(".st-recognition-defaults .st-model-picker select").count() === 1, `${platform}: default model selector is missing`);
   assert(await root.locator(".st-recognition-defaults .st-quality-field input[type=range]").count() === 1, `${platform}: default recognition quality selector is missing`);
   const settingsGear = await root.locator('button[aria-label="Close settings"]').boundingBox();
   assert(settingsGear?.width >= compactTarget && settingsGear?.height >= compactTarget, `${platform}: Settings-screen gear target is too small`);
   const autoBeforeCancel = await page.evaluate(() => ({ enabled: window.__streamlinedFixture.controller.autoEnabled, saves: window.__streamlinedFixture.controller.actionCounters.saveConfig }));
-  const autoToggle = root.locator(".st-run-behavior .st-check-row").nth(1).locator('input[type="checkbox"]');
-  await autoToggle.check();
-  assert(await autoToggle.isChecked(), `${platform}: automatic catch-up control did not toggle`);
+  await root.getByRole("tab", { name: "Updates" }).click();
+  const autoToggle = root.getByRole("checkbox", { name: "Automatic catch-up", exact: true });
+  await autoToggle.setChecked(!autoBeforeCancel.enabled);
+  assert(await autoToggle.isChecked() !== autoBeforeCancel.enabled, `${platform}: automatic catch-up control did not toggle`);
   await page.screenshot({ path: join(out, `${platform}-settings.png`), fullPage: false });
   await root.getByRole("button", { name: "Cancel", exact: true }).click();
   const autoAfterCancel = await page.evaluate(() => ({ enabled: window.__streamlinedFixture.controller.autoEnabled, saves: window.__streamlinedFixture.controller.actionCounters.saveConfig }));
@@ -150,10 +156,10 @@ for (const platform of platforms) {
   assert(queueText.includes("14 pages"), `${platform}: global target page estimate missing`);
   assert(await root.locator(".st-queue-estimate-info").count() <= 1, `${platform}: estimate explanation repeats in queue rows`);
   const estimateInfo = root.locator(".st-queue-estimate-info");
-  if (await estimateInfo.count()) { await estimateInfo.locator("summary").click(); assert((await estimateInfo.innerText()).includes("Estimates are not bills"), `${platform}: API context is missing from estimate details`); }
+  await estimateInfo.getByRole("button", { name: "Help: About this estimate" }).click();
+  assert((await estimateInfo.innerText()).includes("Estimates are not bills"), `${platform}: API context is missing from estimate details`);
   const waitingBefore = await page.evaluate(() => (window).__streamlinedFixture.controller.queueView.waiting.slice());
   assert(waitingBefore.length === 2, `${platform}: waiting order should include two synthetic notebooks`);
-  const waitingRowsBefore = await root.locator(".st-queue-live .st-queue-row:not(.st-working)").allInnerTexts();
   const firstWaiting = root.locator(`button[data-queue-key="next:${waitingBefore[1]}"]`);
   await firstWaiting.click();
   await pause();
@@ -170,21 +176,33 @@ for (const platform of platforms) {
   assert(actions.prioritize.length === 1 && actions.notebookPause.length === 1, `${platform}: queue action counters mismatch`);
 
   // Subscription mode proves page targets and grouped requests stay distinct; its context note appears once.
-  await page.evaluate(() => { const c = (window).__streamlinedFixture.controller; c.provider = "subscription"; c.notify?.(); c.emit?.(); });
-  await page.evaluate(() => { const c = (window).__streamlinedFixture.controller; c.setProvider?.("subscription"); });
+  await page.evaluate(() => { const c = window.__streamlinedFixture.controller; c.provider = "subscription"; c.notify(); });
   await page.screenshot({ path: join(out, `${platform}-1280x900-queue-subscription.png`), fullPage: false });
   const subscriptionInfo = root.locator(".st-queue-estimate-info");
-  if (await subscriptionInfo.count()) await subscriptionInfo.locator("summary").click();
+  const subscriptionHelp = subscriptionInfo.getByRole("button", { name: "Help: About this estimate" });
+  assert(await subscriptionHelp.getAttribute("aria-expanded") === "true", `${platform}: queue refresh collapsed the open estimate help`);
   const subscriptionText = await root.innerText();
   const disclaimers = (subscriptionText.match(/ChatGPT manages plan allowance/g) ?? []).length;
-  assert(disclaimers <= 1, `${platform}: subscription allowance context repeated ${disclaimers} times`);
+  assert(disclaimers === 1, `${platform}: expected one subscription allowance note, got ${disclaimers}`);
   assert(/\d+ pages?/.test(subscriptionText) && /\d+ requests?/.test(subscriptionText), `${platform}: subscription queue conflates target pages and requests`);
 
+  const sourceIssues = root.locator(".st-queue-source-issues");
+  assert((await sourceIssues.innerText()).includes("Source could not be listed"), `${platform}: saved source issue is missing from Queue`);
+  if (platform === "desktop") {
+    const status = await page.evaluate(() => {
+      const item = window.__streamlinedFixture.statusBarItem;
+      const status = { icon: item.querySelector(".st-activity-statusbar-icon")?.dataset.icon, label: item.getAttribute("aria-label") };
+      item.click();
+      return status;
+    });
+    assert(status.icon === "scan-text" && status.label.includes("Updating"), "desktop: status item is missing its icon or live state");
+    await page.locator(".st-activity-modal").getByRole("button", { name: "Open Queue" }).click();
+    assert((await root.locator("h1").innerText()) === "Queue", "desktop: Activity did not open Queue");
+  }
+
   // Actionable error remains reachable from Queue and every action is a fake in-memory counter.
-  const c = await page.evaluateHandle(() => (window).__streamlinedFixture.controller);
   await page.evaluate(() => { const controller = (window).__streamlinedFixture.controller; controller.progress.running = false; controller.progress.activeSource = undefined; controller.progress.activePage = undefined; controller.notify(); });
-  const attention = root.locator('details[data-queue-section="Needs attention"]');
-  await attention.locator("summary").click();
+  const attention = root.locator(".st-queue-attention");
   await attention.getByRole("button", { name: "Review pages" }).click();
   assert(await root.getByRole("button", { name: "Retry", exact: true }).count() === 1, `${platform}: failed page Retry missing`);
   assert(await root.getByRole("button", { name: "Skip", exact: true }).count() === 1, `${platform}: failed page Skip missing`);
@@ -198,15 +216,25 @@ for (const platform of platforms) {
   assert(issueActions.retryPage.length === 1, `${platform}: Retry did not call fixture action`);
   assert(issueActions.update === 0, `${platform}: UI invoked recognition during the check`);
 
-  const finalConfig = await page.evaluate(() => JSON.parse(JSON.stringify((window).__streamlinedFixture.controller.config)));
+  await page.evaluate(() => {
+    const c = window.__streamlinedFixture.controller;
+    c.aiEnabled = true;
+    c.progress.paused = false;
+    c.notify();
+  });
+  await root.getByRole("button", { name: "Back", exact: true }).click();
+  await root.getByRole("button", { name: "Update", exact: true }).click();
+  assert((await page.evaluate(() => window.__streamlinedFixture.controller.actionCounters.update)) === 1, `${platform}: Update did not start directly`);
+  await page.evaluate(() => window.__streamlinedFixture.commands.get("update").callback());
+  assert((await page.evaluate(() => window.__streamlinedFixture.controller.actionCounters.update)) === 2, `${platform}: palette Update did not dispatch directly`);
+
   await page.screenshot({ path: join(out, `${platform}-768x1024-responsive.png`), fullPage: false, clip: { x: 0, y: 0, width: 768, height: 1024 } }).catch(async () => {
     await page.setViewportSize({ width: 768, height: 1024 });
     await page.screenshot({ path: join(out, `${platform}-768x1024-responsive.png`), fullPage: false });
   });
-  await c.dispose();
   await browser.close();
   assert(errors.length === 0, `${platform}: browser errors: ${errors.join("; ")}`);
-  reports.push({ platform, passed: true, modal: initialLayout, configureControl: configureLayout, settingsGear: { width: settingsGear.width, height: settingsGear.height }, compactTargetPx: compactTarget, sourceRows: 2, syntheticNotes: 5, profileIsolation: true, cancelPreserved: true, modelQualityDestinationGlossarySave: true, queuePriorityAndPause: true, subscriptionContextOccurrences: disclaimers, targetPagesAndRequestsDistinct: true, errorRetrySkip: true, recognitionCalls: actions.update });
+  reports.push({ platform, passed: true, modal: initialLayout, configureControl: configureLayout, settingsGear: { width: settingsGear.width, height: settingsGear.height }, compactTargetPx: compactTarget, sourceRows: 2, syntheticNotes: 5, profileIsolation: true, cancelPreserved: true, modelQualityDestinationGlossarySave: true, queuePriorityAndPause: true, subscriptionContextOccurrences: disclaimers, targetPagesAndRequestsDistinct: true, errorRetrySkip: true, directUpdateDispatches: 2, providerRequests: 0 });
 }
 const evidence = {
   verificationMode: "headless local browser mock",
@@ -218,7 +246,7 @@ const evidence = {
   reports,
   screenshots: out,
 };
-const evidencePath = resolve("test-artifacts/interface-0.11.0-ui-evidence.json");
+const evidencePath = resolve("test-artifacts/streamlined-ui-evidence.json");
 await mkdir(resolve("test-artifacts"), { recursive: true });
 await writeFile(evidencePath, `${JSON.stringify(evidence, null, 2)}\n`);
 console.log(JSON.stringify({ ...evidence, evidencePath }, null, 2));

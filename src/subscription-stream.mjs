@@ -3,13 +3,15 @@ import { EMPTY_PAGE_TEXT } from "./prompts.mjs";
 /** A page response failure is distinct from an execution/account stop. */
 export class RecognitionFailure extends Error {
   /** @param {string} kind @param {string} reason
-   * @param {{usage?:any,response?:any,outcomeKnown?:boolean,scope?:string,code?:string}} options */
+   * @param {{usage?:any,response?:any,outcomeKnown?:boolean,scope?:string,code?:string,retryable?:boolean,retryAfterMs?:number}} options */
   constructor(kind, reason, options = {}) {
     super(reason); this.name = "RecognitionFailure"; this.kind = kind;
     this.usage = options.usage; this.response = options.response;
     this.outcomeKnown = options.outcomeKnown === true;
     this.scope = options.scope ?? "page"; this.fatal = this.scope !== "page";
     this.code = options.code;
+    this.retryable = options.retryable === true;
+    this.retryAfterMs = options.retryAfterMs;
   }
 }
 /** @param {any} error @returns {error is RecognitionFailure} */
@@ -20,14 +22,31 @@ export function normalizePageText(text) {
   return text.trim();
 }
 const codeOf = value => String(value ?? "").replace(/[^a-zA-Z0-9_-]/g, "").slice(0, 100);
-export function providerFailure(status, data) {
+const MAX_AUTOMATIC_RETRY_AFTER_MS = 120000;
+function retryAfterMilliseconds(headers) {
+  const entry = Object.entries(headers ?? {}).find(([key]) => key.toLowerCase() === "retry-after");
+  const value = entry?.[1];
+  if (typeof value !== "string" && typeof value !== "number") return undefined;
+  const seconds = Number(value);
+  const delay = Number.isFinite(seconds) && seconds >= 0 ? seconds * 1000 : Date.parse(String(value)) - Date.now();
+  return Number.isFinite(delay) && delay >= 0 ? delay : undefined;
+}
+export function providerFailure(status, data, headers) {
   const code = codeOf(data?.error?.code ?? data?.code);
+  const failureText = `${code} ${data?.error?.type ?? ""} ${data?.error?.message ?? data?.message ?? ""}`;
   const detail = code ? ` (${code})` : "";
-  const options = { code, response: data, usage: data?.usage, outcomeKnown: true };
+  const retryableCode = /^(?:server_is_overloaded|overloaded|temporarily_unavailable|rate_limit_exceeded|rate_limit)$/i.test(code);
+  const excludedCode = /quota|usage.?limit|billing|insufficient.?credit|invalid_api_key|authentication|account_deactivated|token_expired|invalid_model|model_not_found|model_not_available|model_not_supported|unsupported_model|content_policy|content_filter|invalid_image|image_parse|unsupported_image/i.test(failureText);
+  const retryAfterMs = retryAfterMilliseconds(headers);
+  const retryable = !excludedCode && (retryableCode || status === 429 || Number(status) >= 500 && Number(status) <= 599) &&
+    (retryAfterMs === undefined || retryAfterMs <= MAX_AUTOMATIC_RETRY_AFTER_MS);
+  const waitAdvice = retryAfterMs > MAX_AUTOMATIC_RETRY_AFTER_MS ? " The provider requested a longer wait; retry this page manually after that wait." : "";
+  const options = { code, response: data, usage: data?.usage, outcomeKnown: true,
+    ...(retryable ? { retryable: true, retryAfterMs } : {}) };
   if (/invalid_model|model_not_found|model_not_available|model_not_supported|unsupported_model/.test(code))
     return new RecognitionFailure("provider", `The selected model is unavailable${detail}. Choose a supported model and retry this notebook.`, { ...options, scope: "source" });
   if (/rate_limit|quota|usage_limit|billing_hard_limit|insufficient_credit/.test(code) || status === 429 || status === 402)
-    return new RecognitionFailure("provider", `The provider's rate or account usage limit stopped recognition${detail}. Wait or check your account before continuing.`, { ...options, scope: "batch" });
+    return new RecognitionFailure("provider", `The provider's rate or account usage limit stopped recognition${detail}. Wait or check your account before continuing.${waitAdvice}`, { ...options, scope: "batch" });
   if (status === 401 || status === 403 || /invalid_api_key|authentication|account_deactivated|token_expired/.test(code))
     return new RecognitionFailure("provider", `The provider did not authorize recognition${detail}. Reconnect or check your credentials.`, { ...options, scope: "batch" });
   if (/content_policy|content_filter/.test(code))
@@ -36,7 +55,7 @@ export function providerFailure(status, data) {
     return new RecognitionFailure("render", `The provider rejected this page image${detail}. Retry it explicitly or skip it.`, options);
   if (status === 400 || status === 404 || status === 422)
     return new RecognitionFailure("provider", `The provider rejected this notebook's request configuration (HTTP ${status})${detail}. Check its model and endpoint before retrying.`, { ...options, scope: "source" });
-  return new RecognitionFailure("provider", `The provider could not complete this page${status ? ` (HTTP ${status})` : ""}${detail}. Retry it explicitly or skip it.`, options);
+  return new RecognitionFailure("provider", `The provider could not complete this page${status ? ` (HTTP ${status})` : ""}${detail}. Retry it explicitly or skip it.${waitAdvice}`, options);
 }
 function terminalFailure(response, fallback) {
   if (response?.status === "incomplete" || fallback === "incomplete") {

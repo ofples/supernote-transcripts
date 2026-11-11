@@ -393,13 +393,13 @@ async function inspectViewport(platform, viewport, label) {
   check(await estimateHelp.innerText() === "?" && await estimateHelp.getAttribute("aria-expanded") === "false" && await estimateInfo.locator(".st-help-text").isHidden(), `${label}: estimate help is not collapsed behind the standard ? control`);
   await estimateHelp.click();
   check(await estimateHelp.innerText() === "?" && await estimateHelp.getAttribute("aria-expanded") === "true", `${label}: eligible-work estimate does not use the standard contextual help control`);
-  check(await estimateInfo.locator(".st-help-text p").first().innerText().then((text) => /after you press Update or Resume\. Individually paused or blocked notebooks are excluded/i.test(text)), `${label}: total estimate scope does not distinguish eligible work from paused or blocked sources`);
+  check(await estimateInfo.locator(".st-help-text").innerText().then((text) => /after Update or Resume\. Individually paused or blocked notebooks are excluded/i.test(text)), `${label}: total estimate scope does not distinguish eligible work from paused or blocked sources`);
   await estimateHelp.click();
   const workingCard = root.locator(".st-working");
   if (await workingCard.count()) {
     const workingDisclosure = workingCard.locator(".st-working-disclosure");
     check(await workingCard.getAttribute("aria-expanded") === "false" && await workingCard.locator(".st-working-details").isHidden(), `${label}: Working now details are not collapsed in the card`);
-    check(await workingCard.locator(".st-working-progress").isVisible(), `${label}: Working now progress is hidden with the details`);
+    check(await workingCard.getByRole("progressbar").isVisible(), `${label}: Working now progress is hidden with the details`);
     const pauseBounds = await workingCard.getByRole("button", { name: /Pause: Reflection/ }).boundingBox();
     const caretBounds = await workingDisclosure.boundingBox();
     check(!!pauseBounds && !!caretBounds && caretBounds.x > pauseBounds.x, `${label}: Working now caret is not to the right of Pause`);
@@ -458,7 +458,7 @@ async function inspectViewport(platform, viewport, label) {
   check(reviewCostsBounds && reviewCostsBounds.y >= 0 && reviewCostsBounds.y + reviewCostsBounds.height <= viewport.height, `${label}: Review Costs action is below the visible area in a budget-blocked queue: ${JSON.stringify(reviewCostsBounds)}`);
   check(await root.locator(".st-update").isDisabled(), `${label}: Update remains enabled while spending is blocked`);
   if (await estimateHelp.getAttribute("aria-expanded") === "false") await estimateHelp.click();
-  check(await estimateInfo.locator(".st-help-text p").first().innerText().then((text) => /spending or execution limits can still stop requests/i.test(text)), `${label}: budget-blocked state hides the estimate scope explanation`);
+  check(await estimateInfo.locator(".st-help-text").innerText().then((text) => /Limits can still stop requests/i.test(text)), `${label}: budget-blocked state hides the estimate scope explanation`);
   await assertLayout("Budget-blocked queue");
   await screenshot("queue-spending-paused");
   await page.evaluate(() => {
@@ -491,18 +491,22 @@ async function inspectViewport(platform, viewport, label) {
     check(actionLayout.display === "flex" && actionLayout.review && actionLayout.force && Math.abs(actionLayout.review.y - actionLayout.force.y) <= 2, `${label}: Review pages and Force update are not side by side: ${JSON.stringify(actionLayout)}`);
     const progressBottom = await failedSourceRow.locator(".st-progress").evaluate((node) => node.getBoundingClientRect().bottom);
     check(!!actionLayout.review && actionLayout.review.y >= progressBottom, `${label}: source actions are not beneath the progress bar`);
-    check(await failedSourceRow.evaluate((node) => getComputedStyle(node).borderBottomWidth) === "0px", `${label}: the page-progress line is doubled with a second bottom divider`);
+    check(await failedSourceRow.evaluate((node) => {
+      const track = node.querySelector(".st-progress").getBoundingClientRect();
+      return node.getBoundingClientRect().bottom - track.bottom >= 4;
+    }), `${label}: the row boundary crowds the page-progress line`);
   }
   await root.getByRole("button", { name: "Queue", exact: true }).click();
-  const attentionSection = root.locator(".st-queue-attention");
+  const attentionSection = root.locator(".st-queue-attention").filter({ has: page.getByRole("heading", { name: /Needs attention/ }) });
   const forceRow = attentionSection.locator(".st-queue-row").filter({ hasText: "Failed" });
   check(await attentionSection.locator("h2").innerText().then((text) => /Needs attention/.test(text)) && await forceRow.isVisible(), `${label}: Needs attention is not a continuously visible section`);
   check(await root.locator(".st-queue-live hr").count() === 0 && await attentionSection.evaluate((node) => getComputedStyle(node).borderTopWidth) === "0px", `${label}: a duplicate horizontal rule separates the prior queue row from Needs attention`);
   const attentionPrevious = await attentionSection.evaluate((node) => {
     const previous = node.previousElementSibling;
-    return { className: previous?.className ?? "", borderBottom: previous?.matches(".st-queue-row") ? getComputedStyle(previous).borderBottomWidth : "not-a-row", progress: !!previous?.querySelector(".st-progress") };
+    const track = previous?.querySelector(".st-progress");
+    return track ? previous.getBoundingClientRect().bottom - track.getBoundingClientRect().bottom : undefined;
   });
-  if (attentionPrevious.progress) check(attentionPrevious.borderBottom === "0px", `${label}: the progress line before Needs attention is doubled by an adjacent row divider`);
+  if (attentionPrevious !== undefined) check(attentionPrevious >= 4, `${label}: the row boundary before Needs attention crowds the progress line`);
   const forceAction = forceRow.getByRole("button", { name: /Force update Failed/ });
   check(await forceAction.isVisible() && !(await forceAction.isDisabled()), `${label}: eligible sync conflict has no enabled Force update action in Queue; state=${await page.evaluate(() => { const c = window.__streamlinedFixture.controller; const s = c.store.notebooks[Object.keys(c.store.notebooks).find((source) => source.endsWith("/Failed.note"))]; return JSON.stringify({status:s?.status,error:s?.error,hasMethod:!!c.forceUpdate}); })}; rows=${await root.locator(".st-queue-collapsed[open] .st-queue-row").allInnerTexts().then((items) => JSON.stringify(items))}; buttons=${await root.locator(".st-queue-collapsed[open] .st-queue-row button").evaluateAll((items) => JSON.stringify(items.map((item) => [item.textContent, item.getAttribute("aria-label")])))}`);
   await forceAction.click();
@@ -638,21 +642,19 @@ async function inspectViewport(platform, viewport, label) {
   if (platform === "desktop" || platform === "nomad") {
     for (const fieldName of ["API key", "Simultaneous requests", "Check interval (minutes)"]) {
       await root.getByRole("tab", { name: fieldName === "API key" ? "Connection" : "Updates" }).click();
-      const label = root.locator(".st-settings-section label").filter({ hasText: new RegExp(`^${fieldName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}$`) });
-      const geometry = await label.evaluate((element) => {
-        const field = element.closest(".st-field");
+      const fieldInput = root.getByLabel(fieldName, { exact: true });
+      const geometry = await fieldInput.evaluate((element) => {
+        const field = element.closest(".st-setting-row");
         const rect = (node) => {
           const r = node?.getBoundingClientRect();
-          return r && { x: r.x, y: r.y, width: r.width, height: r.height, right: r.right };
+          return r && { left: r.left, top: r.top, right: r.right, bottom: r.bottom };
         };
-        const input = field?.querySelector("input, select");
-        return { label: rect(element), field: rect(field), grid: field ? getComputedStyle(field).gridTemplateColumns : "", input: rect(input), inputGrid: input ? `${getComputedStyle(input).gridColumnStart}/${getComputedStyle(input).gridColumnEnd}` : "", help: rect(field?.querySelector("button.st-help-button")) };
+        return { label: rect(field?.querySelector("label")), field: rect(field), input: rect(element) };
       });
-      const { label: labelBounds, input: inputBounds, help: helpBounds } = geometry;
-      check(labelBounds && inputBounds && helpBounds, `${label}: ${fieldName} settings row is missing label/input/help geometry`);
-      check(Math.abs(inputBounds.right - helpBounds.right) <= 2, `${label}: ${fieldName} control and help button do not share the right rail: ${JSON.stringify(geometry)}`);
-      const labelHelpTopDelta = Math.abs(helpBounds.y - labelBounds.y);
-      check(inputBounds.y > labelBounds.y + labelBounds.height - 2 && labelHelpTopDelta <= 8, `${label}: ${fieldName} label, control, and help do not use the aligned label-above-control layout: ${JSON.stringify({ labelBounds, inputBounds, helpBounds })}`);
+      const { label: labelBounds, input: inputBounds, field: rowBounds } = geometry;
+      check(labelBounds && inputBounds && rowBounds, `${label}: ${fieldName} settings row is missing its label or control`);
+      check(inputBounds.right <= rowBounds.right + 2 && (inputBounds.left >= labelBounds.right || inputBounds.top >= labelBounds.bottom),
+        `${label}: ${fieldName} control escapes the row or overlaps the label: ${JSON.stringify(geometry)}`);
     }
     const settingsToggles = await root.locator(".st-settings-panel-updates .st-settings-section .st-check-row").evaluateAll((rows) => rows.map((row) => {
       const checkbox = row.querySelector('input[type="checkbox"]')?.getBoundingClientRect();
@@ -661,8 +663,8 @@ async function inspectViewport(platform, viewport, label) {
     }).filter((item) => item.checkboxX !== null));
     check(settingsToggles.length >= 2, `${label}: settings toggle geometry was not found`);
     check(Math.max(...settingsToggles.map((item) => item.checkboxX)) - Math.min(...settingsToggles.map((item) => item.checkboxX)) <= 2, `${label}: settings checkbox centers do not align: ${JSON.stringify(settingsToggles)}`);
-    const settingsHelpRights = settingsToggles.map((item) => item.helpRight).filter((right) => right !== null);
-    check(settingsHelpRights.length > 0 && Math.max(...settingsHelpRights) - Math.min(...settingsHelpRights) <= 2, `${label}: settings toggle help buttons do not share a right rail: ${JSON.stringify(settingsToggles)}`);
+    check(settingsToggles.every((item) => item.helpRight === null || item.helpRight < item.checkboxX - 10),
+      `${label}: contextual help overlaps a settings checkbox: ${JSON.stringify(settingsToggles)}`);
   }
   const helpButton = root.locator(".st-settings-panel-updates button.st-help-button").first();
   check(await helpButton.count() === 1, `${label}: settings help button missing`);
@@ -723,9 +725,8 @@ async function inspectViewport(platform, viewport, label) {
   await root.locator(".st-form").waitFor();
   await root.locator(".st-body").evaluate((element) => { element.scrollTop = 0; });
   check(await root.locator(".st-source-title").innerText() === "Reflection", `${label}: single-note editor did not open Reflection`);
-  const editorHeadings = await root.locator(".st-form h2").allTextContents();
-  for (const heading of ["Source", "Markdown", "Recognition", "Notebook actions"]) {
-    check(editorHeadings.includes(heading), `${label}: source editor is missing the ${heading} section heading: ${JSON.stringify(editorHeadings)}`);
+  for (const heading of ["Source", "Markdown output", "Recognition", "Notebook actions"]) {
+    check(await root.locator(".st-form").getByRole("heading", { name: heading, exact: true }).isVisible(), `${label}: source editor is missing the ${heading} section heading`);
   }
   check(await root.locator(".st-form .st-source-advanced").count() === 0, `${label}: single-note editor still has a Source Advanced disclosure`);
   const autoRecognition = root.locator(".st-form").getByLabel("Automatic updates", { exact: true });
@@ -764,40 +765,25 @@ async function inspectViewport(platform, viewport, label) {
     };
   });
   check(outputRail.field && outputRail.controls && outputRail.help, `${label}: output folder and help geometry is missing: ${JSON.stringify(outputRail)}`);
-  check(Math.abs(outputRail.controls.right - outputRail.help.right) <= 2, `${label}: output folder controls and help button do not share a right rail: ${JSON.stringify(outputRail)}`);
+  check(outputRail.controls.right <= outputRail.field.right + 2, `${label}: output folder controls escape their field: ${JSON.stringify(outputRail)}`);
   if (platform === "desktop" && viewport.width >= 701) {
     const fieldGeometry = await root.evaluate(() => {
       const rect = (node) => {
         const r = node?.getBoundingClientRect();
         return r && { x: r.x, y: r.y, width: r.width, height: r.height, right: r.right };
       };
-      const fields = [".st-shared-mirror-field .st-field", ".st-model-picker", ".st-output-folder-field"].map((selector) => {
-        const field = document.querySelector(selector);
-        const control = selector.includes("output-folder") ? field?.querySelector(".st-output-folder-controls") : field?.querySelector("select");
-        return { selector, field: rect(field), control: rect(control) };
-      });
-      const helpButtons = [...document.querySelectorAll(".st-form .st-help-button")].map((button) => ({
-        button: rect(button), field: rect(button.closest(".st-field")),
-      }));
-      const toggles = [...document.querySelectorAll(".st-form .st-check-row")].map((row) => ({
+      const toggles = [...document.querySelectorAll(".st-form .st-check-row")].filter((row) => !row.closest("details:not([open])")).map((row) => ({
         checkbox: rect(row.querySelector('input[type="checkbox"]')),
-        help: rect(row.querySelector(".st-help-button")),
-      })).filter((item) => item.checkbox);
-      return { fields, helpButtons, toggles };
+        label: rect(row.querySelector("label")),
+      })).filter((item) => item.checkbox?.width && item.label?.width);
+      return { toggles };
     });
-    check(fieldGeometry.fields.every((item) => item.field && item.control), `${label}: shared mirror, model, or output control geometry is missing: ${JSON.stringify(fieldGeometry.fields)}`);
-    const fieldRights = fieldGeometry.fields.map((item) => item.field.right);
-    check(Math.max(...fieldRights) - Math.min(...fieldRights) <= 2, `${label}: shared mirror, model, and output fields do not share a right edge: ${JSON.stringify(fieldGeometry.fields)}`);
-    check(fieldGeometry.fields.every((item) => Math.abs(item.control.right - item.field.right) <= 2), `${label}: shared mirror, model, or output control does not reach the shared field edge: ${JSON.stringify(fieldGeometry.fields)}`);
-    check(fieldGeometry.helpButtons.length > 0 && fieldGeometry.helpButtons.every((item) => item.button && (!item.field || Math.abs(item.button.right - item.field.right) <= 2)), `${label}: one or more source form help buttons are not at the field's right rail: ${JSON.stringify(fieldGeometry.helpButtons)}`);
-    const helpRights = fieldGeometry.helpButtons.map((item) => item.button.right);
-    check(Math.max(...helpRights) - Math.min(...helpRights) <= 2, `${label}: source form help buttons do not share a right rail: ${JSON.stringify(helpRights)}`);
     check(fieldGeometry.toggles.length >= 2, `${label}: source form toggle geometry was not found`);
     const checkboxCenters = fieldGeometry.toggles.map((item) => item.checkbox.x + item.checkbox.width / 2);
     check(Math.max(...checkboxCenters) - Math.min(...checkboxCenters) <= 2, `${label}: source form checkbox centers do not align: ${JSON.stringify(fieldGeometry.toggles)}`);
-    const toggleHelpRights = fieldGeometry.toggles.filter((item) => item.help).map((item) => item.help.x + item.help.width);
-    check(toggleHelpRights.length > 0 && Math.max(...toggleHelpRights) - Math.min(...toggleHelpRights) <= 2, `${label}: source form toggle help buttons do not share a right rail: ${JSON.stringify(fieldGeometry.toggles)}`);
+    check(fieldGeometry.toggles.every((item) => item.checkbox.right < item.label.x), `${label}: source checkboxes do not precede their labels`);
   }
+  await root.locator(".st-source-sync-options > summary").click();
   const mirrorHelp = root.locator(".st-form .st-help-button[aria-label='Help: Shared mirror']");
   await mirrorHelp.focus();
   await page.keyboard.press("Enter");
@@ -807,7 +793,7 @@ async function inspectViewport(platform, viewport, label) {
   await page.keyboard.press("Space");
   const chooseFolder = root.getByRole("button", { name: "Choose folder", exact: true });
   check(await chooseFolder.isVisible(), `${label}: output folder picker button missing`);
-  const outputField = root.locator(".st-output-choice .st-field");
+  const outputField = root.locator(".st-output-folder-field");
   const outputInput = outputField.locator("input");
   const chooserBounds = await chooseFolder.boundingBox();
   const fieldBounds = await outputField.boundingBox();
@@ -949,7 +935,8 @@ async function inspectViewport(platform, viewport, label) {
     state.status = "conflict";
     state.error = "Shared publication receipt is damaged. Diagnostic frames and internal details follow.\n at synthetic stack frame";
   });
-  await root.locator(".st-body > .st-field select").dispatchEvent("change");
+  await root.getByRole("button", { name: "Back", exact: true }).click();
+  await standaloneDetails.click();
   const visibleAttentionReason = root.locator(".st-detail-live .st-attention-reason");
   const visibleAttentionReasonText = await visibleAttentionReason.innerText().catch(() => "missing");
   check(await visibleAttentionReason.isVisible() && visibleAttentionReasonText === "Could not verify this transcript’s sync record. It links the saved Markdown to the original note; this check did not modify the notebook. Check Sync, then use Check & update.", `${label}: notebook details do not show a concise blocking reason without opening diagnostics: ${visibleAttentionReasonText}`);
@@ -961,7 +948,8 @@ async function inspectViewport(platform, viewport, label) {
     state.status = "current";
     delete state.error;
   });
-  await root.locator(".st-body > .st-field select").dispatchEvent("change");
+  await root.getByRole("button", { name: "Back", exact: true }).click();
+  await standaloneDetails.click();
   const updateControls = detail.locator(".st-update-controls");
   const notebookTools = detail.locator(".st-notebook-tools");
   check(await updateControls.count() === 1 && await notebookTools.count() === 1 && await updateControls.locator("h2").innerText() === "Update" && await notebookTools.locator("h2").innerText() === "Notebook tools", `${label}: notebook details do not separate Update controls from Notebook tools`);
@@ -969,7 +957,8 @@ async function inspectViewport(platform, viewport, label) {
   check(await notebookTools.locator(".st-cleanup-open, .st-reprocess-open, .st-history-details").count() === 3 && await notebookTools.locator(".st-history-details").getAttribute("aria-expanded") === "false", `${label}: Notebook tools are missing Clean up, Re-recognize, or History`);
   const detailActions = detail.locator(".st-detail-action-grid > button");
   const actionHeights = await detailActions.evaluateAll((buttons) => buttons.map((button) => ({ label: (button.textContent || "").trim(), height: button.getBoundingClientRect().height })));
-  check(actionHeights.length >= 6 && actionHeights.every((item) => item.height >= 48), `${label}: notebook detail actions are not full-sized buttons: ${JSON.stringify(actionHeights)}`);
+  const actionMinimum = platform === "desktop" ? 32 : 48;
+  check(actionHeights.length >= 6 && actionHeights.every((item) => item.height >= actionMinimum), `${label}: notebook detail actions have undersized targets: ${JSON.stringify(actionHeights)}`);
   const actionGridLayout = await detail.locator(".st-detail-action-grid").evaluateAll((grids) => grids.map((grid) => {
     const style = getComputedStyle(grid);
     const buttons = [...grid.querySelectorAll("button")];
@@ -985,7 +974,7 @@ async function inspectViewport(platform, viewport, label) {
       })),
     };
   }));
-  check(actionGridLayout.length === 2 && actionGridLayout.every((grid) => grid.columns === 2 && grid.buttons.length >= 3), `${label}: Update and Notebook tools actions are not arranged in two columns: ${JSON.stringify(actionGridLayout)}`);
+  check(actionGridLayout.length === 2 && actionGridLayout.every((grid) => grid.buttons.length >= 3), `${label}: Update and Notebook tools actions are missing: ${JSON.stringify(actionGridLayout)}`);
   check(actionGridLayout.every((grid) => grid.buttons.every((button) => button.whiteSpace === "nowrap" && button.scrollWidth <= button.width + 1)), `${label}: a notebook action label wraps or overflows its button: ${JSON.stringify(actionGridLayout)}`);
   check(!(await detail.locator(".st-notebook-details").evaluate((details) => details.open)), `${label}: technical notebook details are expanded by default`);
   await detail.locator(".st-notebook-details > summary").click();
@@ -1100,7 +1089,7 @@ async function inspectViewport(platform, viewport, label) {
   check(await reprocessFlow.getByText(/1 selected page · 1 request/).isVisible(), `${label}: singular selected page/request estimate is not grammatically correct`);
   await pageRange.fill("1-2");
   check(await reprocessFlow.locator(".st-page-preview-select").evaluateAll((cards) => cards.slice(0, 2).every((card) => card.getAttribute("aria-pressed") === "true") && cards.slice(2).every((card) => card.getAttribute("aria-pressed") === "false")), `${label}: typing a page range did not synchronize visible page selection`);
-  const previewPageSize = platform === "nomad" || viewport.width <= 700 ? 6 : 9;
+  const previewPageSize = platform === "desktop" && (await root.boundingBox()).width > 700 ? 9 : 6;
   check(await reprocessFlow.locator(".st-page-preview-card").count() === previewPageSize, `${label}: page preview renders more than one bounded page of cards`);
   await reprocessFlow.getByRole("button", { name: "Next", exact: true }).click();
   await reprocessFlow.getByText(`Synthetic OCR page ${previewPageSize + 1}.`, { exact: false }).waitFor();
@@ -1136,7 +1125,7 @@ async function inspectViewport(platform, viewport, label) {
   await page.waitForFunction(() => !document.querySelector(".st-page-preview-image")?.disabled && document.querySelector(".st-page-preview-image-status")?.hidden === true);
   check(await pageRange.inputValue() === "1-2" && await reprocessFlow.getByRole("button", { name: "Select page 1", exact: true }).getAttribute("aria-pressed") === "true", `${label}: original-image Preview changed page selection`);
   await screenshot("original-page-preview");
-  await page.evaluate(() => document.querySelector(".st-preview-modal")?.remove());
+  await page.evaluate(() => document.querySelector(".st-preview-modal")?.closest(".modal-container")?.remove());
   await screenshot("reprocess-workflow");
   await page.evaluate(() => { const capture = window.__streamlinedFixture.controller.workflowCapture; capture.deferImagePreview = false; capture.rejectImagePreview = true; });
   await reprocessFlow.getByRole("button", { name: "Preview page 2", exact: true }).click();
@@ -1247,15 +1236,16 @@ async function inspectViewport(platform, viewport, label) {
   await root.locator(".st-notebook-actions").getByRole("button", { name: "Clean up document", exact: true }).click();
   await root.locator(".st-cleanup-workflow").waitFor();
   await root.getByRole("button", { name: "Clean up document", exact: true }).click();
+  await root.getByRole("button", { name: "Back", exact: true }).click();
+  await root.getByRole("button", { name: "Cancel", exact: true }).click();
   await root.getByRole("button", { name: "Settings", exact: true }).click();
   await root.locator(".st-form").waitFor();
   await page.evaluate(() => window.__streamlinedFixture.controller.workflowCapture.resolveCleanup?.());
   await page.waitForFunction(() => window.__streamlinedFixture.controller.workflowCapture.cleanupResolved);
   check(await root.locator(".st-form").isVisible() && await root.locator(".st-cleanup-workflow").count() === 0, `${label}: completed cleanup pulled the user back from Settings`);
   await root.getByRole("button", { name: "Close settings", exact: true }).click();
-  await root.locator(".st-cleanup-workflow").waitFor();
-  await root.getByRole("button", { name: "Cancel", exact: true }).click();
-  check(await root.locator(".st-notebook-actions").isVisible(), `${label}: cancelled pending cleanup did not return to source settings`);
+  await reflectionConfigure.click();
+  check(await root.locator(".st-notebook-actions").isVisible(), `${label}: source settings could not be reopened after background cleanup`);
   await page.evaluate(() => { window.__streamlinedFixture.controller.workflowCapture.deferCleanup = false; });
   await root.locator(".st-notebook-actions").getByRole("button", { name: "Clean up document", exact: true }).click();
   await root.getByRole("button", { name: "Clean up document", exact: true }).click();

@@ -6,7 +6,7 @@ import {
   PluginSettingTab,
   setIcon,
 } from "obsidian";
-import type { Controller, FolderRule, Profile, QueueEstimate, Store } from "./types";
+import type { Controller, FolderRule, Profile, QueueEstimate, Store, TranscriptionOptions } from "./types";
 import {
   browserBreadcrumbs,
   browserEntryType,
@@ -46,6 +46,14 @@ import {
   validateSource,
 } from "./reconcile.mjs";
 import { isDataPath, TRANSCRIPTS_ROOT } from "./storage-paths";
+import { PromptLibraryView } from "./prompt-library-ui";
+import type { PromptRef } from "./prompt-library.mjs";
+import { renderPromptRevisionSelect, renderRunOptions } from "./run-options-ui";
+import { isManagedTranscript } from "./page-navigation";
+import { installActivityPanel } from "./activity-panel";
+import { unresolvedSourceIssues } from "./activity-model.mjs";
+// @ts-ignore JavaScript helper shared with UI eligibility checks.
+import { encodeManualSectionName, manualSectionPlacementAllowed } from "./manual-sections.mjs";
 
 const ROOT = "/storage/emulated/0/Note";
 const MODEL_OPTIONS = [
@@ -126,6 +134,13 @@ const safe = (p: Promise<unknown>) => p.catch((e) => new Notice(err(e)));
 const setText = (el: HTMLElement, text: string) => {
   if (el.textContent !== text) el.textContent = text;
 };
+const sectionHeading = (parent: HTMLElement, label: string, icon: string) => {
+  const heading = el(parent, "h2", undefined, "st-section-heading st-icon-heading");
+  const glyph = el(heading, "span", undefined, "st-source-icon");
+  glyph.setAttribute("aria-hidden", "true");
+  setIcon(glyph, icon);
+  el(heading, "span", label);
+};
 const iconButton = (
   parent: HTMLElement,
   icon: string,
@@ -163,8 +178,9 @@ const progressBar = (
   small = true,
 ) => {
   if (!view.total) return;
+  const row = el(parent, "div", undefined, "st-progress-row");
   const track = el(
-    parent,
+    row,
     "div",
     undefined,
     `st-progress${small ? " st-small" : ""}`,
@@ -180,14 +196,86 @@ const progressBar = (
 
 export function installUI(plugin: Plugin, c: Controller) {
   let active: MirrorsModal | undefined;
-  const open = () => {
-    if (active?.modalEl.isConnected) return;
-    active = new MirrorsModal(plugin.app, c);
-    active.open();
+  const openMirrors = () => {
+    if (!active) active = new MirrorsModal(plugin.app, c);
+    if (!active.modalEl.isConnected) active.open();
+    return active;
   };
-  plugin.register(() => active?.close());
-  plugin.addSettingTab(new SettingsTab(plugin.app, plugin, open));
+  const open = () => { openMirrors(); };
+  plugin.register(() => active?.dispose());
+  installActivityPanel(plugin, c,
+    issue => openMirrors().openActivityIssue(issue.source, issue.ruleId, issue.pageId),
+    () => openMirrors().openQueue());
+  const openSourcePicker = () => openMirrors().openSourcePicker();
+  const openTranscribePicker = () => {
+    if (c.transcribeSelection) openMirrors().openSourcePicker("transcribe");
+  };
+  const settings = new SettingsTab(plugin.app, plugin,
+    (host, toolbar) => new MirrorsModal(plugin.app, c).mountNativeSettings(host, toolbar));
+  plugin.addSettingTab(settings);
+  plugin.register(() => settings.hide());
+  const canInsertSection = (editor: import("obsidian").Editor, path?: string) => {
+    if (!path) return false;
+    const from = editor.posToOffset(editor.getCursor("from")), to = editor.posToOffset(editor.getCursor("to"));
+    return manualSectionPlacementAllowed(path, editor.getValue(), c.store.notebooks, isManagedTranscript, from, to);
+  };
+  const insertManualSection = (editor: import("obsidian").Editor) => {
+    const id = crypto.randomUUID(), from = editor.getCursor("from"), selected = editor.getSelection();
+    const name = window.prompt("Section name (optional)", "") ?? "";
+    editor.replaceSelection(`\n<!-- supernote-manual:start:${id}${encodeManualSectionName(name)} -->\n${selected}\n<!-- supernote-manual:end:${id} -->\n`);
+    editor.setCursor({ line: from.line + 2, ch: 0 });
+  };
+  plugin.addCommand({
+    id: "insert-manual-section",
+    name: "Insert manual section",
+    editorCheckCallback: (checking, editor, ctx) => {
+      const path = ctx && "file" in ctx ? ctx.file?.path : undefined;
+      if (!canInsertSection(editor, path)) return false;
+      if (checking) return true;
+      insertManualSection(editor);
+    },
+  });
+  if (c.transcribeSelection) {
+    plugin.addCommand({
+      id: "transcribe-selection",
+      name: "Transcribe file or folder",
+      callback: openTranscribePicker,
+    });
+    if (c.platform === "desktop") plugin.registerEvent(plugin.app.workspace.on("file-menu", (menu, file) => {
+      const path = file.path;
+      const kind = Array.isArray((file as any).children) ? "folder" : /\.note$/i.test(path) ? "file" : undefined;
+      const adapter = plugin.app.vault.adapter as any;
+      if (!kind || !path || typeof adapter.getFullPath !== "function") return;
+      menu.addItem((item) => item
+        .setTitle(kind === "file" ? "Transcribe this notebook" : "Transcribe this folder")
+        .setIcon("scan-text")
+        .onClick(() => {
+          try {
+            const sourcePath = normalizeBrowserPath(adapter.getFullPath(path));
+            const vaultRoot = typeof adapter.getBasePath === "function"
+              ? adapter.getBasePath()
+              : adapter.basePath;
+            if (isBrowserRoot(sourcePath) || (typeof vaultRoot === "string" &&
+                normalizeBrowserPath(vaultRoot) === sourcePath)) return;
+            void c.transcribeSelection?.({ path: sourcePath, kind })
+              .then(() => new Notice("Transcription queued. Follow progress in Queue."))
+              .catch((error) => new Notice(`Could not start transcription: ${err(error)}`));
+          } catch (error) {
+            new Notice(`Could not start transcription: ${err(error)}`);
+          }
+        }));
+    }));
+  }
+  plugin.registerEvent(plugin.app.workspace.on("editor-menu", (menu, editor, view) => {
+    if (!canInsertSection(editor, view.file?.path)) return;
+    menu.addItem(item => item.setTitle("Insert manual section").setIcon("bookmark-plus").onClick(() => insertManualSection(editor)));
+  }));
   plugin.addCommand({ id: "open", name: "Open mirrors", callback: open });
+  plugin.addCommand({
+    id: "add-source",
+    name: "Add source",
+    callback: openSourcePicker,
+  });
   plugin.addCommand({
     id: "update",
     name: "Update mirrors",
@@ -207,18 +295,35 @@ export function installUI(plugin: Plugin, c: Controller) {
 }
 
 class SettingsTab extends PluginSettingTab {
+  private unmountNativeSettings?: () => void;
   constructor(
     app: App,
     plugin: Plugin,
-    private open: () => void,
+    private mountNativeSettings: (host: HTMLElement, toolbar: HTMLElement) => {
+      openSources: () => void;
+      openPicker: () => void;
+      dispose: () => void;
+    },
   ) {
     super(app, plugin);
   }
   display() {
+    this.unmountNativeSettings?.();
+    this.unmountNativeSettings = undefined;
     this.containerEl.empty();
     this.containerEl.addClass("st-settings");
-    el(this.containerEl, "h2", "Supernote Transcripts");
-    btn(this.containerEl, "Open Mirrors", this.open, "st-button st-primary");
+    const toolbar = el(this.containerEl, "div", undefined, "st-native-settings-toolbar");
+    el(toolbar, "h2", "Supernote Transcripts");
+    const actions = el(toolbar, "div", undefined, "st-native-settings-actions");
+    btn(actions, "Open Sources", () => mounted.openSources(), "st-button st-text-button");
+    btn(actions, "Add source", () => mounted.openPicker(), "st-button st-primary");
+    const host = el(this.containerEl, "div", undefined, "st-native-settings-host");
+    const mounted = this.mountNativeSettings(host, toolbar);
+    this.unmountNativeSettings = mounted.dispose;
+  }
+  hide() {
+    this.unmountNativeSettings?.();
+    this.unmountNativeSettings = undefined;
   }
 }
 
@@ -228,6 +333,7 @@ type Screen =
   | "force-update"
   | "notebook-selection"
   | "settings"
+  | "prompts"
   | "editor"
   | "browser"
   | "detail"
@@ -268,6 +374,8 @@ class MirrorsModal extends Modal {
   private pendingConfigSaves = 0;
   private formControlState?: Array<[HTMLButtonElement | HTMLInputElement | HTMLTextAreaElement | HTMLSelectElement, boolean]>;
   private off?: () => void;
+  private nativeSettingsMounted = false;
+  private nativeSettingsToolbar?: HTMLElement;
   private screen: Screen = "home";
   private actionReturnScreen: "editor" | "detail" = "detail";
   private actionSource = "";
@@ -297,7 +405,7 @@ class MirrorsModal extends Modal {
   private costDraft?: CostSettings;
   private costReturnScreen: "home" | "queue" | "settings" = "home";
   private outputPickerPath = "";
-  private folderPickerPurpose: "output" | "support" = "output";
+  private folderPickerPurpose: "output" | "support" | "default-output" = "output";
   private outputFolderSearch = "";
   private outputFolderName = "";
   private editorRule?: FolderRule;
@@ -319,6 +427,7 @@ class MirrorsModal extends Modal {
     intervalMinutes: number;
     provider: "api" | "subscription";
     concurrency: number;
+    transientRetries: number;
     showPageHeadings: boolean;
     cleanupPrompt: string;
     automaticCheck: "new" | "recent" | "all";
@@ -326,17 +435,29 @@ class MirrorsModal extends Modal {
     pairingAddress: string;
     pairingCode: string;
     supportFolder: string;
+    defaultOutput: string;
     hideSupportFolderInExplorer: boolean;
     excludeSupportFilesFromSearch: boolean;
   };
   private settingsTab: "connection" | "recognition" | "updates" | "storage" = "connection";
+  private settingsAdvancedOpen = false;
   private settingsProfilesBaseline: Profile[] = [];
+  private settingsCleanupPromptBaseline = DEFAULT_CLEANUP_PROMPT;
   private browserPath = ROOT;
   private browserRootPath = ROOT;
   private sourcePathDraft = "";
   private browserToken = 0;
   private browserError = "";
-  private browserFrom: "add" | "edit" = "add";
+  private browserFrom: "add" | "edit" | "transcribe" = "add";
+  private browserReturnScreen: "settings" | "home" = "home";
+  private renderedView = "";
+  private returnToPicker?: () => void;
+  private browserSelection?: { path: string; kind: "file" | "folder" };
+  private transcriptionOptionsDraft: TranscriptionOptions = {};
+  private transcriptionOptionsOpen = false;
+  private browserFocusPath = "";
+  private browserRegistering = false;
+  private browserOperationId = 0;
   private glossaryBefore: string[] = [];
   private selectedSource = "";
   private selectedRule = "";
@@ -385,6 +506,7 @@ class MirrorsModal extends Modal {
   private cleanupCopyPath = "";
   private cleanupModel = "";
   private cleanupExtraInstructions = "";
+  private cleanupPrompt?: PromptRef;
   private cleanupRemovePageComments = false;
   private reprocessPreview: { number: number; text: string; origin: "device-ocr" | "recognized" | "empty" }[] = [];
   private reprocessPreviewPage = 0;
@@ -416,6 +538,87 @@ class MirrorsModal extends Modal {
     this.modalEl.querySelector(".modal-close-button")?.remove();
     this.modalEl.querySelector(":scope > .modal-header-button")?.remove();
   }
+  mountNativeSettings(host: HTMLElement, toolbar: HTMLElement) {
+    this.nativeSettingsMounted = true;
+    this.nativeSettingsToolbar = toolbar;
+    if (!this.settingsDraft) this.beginSettingsDraft("home");
+    this.settingsReturnScreen = "home";
+    this.screen = "settings";
+    host.append(this.modalEl);
+    this.onOpen();
+    return {
+      openSources: () => this.goHome(),
+      openPicker: () => this.openSourcePicker(),
+      dispose: () => this.unmountNativeSettings(),
+    };
+  }
+  private unmountNativeSettings() {
+    if (!this.nativeSettingsMounted) return;
+    this.nativeSettingsToolbar?.parentElement?.style.removeProperty("--st-settings-height");
+    this.nativeSettingsMounted = false;
+    this.nativeSettingsToolbar = undefined;
+    this.onClose();
+    this.modalEl.remove();
+  }
+  dispose() {
+    if (this.modalEl.isConnected) this.close();
+  }
+  openQueue() {
+    this.screen = "queue";
+    this.render();
+  }
+  openSourcePicker(purpose: "add" | "transcribe" = "add") {
+    this.returnToPicker = undefined;
+    this.browserOperationId++;
+    this.browserFrom = purpose;
+    this.browserReturnScreen = this.nativeSettingsMounted && this.screen === "settings" ? "settings" : "home";
+    if (purpose === "transcribe") {
+      this.transcriptionOptionsDraft = {};
+      this.transcriptionOptionsOpen = false;
+    }
+    const start = this.isDesktop()
+      ? this.initialDesktopBrowserPath()
+      : ROOT;
+    this.browserRootPath = this.isDesktop()
+      ? browserBreadcrumbs(start)[0]?.path ?? "/"
+      : ROOT;
+    this.browserPath = start;
+    this.browserSelection = undefined;
+    this.browserFocusPath = "";
+    this.sourcePathDraft = "";
+    this.browserError = "";
+    this.browserRegistering = false;
+    this.screen = "browser";
+    this.render();
+  }
+  openActivityIssue(source: string, ruleId?: string, pageId?: string) {
+    const state = this.displayStore.notebooks[source];
+    if (state?.oneTime) {
+      this.openNotebookDetail(state.ruleId, source);
+      return;
+    }
+    if (ruleId && !pageId) {
+      const configured = this.c.config.rules.find((item) => item.id === ruleId);
+      if (!configured) {
+        new Notice("This source issue belongs to a source that was removed. Open Sources to review the remaining configuration.");
+        this.screen = "home";
+        this.render();
+        return;
+      }
+      this.openEditor(configured);
+      return;
+    }
+    const rule = (state?.ruleId && this.c.config.rules.find((item) => item.id === state.ruleId)) ??
+      (ruleId && this.c.config.rules.find((item) => item.id === ruleId)) ??
+      ruleFor(source, this.c.config.rules);
+    if (!rule) {
+      new Notice("This issue no longer has a configured source. Open Sources to review it.");
+      this.screen = "home";
+      this.render();
+      return;
+    }
+    this.openNotebookDetail(rule.id, source);
+  }
   onOpen() {
     const c = this.c as Controller & { platform?: "desktop" | "nomad" };
     this.modalEl.classList.toggle("st-desktop", c.platform === "desktop");
@@ -428,7 +631,12 @@ class MirrorsModal extends Modal {
       () => this.goBack(),
       "st-back",
     );
-    this.heading = el(head, "h1", "Mirrors");
+    const brand = el(head, "div", undefined, "st-plugin-brand");
+    const brandIcon = el(brand, "span", undefined, "st-plugin-brand-icon");
+    brandIcon.setAttribute("aria-hidden", "true");
+    setIcon(brandIcon, "book-open-text");
+    el(brand, "span", "Supernote Transcripts");
+    this.heading = el(head, this.nativeSettingsMounted ? "h2" : "h1", "Mirrors", "st-screen-title");
     this.heading.id = `st-title-${crypto.randomUUID()}`;
     this.modalEl.setAttribute("aria-labelledby", this.heading.id);
     const costs = iconButton(
@@ -464,6 +672,16 @@ class MirrorsModal extends Modal {
       if (!keyboard) this.keyboardHiddenHeight = viewWindow.innerHeight;
       const height = availableModalHeight(viewport, this.keyboardHiddenHeight, keyboard);
       this.modalEl.style.setProperty("--st-visual-height", `${height}px`);
+      const settingsPane = this.nativeSettingsToolbar?.parentElement;
+      if (settingsPane) {
+        const top = Math.max(0, settingsPane.getBoundingClientRect().top);
+        let bottom = height;
+        for (let parent = settingsPane.parentElement; parent && parent !== viewDocument.body; parent = parent.parentElement) {
+          if (/auto|scroll|hidden|clip/.test(viewWindow.getComputedStyle(parent).overflowY))
+            bottom = Math.min(bottom, parent.getBoundingClientRect().bottom);
+        }
+        settingsPane.style.setProperty("--st-settings-height", `${Math.max(0, Math.floor(bottom - top - 8))}px`);
+      }
       if (keyboard) viewWindow.requestAnimationFrame(() => {
         const focused = viewDocument.activeElement;
         if (focused instanceof viewWindow.HTMLElement && this.body.contains(focused))
@@ -477,6 +695,7 @@ class MirrorsModal extends Modal {
     this.keyboardObserver.observe(viewDocument.documentElement, { attributes: true, attributeFilter: ["style"] });
   }
   onClose() {
+    this.browserOperationId++;
     this.invalidateReprocessImagePreviews();
     if (this.viewportResize) {
       this.visualViewport?.removeEventListener("resize", this.viewportResize);
@@ -484,6 +703,11 @@ class MirrorsModal extends Modal {
     }
     this.keyboardObserver?.disconnect();
     this.off?.();
+    this.off = undefined;
+    this.keyboardObserver = undefined;
+    this.viewportResize = undefined;
+    this.renderedView = "";
+    this.returnToPicker = undefined;
     this.contentEl.empty();
   }
   close() {
@@ -501,7 +725,10 @@ class MirrorsModal extends Modal {
   }
   private async openOutputAndClose(path: string) {
     await this.c.openOutput(path);
-    this.close();
+    if (this.nativeSettingsMounted) {
+      this.screen = "settings";
+      this.render();
+    } else this.close();
   }
   private saveConfigQueued() {
     const save = () => this.c.saveConfig();
@@ -516,11 +743,10 @@ class MirrorsModal extends Modal {
   private setFormControlsDisabled(disabled: boolean) {
     if (disabled) {
       if (this.formControlState) return;
-      const controls = Array.from(
-        this.modalEl.querySelectorAll<HTMLButtonElement | HTMLInputElement | HTMLTextAreaElement | HTMLSelectElement>(
-          "button, input, textarea, select",
-        ),
-      );
+      const controls = Array.from(new Set([
+        ...Array.from(this.modalEl.querySelectorAll<HTMLButtonElement | HTMLInputElement | HTMLTextAreaElement | HTMLSelectElement>("button, input, textarea, select")),
+        ...Array.from(this.nativeSettingsToolbar?.querySelectorAll<HTMLButtonElement | HTMLInputElement | HTMLTextAreaElement | HTMLSelectElement>("button, input, textarea, select") ?? []),
+      ]));
       this.formControlState = controls.map((control) => [control, control.disabled]);
       for (const [control] of this.formControlState) control.disabled = true;
       return;
@@ -532,13 +758,19 @@ class MirrorsModal extends Modal {
   private goBack() {
     if (this.pendingConfigSaves) return;
     if (this.excludeBusy || this.outputFolderCreateBusy) return;
+    if (this.screen === "editor") {
+      this.finishSourceEditor();
+      return;
+    }
+    if (this.screen === "browser") this.browserOperationId++;
     if (this.screen === "reprocess") this.invalidateReprocessImagePreviews();
     if (this.screen === "costs") {
       this.costDraft = JSON.parse(JSON.stringify(this.c.costs.settings));
       this.screen = this.costReturnScreen;
     } else if (this.screen === "output-folders") {
-      this.screen = this.folderPickerPurpose === "support" ? "settings" : "editor";
+      this.screen = this.folderPickerPurpose === "output" ? "editor" : "settings";
       if (this.folderPickerPurpose === "support") this.settingsTab = "storage";
+      else if (this.folderPickerPurpose === "default-output") this.settingsTab = "connection";
     } else if (this.screen === "output-folder-create") {
       this.outputFolderName = "";
       this.screen = "output-folders";
@@ -551,6 +783,7 @@ class MirrorsModal extends Modal {
       this.screen = "editor";
     } else if (this.screen === "browser" && this.browserFrom === "edit")
       this.screen = "editor";
+    else if (this.screen === "browser") this.screen = this.browserReturnScreen;
     else if (this.screen === "recovery" || this.screen === "page-reconciliation") this.screen = "detail";
     else if (this.screen === "exclude-confirm") {
       this.excludeSource = "";
@@ -560,28 +793,33 @@ class MirrorsModal extends Modal {
     }
     else if (this.screen === "cleanup" || this.screen === "reprocess") this.screen = this.actionReturnScreen;
     else if (this.screen === "storage") this.screen = "settings";
+    else if (this.screen === "prompts") {
+      this.screen = "settings";
+      this.refreshSettingsPromptDefaults();
+    }
     else if (this.screen === "detail") this.screen = this.detailReturnScreen;
     else if (this.screen === "settings") {
       this.settingsDraft = undefined;
-      this.screen = this.settingsReturnScreen;
+      if (this.nativeSettingsMounted) this.beginSettingsDraft("home");
+      else this.screen = this.settingsReturnScreen;
     }
-    else this.screen = "home";
+    else this.screen = this.nativeSettingsMounted && this.screen === "home" ? "settings" : "home";
     this.render();
   }
-  private showSettings() {
-    if (this.excludeBusy || this.outputFolderCreateBusy) return;
-    if (this.screen === "reprocess") this.invalidateReprocessImagePreviews();
-    this.settingsReturnScreen = this.screen === "settings" ? "home" : this.screen;
+  private beginSettingsDraft(returnScreen: Screen) {
+    this.settingsReturnScreen = returnScreen;
+    this.settingsAdvancedOpen = false;
     const controller = this.c as Controller & {
       provider?: "api" | "subscription";
       concurrency?: number;
+      transientRetries?: number;
       storagePreferences?: () => { hideInExplorer: boolean; excludeFromSearch: boolean };
     };
     const storagePreferences = controller.storagePreferences?.() ?? {
       hideInExplorer: true,
       excludeFromSearch: true,
     };
-    const storageConfig = this.c.config as typeof this.c.config & { supportFolder?: string };
+    const storageConfig = this.c.config as typeof this.c.config & { supportFolder?: string; defaultOutput?: string };
     const profilesSnapshot = this.c.config.profiles.map((p) => ({
       ...p,
       glossaries: [...p.glossaries],
@@ -590,6 +828,7 @@ class MirrorsModal extends Modal {
       ...p,
       glossaries: [...p.glossaries],
     }));
+    this.settingsCleanupPromptBaseline = this.c.config.cleanupPrompt ?? DEFAULT_CLEANUP_PROMPT;
     this.settingsDraft = {
       apiKey: this.c.apiKey,
       aiEnabled: aiOn(this.c),
@@ -601,20 +840,46 @@ class MirrorsModal extends Modal {
       intervalMinutes: this.c.config.intervalMinutes,
       provider: controller.provider ?? "api",
       concurrency: controller.concurrency ?? 1,
+      transientRetries: controller.transientRetries ?? 2,
       showPageHeadings: this.c.config.showPageHeadings === true &&
         (profilesSnapshot.find((p) => p.id === "general")?.preserveFormatting ?? true) === false,
-      cleanupPrompt: (this.c.config as typeof this.c.config & { cleanupPrompt?: string }).cleanupPrompt ?? DEFAULT_CLEANUP_PROMPT,
+      cleanupPrompt: this.settingsCleanupPromptBaseline,
       automaticCheck: (this.c.config as typeof this.c.config & { automaticCheck?: "new" | "recent" | "all" }).automaticCheck ?? "new",
       automaticCheckRecentPages: (this.c.config as typeof this.c.config & { automaticCheckRecentPages?: number }).automaticCheckRecentPages ?? 5,
       pairingAddress: "",
       pairingCode: "",
       supportFolder: storageConfig.supportFolder ?? "_supernote",
+      defaultOutput: storageConfig.defaultOutput ?? TRANSCRIPTS_ROOT,
       hideSupportFolderInExplorer: storagePreferences.hideInExplorer,
       excludeSupportFilesFromSearch: storagePreferences.excludeFromSearch,
     };
-    this.settingsTab = "connection";
+  }
+  private showSettings() {
+    if (this.excludeBusy || this.outputFolderCreateBusy) return;
+    if (this.screen === "reprocess") this.invalidateReprocessImagePreviews();
+    if (!this.settingsDraft) {
+      this.beginSettingsDraft(this.screen === "settings" ? "home" : this.screen);
+      this.settingsTab = "connection";
+    }
+    this.settingsReturnScreen = this.screen === "settings" ? "home" : this.screen;
     this.screen = "settings";
     this.render();
+  }
+  private refreshSettingsPromptDefaults() {
+    const draft = this.settingsDraft;
+    if (!draft || this.screen !== "settings" || !this.modalEl.isConnected) return;
+    if (draft.cleanupPrompt === this.settingsCleanupPromptBaseline) {
+      this.settingsCleanupPromptBaseline = this.c.config.cleanupPrompt ?? DEFAULT_CLEANUP_PROMPT;
+      draft.cleanupPrompt = this.settingsCleanupPromptBaseline;
+    }
+    for (const baseline of this.settingsProfilesBaseline) {
+      const current = this.c.config.profiles.find(profile => profile.id === baseline.id);
+      const proposed = draft.profiles.find(profile => profile.id === baseline.id);
+      if (current && proposed && proposed.prompt === baseline.prompt) {
+        baseline.prompt = current.prompt;
+        proposed.prompt = current.prompt;
+      }
+    }
   }
   private selectSettingsTab(key: "connection" | "recognition" | "updates" | "storage") {
     this.settingsTab = key;
@@ -622,13 +887,27 @@ class MirrorsModal extends Modal {
     this.body.scrollTop = 0;
     this.body.querySelector<HTMLButtonElement>(`[data-settings-tab="${key}"]`)?.focus();
   }
-  private render() {
-    const mutationBusy = this.excludeBusy || this.outputFolderCreateBusy || !!this.reconciliationBusyPage;
-    this.back.hidden = this.screen === "home";
+  private render(scrollOverride?: number) {
+    const view = this.screen === "browser" ? `${this.screen}:${this.browserFrom}:${this.browserPath}`
+      : this.screen === "settings" ? `${this.screen}:${this.settingsTab}` : this.screen;
+    const scroll = scrollOverride ?? (view === this.renderedView ? this.body.scrollTop : 0);
+    this.renderedView = view;
+    const mutationBusy = this.excludeBusy || this.outputFolderCreateBusy || !!this.reconciliationBusyPage ||
+      (this.screen === "browser" && this.browserRegistering);
+    this.modalEl.classList.toggle("st-native-settings", this.nativeSettingsMounted);
+    const inSettings = this.screen === "settings";
+    this.modalEl.classList.toggle("st-workflow-screen", !this.nativeSettingsMounted || !inSettings);
+    this.modalEl.classList.toggle("st-source-settings-screen", this.screen === "editor");
+    this.modalEl.classList.toggle("st-settings-screen", inSettings);
+    this.nativeSettingsToolbar && (this.nativeSettingsToolbar.hidden = !inSettings);
+    const header = this.modalEl.querySelector<HTMLElement>(".st-header");
+    if (header) header.hidden = this.nativeSettingsMounted && inSettings;
+    this.back.hidden = this.nativeSettingsMounted ? inSettings : this.screen === "home";
     this.back.disabled = mutationBusy;
     this.headAction.disabled = mutationBusy;
-    this.headAction.hidden = false;
-    const inSettings = this.screen === "settings";
+    const scopedPicker = this.screen === "browser" && this.browserFrom !== "edit";
+    this.modalEl.classList.toggle("st-scoped-picker", scopedPicker);
+    this.headAction.hidden = this.nativeSettingsMounted || !["home", "queue", "settings"].includes(this.screen);
     this.headAction.classList.toggle("is-active", inSettings);
     this.headAction.setAttribute("aria-pressed", String(inSettings));
     this.headAction.setAttribute("aria-label", inSettings ? "Close settings" : "Settings");
@@ -639,10 +918,13 @@ class MirrorsModal extends Modal {
     const costHead =
       this.modalEl.querySelector<HTMLButtonElement>(".st-cost-head");
     if (costHead)
-      costHead.hidden = !["home", "queue", "settings"].includes(this.screen);
+      costHead.hidden = this.nativeSettingsMounted || !["home", "queue", "settings"].includes(this.screen);
     if (costHead) costHead.disabled = mutationBusy;
     const closeButton = this.modalEl.querySelector<HTMLButtonElement>(".st-close");
-    if (closeButton) closeButton.disabled = mutationBusy;
+    if (closeButton) {
+      closeButton.disabled = mutationBusy;
+      closeButton.hidden = this.nativeSettingsMounted;
+    }
     this.modalEl.classList.toggle(
       "st-home",
       ["home", "queue"].includes(this.screen),
@@ -650,9 +932,11 @@ class MirrorsModal extends Modal {
     setText(
       this.heading,
       this.screen === "home"
-        ? "Transcripts"
+        ? "Sources"
         : this.screen === "settings"
           ? "Settings"
+          : this.screen === "prompts"
+            ? "Prompt library"
           : this.screen === "queue"
             ? "Queue"
             : this.screen === "force-update"
@@ -668,13 +952,13 @@ class MirrorsModal extends Modal {
               : this.screen === "editor"
                 ? "Source settings"
                 : this.screen === "browser"
-                  ? "Choose source"
+                  ? this.browserFrom === "add" ? "Add source" : this.browserFrom === "transcribe" ? "Transcribe" : "Choose source"
                   : this.screen === "glossaries"
                     ? "Glossaries"
                     : this.screen === "costs"
                       ? "Costs"
                       : this.screen === "output-folders"
-                        ? this.folderPickerPurpose === "support" ? "Choose support folder" : "Choose output folder"
+                        ? this.folderPickerPurpose === "support" ? "Choose support folder" : this.folderPickerPurpose === "default-output" ? "Choose default transcript folder" : "Choose output folder"
                         : this.screen === "output-folder-create"
                           ? "Create output folder"
                         : this.screen === "exclude-confirm"
@@ -703,8 +987,15 @@ class MirrorsModal extends Modal {
     else if (this.screen === "notebook-selection")
       void this.renderNotebookSelection();
     else if (this.screen === "settings") this.renderSettings();
+    else if (this.screen === "prompts") {
+      if (this.c.promptLibrary) new PromptLibraryView(
+        el(this.body, "section", undefined, "st-prompt-library"),
+        this.c.promptLibrary,
+        el(this.footer, "div", undefined, "st-actions st-prompt-footer"),
+      );
+    }
     else if (this.screen === "storage") this.renderStorage();
-    else if (this.screen === "browser") void this.renderBrowser();
+    else if (this.screen === "browser") void this.renderBrowser(scroll);
     else if (this.screen === "glossaries") void this.renderGlossaryPicker();
     else if (this.screen === "costs") this.renderCosts();
     else if (this.screen === "output-folders") void this.renderOutputFolders();
@@ -714,6 +1005,7 @@ class MirrorsModal extends Modal {
     else if (this.screen === "recovery") this.renderRecovery();
     else if (this.screen === "page-reconciliation") this.renderPageReconciliation();
     else this.renderDetail();
+    this.body.scrollTop = scroll;
   }
   private refreshLive() {
     if (this.screen === "home") this.refreshHome();
@@ -765,17 +1057,7 @@ class MirrorsModal extends Modal {
     btn(
       actions,
       "+ Add source",
-      () => {
-        this.browserFrom = "add";
-        this.browserRootPath = this.isDesktop()
-          ? this.initialDesktopBrowserPath()
-          : ROOT;
-        this.browserPath = this.browserRootPath;
-        this.sourcePathDraft = "";
-        this.browserError = "";
-        this.screen = "browser";
-        this.render();
-      },
+      () => this.openSourcePicker(),
       "st-button st-text-button",
     );
     this.updateButton = btn(
@@ -799,10 +1081,7 @@ class MirrorsModal extends Modal {
     const queue = btn(
       nav,
       "Queue",
-      () => {
-        this.screen = "queue";
-        this.render();
-      },
+      () => this.openQueue(),
       `st-desktop-tab st-view-tab${active === "queue" ? " is-active" : ""}`,
     );
     if (active === "queue") queue.setAttribute("aria-current", "page");
@@ -959,6 +1238,7 @@ class MirrorsModal extends Modal {
       (this.c.store.queue as ManualQueueTask[] | undefined)?.filter((task) => task.manual).map((task) => task.source),
       [...this.recognitionNowBusy].sort(),
       (this.c as Controller & { sharedSettingsIssues?: unknown }).sharedSettingsIssues,
+      (this.c as Controller & { globalPreferencesIssue?: unknown }).globalPreferencesIssue,
     ]);
     if (this.rows.dataset.key !== key) {
       const inactiveOpen =
@@ -969,6 +1249,7 @@ class MirrorsModal extends Modal {
       const focusNotebook = active?.dataset.notebookId;
       this.rows.dataset.key = key;
       this.rows.empty();
+      this.renderGlobalPreferencesConflict(this.rows);
       if (this.c.progress.stateBlocked)
         this.renderStateBlockedNotice(this.rows);
       const enabled = rules.filter((r) => r.enabled),
@@ -1026,6 +1307,9 @@ class MirrorsModal extends Modal {
   private queueCopy(parent: HTMLElement, source: string) {
     const copy = el(parent, "div", undefined, "st-queue-copy");
     const heading = el(copy, "div", undefined, "st-source-heading");
+    const glyph = el(heading, "span", undefined, "st-source-icon");
+    glyph.setAttribute("aria-hidden", "true");
+    setIcon(glyph, "book-open");
     el(heading, "strong", base(source).replace(/\.note$/i, ""));
     const q = this.c.queueView;
     const sources = [
@@ -1069,7 +1353,7 @@ class MirrorsModal extends Modal {
       : `Recognize now: ${title}`;
     const button = iconButton(
       parent,
-      state.active ? "loader-circle" : state.queued || state.busy ? "clock-3" : "play",
+      state.active ? "loader-circle" : state.queued || state.busy ? "clock-3" : "scan-text",
       label,
       () => {
         if (!controller.requestRecognitionNow || this.c.progress.stateBlocked || state.active || state.queued || state.busy) return;
@@ -1097,22 +1381,21 @@ class MirrorsModal extends Modal {
     return ((this.c.progress as ManualProgress).manualSources ?? []).includes(source) ||
       (((this.c.store.queue as ManualQueueTask[] | undefined) ?? []).some((task) => task.manual && task.source === source));
   }
-  private queueProgress(copy: HTMLElement, source: string) {
+  private queueProgress(copy: HTMLElement, source: string, status?: string) {
     const state = this.displayStore.notebooks[source];
     if (!state) return;
     const view = notebookPresentation(state);
     el(
       copy,
       "p",
-      view.total
-        ? `${view.ready} of ${view.total} pages ready · ${view.pending} remaining`
-        : "Awaiting page check",
+      status ?? (view.total ? `${view.ready} of ${view.total} pages ready` : "Waiting for page check"),
       "st-caption",
     );
     const reason = this.forceUpdateReason(state, view.reason);
     if (reason)
       el(copy, "p", reason, "st-caption st-attention-reason");
-    progressBar(copy, view, `${base(source)} pages ready`);
+    const row = copy.closest<HTMLElement>(".st-queue-row");
+    if (row) progressBar(row, view, `${base(source)} pages ready`);
   }
   private renderForceUpdateAction(parent: HTMLElement, state: Controller["store"]["notebooks"][string]) {
     if (!this.canForceUpdate(state)) return;
@@ -1165,7 +1448,10 @@ class MirrorsModal extends Modal {
     if (!this.summary) return;
     const q = this.c.queueView;
     if (!q) return;
-    const pageAttention = Object.values(this.displayStore.notebooks)
+    const notebooks = Object.values(this.displayStore.notebooks);
+    const oneTimeTranscripts = notebooks.filter(state => state.oneTime && state.publishedHash)
+      .sort((left, right) => (right.lastSaved ?? "").localeCompare(left.lastSaved ?? ""));
+    const pageAttention = notebooks
       .filter((state) => {
         const rule = this.c.config.rules.find((candidate) => candidate.id === state.ruleId);
         return !!rule?.enabled && selectedForRule(rule, state) &&
@@ -1177,8 +1463,11 @@ class MirrorsModal extends Modal {
         const state = this.displayStore.notebooks[source];
         return !state || notebookPresentation(state).attention;
       });
+    const sourceIssues = unresolvedSourceIssues(this.displayStore);
+    const attentionCount = attentionSources.length + sourceIssues.length;
     const key = JSON.stringify([
       q,
+      sourceIssues,
       (this.c as Controller & { provider?: string }).provider,
       (this.c as Controller & { queueEstimate?: (source?: string) => unknown }).queueEstimate?.(),
       this.c.progress.activePage,
@@ -1187,17 +1476,19 @@ class MirrorsModal extends Modal {
       this.c.progress.paused,
       this.c.progress.budgetBlocked,
       this.c.progress.stateBlocked,
+      this.c.progress.stage,
       (this.c.progress as typeof this.c.progress & { executionBlocked?: string }).executionBlocked,
       this.c.progress.detail,
       (this.c.progress as ManualProgress).manualSources,
       (this.c.store.queue as ManualQueueTask[] | undefined)?.filter((task) => task.manual).map((task) => task.source),
       [...this.recognitionNowBusy].sort(),
-      Object.values(this.displayStore.notebooks).map((s) => [
+      notebooks.map((s) => [
         s.source,
         notebookPresentation(s),
         s.paused,
         this.c.config.rules.find((r) => r.id === s.ruleId)?.paused,
       ]),
+      oneTimeTranscripts.map(state => [state.source, state.output, state.publishedHash]),
     ]);
     if (this.summary.dataset.key !== key) {
       const scroll = this.body.scrollTop;
@@ -1206,8 +1497,13 @@ class MirrorsModal extends Modal {
           this.summary.querySelectorAll<HTMLDetailsElement>("details[open]"),
         ).map((d) => d.dataset.queueSection ?? d.className),
       );
-      const focusKey = (document.activeElement as HTMLElement | null)?.dataset
+      const focusKey = (this.body.ownerDocument.activeElement as HTMLElement | null)?.dataset
         .queueKey;
+      const estimateOpen = this.summary.querySelector(".st-queue-estimate-info button")?.getAttribute("aria-expanded") === "true";
+      const queueActive = this.c.progress.running;
+      const priorResults = this.summary.querySelector<HTMLDetailsElement>(".st-queue-one-time");
+      const resultsOpen = (!queueActive && this.summary.dataset.active === "true") || (priorResults?.open ?? !queueActive);
+      this.summary.dataset.active = String(queueActive);
       this.summary.dataset.key = key;
       this.summary.empty();
       if (this.c.progress.stateBlocked)
@@ -1215,7 +1511,7 @@ class MirrorsModal extends Modal {
       const overview = el(this.summary, "section", undefined, "st-queue-overview");
       const manualWorking = !!q.working && this.currentManualSources().includes(q.working.source);
       const globalStatus = manualWorking
-        ? `Recognizing manually · ${base(q.working!.source).replace(/\.note$/i, "")}`
+        ? "Manual transcription"
         : this.currentManualSources().length
         ? "Manual request queued"
         : this.c.progress.stage === "Checking notebook pages"
@@ -1228,24 +1524,32 @@ class MirrorsModal extends Modal {
             ? "Updates paused"
             : q.working
         ? this.c.progress.paused
-          ? `Finishing current page · ${base(q.working.source).replace(/\.note$/i, "")}`
-          : `Working on ${base(q.working.source).replace(/\.note$/i, "")}`
+          ? "Finishing current page"
+          : "Updating notebooks"
         : q.waiting.length
           ? `${q.waiting.length} ${q.waiting.length === 1 ? "notebook" : "notebooks"} waiting`
           : q.paused.length
             ? "All remaining work is paused"
-            : attentionSources.length
-              ? `${attentionSources.length} ${attentionSources.length === 1 ? "notebook needs" : "notebooks need"} attention`
+            : attentionCount || this.c.progress.stage === "Needs attention"
+              ? "Needs attention"
               : "No pending work";
-      el(overview, "strong", globalStatus, "st-queue-status");
-      el(
-        overview,
+      const statusLine = el(overview, "div", undefined, "st-queue-status-line");
+      const statusIcon = el(statusLine, "span", undefined, "st-queue-status-icon");
+      statusIcon.setAttribute("aria-hidden", "true");
+      setIcon(statusIcon, q.working ? "refresh-cw" : attentionCount ? "circle-alert" : "list");
+      el(statusLine, "strong", globalStatus, "st-queue-status");
+      const counts = [
+        q.waiting.length ? `${q.waiting.length} waiting` : "",
+        q.paused.length ? `${q.paused.length} paused` : "",
+        attentionCount ? `${attentionCount} need attention` : "",
+      ].filter(Boolean);
+      if (counts.length) el(
+        statusLine,
         "p",
-        `Waiting ${q.waiting.length} · Paused ${q.paused.length} · Needs attention ${attentionSources.length}`,
+        counts.join(" · "),
         "st-caption st-queue-counts",
       );
-      this.renderQueueEstimate(overview);
-      this.renderQueueEstimateInfo(overview);
+      this.renderQueueEstimate(overview, undefined, estimateOpen);
       const blockerReason = this.c.progress.budgetBlocked ||
         (this.c.progress as typeof this.c.progress & { executionBlocked?: string }).executionBlocked;
       if (blockerReason) {
@@ -1300,7 +1604,11 @@ class MirrorsModal extends Modal {
         const total = workingView?.total || current?.total || q.working.total || 0;
         const completed = workingView?.ready ?? (current ? Math.max(0, current.number - 1) : 0);
         const cleaningUp = /cleanup/i.test(q.working.stage);
-        el(copy, "p", cleaningUp ? "Cleaning up document…" : total ? `Recognizing… ${Math.min(completed, total)}/${total} pages` : "Recognizing…", "st-caption st-working-progress");
+        const workingStatus = cleaningUp ? "Cleaning up document" : total && completed >= total
+          ? "Finishing up" : undefined;
+        if (workingState) this.queueProgress(copy, q.working.source, workingStatus);
+        else if (total) progressBar(row, { total, ratio: completed / total }, `${base(q.working.source)} pages ready`);
+        if (!workingState) el(copy, "p", workingStatus ?? (total ? `${completed} of ${total} pages ready` : "Working"), "st-caption");
         const workingDetails = el(copy, "div", undefined, "st-working-details");
         workingDetails.hidden = !this.workingCardExpanded;
         el(workingDetails, "p", `${q.working.stage}${current ? ` · page ${current.number} of ${current.total}` : ""}`, "st-caption");
@@ -1322,7 +1630,6 @@ class MirrorsModal extends Modal {
           el(workingDetails, "p", this.c.progress.detail, "st-caption st-working-detail");
         if (workingView) {
           el(workingDetails, "p", `${workingView.ready} of ${workingView.total} pages ready · ${workingView.pending} remaining`, "st-caption");
-          progressBar(workingDetails, workingView, `${base(q.working.source)} pages ready`);
         }
         const cleanupInProgress = cleaningUp;
         if (cleanupInProgress) {
@@ -1366,11 +1673,11 @@ class MirrorsModal extends Modal {
           toggleWorkingCard,
           "st-working-disclosure",
         );
+        disclosure.dataset.queueKey = `details:${q.working.source}`;
         disclosure.setAttribute("aria-expanded", String(this.workingCardExpanded));
         disclosure.addEventListener("click", (event) => event.stopPropagation());
       }
       if (q.waiting.length) el(this.summary, "h2", "Up next", "st-section-heading st-queue-heading");
-      else if (!q.working && !q.paused.length && !attentionSources.length) el(this.summary, "p", "No pending pages.", "st-empty");
       for (const source of q.waiting) {
         const row = el(this.summary, "article", undefined, "st-queue-row");
         const copy = this.queueCopy(row, source);
@@ -1399,6 +1706,30 @@ class MirrorsModal extends Modal {
         attentionSources,
         false,
       );
+      if (sourceIssues.length) {
+        const section = el(this.summary, "section", undefined, "st-queue-source-issues st-queue-attention");
+        el(section, "h2", `Source access (${sourceIssues.length})`, "st-section-heading");
+        for (const issue of sourceIssues) {
+          const row = el(section, "article", undefined, "st-queue-row");
+          const copy = el(row, "div", undefined, "st-queue-copy");
+          el(copy, "strong", issue.label);
+          el(copy, "p", issue.nextAction, "st-caption");
+          btn(row, "Configure source", () => this.openActivityIssue(issue.source, issue.ruleId), "st-button st-text-button");
+        }
+      }
+      if (oneTimeTranscripts.length) {
+        const section = el(this.summary, "details", undefined, "st-queue-one-time");
+        section.open = resultsOpen;
+        el(section, "summary", `One-time transcriptions (${oneTimeTranscripts.length})`).dataset.queueKey = "one-time-transcripts";
+        for (const state of oneTimeTranscripts) {
+          const row = el(section, "article", undefined, "st-queue-row");
+          const copy = this.queueCopy(row, state.source);
+          el(copy, "p", state.output, "st-caption");
+          const actions = el(row, "div", undefined, "st-row-controls");
+          btn(actions, "Details", () => this.openNotebookDetail(state.ruleId, state.source), "st-button st-text-button").dataset.queueKey = `result-details:${state.source}`;
+          btn(actions, "Open transcript", () => safe(this.openOutputAndClose(state.output)), "st-button st-text-button").dataset.queueKey = `result-open:${state.source}`;
+        }
+      }
       for (const detail of Array.from(
         this.summary.querySelectorAll<HTMLDetailsElement>(
           "details[data-queue-section]",
@@ -1447,38 +1778,21 @@ class MirrorsModal extends Modal {
       this.queueProgress(copy, source);
       this.renderQueueEstimate(copy, source);
       if (resume) {
-        const inheritedPause = !!this.c.config.rules.find(
-          (r) => r.id === state?.ruleId,
-        )?.paused;
-        if (inheritedPause) {
-          el(copy, "p", "Resume folder to continue", "st-caption");
-          const rule = this.c.config.rules.find((r) => r.id === state?.ruleId);
-          if (rule) {
-            const resumeFolder = btn(
-              row,
-              "Resume folder",
-              () => {
-                if (this.c.progress.stateBlocked) return new Notice(this.stateBlockedMessage());
-                safe(this.c.setSourcePaused(rule.id, false));
-              },
-              "st-button st-text-button st-folder-pause-action",
-            );
-            resumeFolder.disabled = !!this.c.progress.stateBlocked;
-            resumeFolder.dataset.queueKey = `folder-pause:${rule.id}`;
-          }
-        }
+        const inheritedPause = !!this.c.config.rules.find((r) => r.id === state?.ruleId)?.paused;
+        if (inheritedPause) el(copy, "p", "Resume this notebook only; the folder stays paused", "st-caption");
         const resumeButton = iconButton(
           row,
           "play",
           `Resume ${base(source)}`,
           () => {
             if (this.c.progress.stateBlocked) return new Notice(this.stateBlockedMessage());
-            safe(this.c.setNotebookPaused(source, false));
+            safe(this.c.resumeNotebook(source));
           },
         );
-        resumeButton.disabled = inheritedPause || !!this.c.progress.stateBlocked;
+        resumeButton.disabled = !!this.c.progress.stateBlocked;
         resumeButton.dataset.queueKey = `resume:${source}`;
       } else if (state) {
+        const actions = el(row, "div", undefined, "st-queue-actions");
         const issues = currentPageIssues(state).filter((issue) => issue.status !== "skipped");
         const actionLabel = canRecoverTranscriptEdits(state)
           ? "Resolve edits"
@@ -1486,7 +1800,7 @@ class MirrorsModal extends Modal {
             ? "Review pages"
             : "Review notebook";
         const open = btn(
-          row,
+          actions,
           actionLabel,
           () => {
             this.selectedRule = state.ruleId;
@@ -1503,11 +1817,11 @@ class MirrorsModal extends Modal {
             : "st-button st-text-button",
         );
         open.dataset.queueKey = `review:${source}`;
-        this.renderForceUpdateAction(row, state);
+        this.renderForceUpdateAction(actions, state);
       }
     }
   }
-  private renderQueueEstimate(parent: HTMLElement, source?: string) {
+  private renderQueueEstimate(parent: HTMLElement, source?: string, expanded = false) {
     const controller = this.c as Controller & {
       provider?: "api" | "subscription";
       queueEstimate?: (source?: string) => {
@@ -1529,45 +1843,24 @@ class MirrorsModal extends Modal {
       pieces.push(`${estimate.requests} request${estimate.requests === 1 ? "" : "s"}`);
       if (estimate.seconds !== undefined && Number.isFinite(estimate.seconds))
         pieces.push(`about ${this.duration(estimate.seconds)}`);
-      el(parent, "p", `${source ? "Estimate" : "Eligible work estimate"}: ${pieces.join(" · ")}`, "st-caption st-queue-estimate");
-      return;
-    }
-    if (estimate.usd !== undefined && Number.isFinite(estimate.usd))
+    } else if (estimate.usd !== undefined && Number.isFinite(estimate.usd))
       pieces.push(`about $${estimate.usd.toFixed(4)}`);
     else if (source) pieces.push("cost unavailable");
-    el(parent, "p", `${source ? "Estimate" : "Eligible work estimate"}: ${pieces.join(" · ")}`, "st-caption st-queue-estimate");
-  }
-  private renderQueueEstimateInfo(parent: HTMLElement) {
-    const controller = this.c as Controller & {
-      provider?: "api" | "subscription";
-      queueEstimate?: (source?: string) => {
-        pages: number; usd?: number; reservationUsd?: number; samples: number;
-        provisional: boolean; seconds?: number; requests: number;
-      };
-    };
-    const estimate = controller.queueEstimate?.();
-    if (!estimate || estimate.pages <= 0) return;
-    const details = el(parent, "div", undefined, "st-queue-estimate-info");
-    const help = btn(details, "?", () => {}, "st-button st-help-button");
-    help.setAttribute("aria-label", "Help: About this estimate");
-    help.setAttribute("aria-expanded", "false");
-    const panel = el(details, "div", undefined, "st-help-text");
-    const panelId = "st-queue-estimate-help-" + Math.random().toString(36).slice(2);
-    panel.id = panelId;
-    panel.hidden = true;
-    help.setAttribute("aria-controls", panelId);
-    help.addEventListener("click", () => {
-      panel.hidden = !panel.hidden;
-      help.setAttribute("aria-expanded", String(!panel.hidden));
-    });
-    if (controller.provider === "subscription") {
-      el(panel, "p", "Forecasts eligible work after you press Update or Resume. Individually paused or blocked notebooks are excluded. Spending or execution limits can still stop requests. Page and request counts are tracked by this plugin. ChatGPT manages plan allowance; no dollar charge is estimated.", "st-caption st-estimate-note");
-      return;
+    if (source) el(parent, "p", `Estimate: ${pieces.join(" · ")}`, "st-caption st-queue-estimate");
+    else {
+      const line = el(parent, "div", undefined, "st-queue-estimate-info");
+      el(line, "p", `Eligible work estimate: ${pieces.join(" · ")}`, "st-caption st-queue-estimate");
+      const scope = "Forecasts eligible work after Update or Resume. Individually paused or blocked notebooks are excluded. Limits can still stop requests.";
+      const detail = controller.provider === "subscription"
+        ? "Pages and requests are tracked by the plugin. ChatGPT manages plan allowance."
+        : `${estimate.provisional ? "Provisional. " : ""}Based on ${estimate.samples} recent comparable page${estimate.samples === 1 ? "" : "s"}. Estimates are not bills.`;
+      const reserved = controller.provider !== "subscription" && estimate.reservationUsd && Number.isFinite(estimate.reservationUsd)
+        ? ` Conservative budget reservation: $${estimate.reservationUsd.toFixed(4)}.` : "";
+      this.help(line, `${scope} ${detail}${reserved}`, "About this estimate");
+      const button = line.querySelector("button")!;
+      button.dataset.queueKey = "estimate-help";
+      if (expanded) button.click();
     }
-    const sample = `${estimate.samples} recent comparable page${estimate.samples === 1 ? "" : "s"}`;
-    el(panel, "p", `Forecasts eligible work after you press Update or Resume. Individually paused or blocked notebooks are excluded. Spending or execution limits can still stop requests. ${estimate.provisional ? "Provisional; " : ""}Based on ${sample}. Estimates are not bills.`, "st-caption st-estimate-note");
-    if (estimate.reservationUsd !== undefined && Number.isFinite(estimate.reservationUsd) && estimate.reservationUsd > 0)
-      el(panel, "p", `Conservative budget reservation: $${estimate.reservationUsd.toFixed(4)}.`, "st-caption st-reservation-note");
   }
   private duration(seconds: number) {
     const minutes = Math.max(1, Math.round(seconds / 60));
@@ -1596,8 +1889,8 @@ class MirrorsModal extends Modal {
     return /shared transcript recognition versions differ/i.test(state.error ?? "");
   }
   private canForceUpdate(state: Controller["store"]["notebooks"][string]) {
-    return state.status === "failed" || state.status === "conflict" ||
-      /wait for (?:shared )?(?:results|synchronization)|another device.*(?:updat|claim)|shared notebook claim/i.test(state.error ?? "");
+    return !state.oneTime && (state.status === "failed" || state.status === "conflict" ||
+      /wait for (?:shared )?(?:results|synchronization)|another device.*(?:updat|claim)|shared notebook claim/i.test(state.error ?? ""));
   }
   private forceUpdateReason(state: Controller["store"]["notebooks"][string] | undefined, fallback?: string) {
     if (!state) return fallback;
@@ -1720,6 +2013,54 @@ class MirrorsModal extends Modal {
     if (this.c.progress.stateBlocked)
       el(notice, "p", this.c.progress.stateBlocked, "st-caption");
     el(notice, "p", this.stateBlockedMessage(), "st-caption");
+  }
+  private renderGlobalPreferencesConflict(parent: HTMLElement) {
+    const controller = this.c as Controller & {
+      globalPreferencesIssue?: { fields: string[]; reason: string };
+      resolveSharedPreferences?: (choice: "local" | "remote") => Promise<void>;
+      refreshSharedSettings?: () => Promise<void>;
+    };
+    const issue = controller.globalPreferencesIssue;
+    if (!issue) return;
+    const card = el(parent, "aside", undefined, "st-shared-settings-conflict st-global-preferences-conflict");
+    const fields: Record<string, string> = {
+      "profile.model": "General model",
+      "profile.quality": "Recognition quality",
+      "profile.prompt": "General instructions",
+      "profile.glossaries": "Reference files",
+      "profile.endpoint": "API endpoint",
+      cleanupPrompt: "Cleanup instructions",
+      showPageHeadings: "Page headings",
+    };
+    const conflict = issue.fields.length > 0;
+    el(card, "strong", conflict ? "Shared defaults conflict" : "Shared defaults need attention");
+    const labels = issue.fields.map(field => fields[field] ?? field);
+    el(card, "p", `${labels.length ? `${labels.join(", ")} · ` : ""}${issue.reason}`, "st-caption");
+    const actions = el(card, "div", undefined, "st-conflict-actions");
+    if (conflict && controller.resolveSharedPreferences) {
+      const local = btn(actions, "Keep this device", () => {
+        local.disabled = remote.disabled = true;
+        void controller.resolveSharedPreferences!("local").then(() => this.refreshHome()).catch(error => {
+          new Notice("Could not keep this device’s shared defaults: " + err(error));
+          local.disabled = remote.disabled = false;
+        });
+      }, "st-button st-text-button");
+      const remote = btn(actions, "Use shared defaults", () => {
+        local.disabled = remote.disabled = true;
+        void controller.resolveSharedPreferences!("remote").then(() => this.refreshHome()).catch(error => {
+          new Notice("Could not use shared defaults: " + err(error));
+          local.disabled = remote.disabled = false;
+        });
+      }, "st-button st-text-button");
+    } else if (controller.refreshSharedSettings) {
+      const retry = btn(actions, "Retry Sync", () => {
+        retry.disabled = true;
+        void controller.refreshSharedSettings!().then(() => this.refreshHome()).catch(error => {
+          new Notice("Could not sync shared defaults: " + err(error));
+          retry.disabled = false;
+        });
+      }, "st-button st-text-button");
+    }
   }
   private renderSharedSettingsConflict(parent: HTMLElement, ruleId: string) {
     const controller = this.c as Controller & {
@@ -1851,26 +2192,21 @@ class MirrorsModal extends Modal {
     const controls = el(row, "div", undefined, "st-row-controls");
     if (isNotebook && stateSources.length) {
       const state = this.displayStore.notebooks[stateSources[0]];
-      iconButton(
-        controls,
-        "info",
-        `Notebook details: ${title}`,
-        () => this.openNotebookDetail(rule.id, state.source),
-        "st-notebook-details-action",
-      );
       const paused = !!(rule.paused || state?.paused);
       const manualPending = this.manualActive(stateSources[0]);
       const pause = iconButton(
         controls,
-        "pause",
-        `${manualPending ? "Pause manual recognition" : paused ? "Resume automatic updates" : "Pause automatic updates"}: ${title}`,
+        paused && !manualPending ? "play" : "pause",
+        `${manualPending ? "Pause manual recognition" : paused ? isNotebook ? "Resume notebook" : "Resume folder queue" : "Pause automatic updates"}: ${title}`,
         () => {
           if (paused && this.c.progress.stateBlocked) return new Notice(this.stateBlockedMessage());
           if (manualPending) safe(this.c.setNotebookPaused(stateSources[0], true));
           else safe(rule.paused
-            ? this.c.setSourcePaused(rule.id, false)
+            ? isNotebook
+              ? this.c.resumeNotebook(stateSources[0])
+              : this.c.resumeSourceFolder(rule.id)
             : state?.paused
-              ? this.c.setNotebookPaused(stateSources[0], false)
+              ? this.c.resumeNotebook(stateSources[0])
               : this.c.setSourcePaused(rule.id, true));
         },
         "st-source-pause",
@@ -1886,11 +2222,13 @@ class MirrorsModal extends Modal {
         : stateSources.some((candidate) => this.manualActive(candidate));
       const pause = iconButton(
         controls,
-        "pause",
-        `${manualPending ? "Pause manual recognition" : rule.paused ? "Resume automatic updates" : "Pause automatic updates"}: ${title}`,
+        rule.paused && !manualPending ? "play" : "pause",
+        `${manualPending ? "Pause manual recognition" : rule.paused ? "Resume folder queue" : "Pause automatic updates"}: ${title}`,
         () => manualPending
           ? safe(this.c.setSourcePaused(rule.id, true))
-          : safe(this.c.setSourcePaused(rule.id, !rule.paused)),
+          : rule.paused
+            ? safe(this.c.resumeSourceFolder(rule.id))
+            : safe(this.c.setSourcePaused(rule.id, true)),
         "st-source-pause",
       );
       pause.setAttribute("aria-pressed", String(!!rule.paused));
@@ -1906,9 +2244,16 @@ class MirrorsModal extends Modal {
       "st-edit",
     );
     configure.dataset.configId = rule.id;
-    if (isNotebook && stateSources.length)
+    if (isNotebook && stateSources.length) {
+      iconButton(
+        controls,
+        "info",
+        `Notebook details: ${title}`,
+        () => this.openNotebookDetail(rule.id, stateSources[0]),
+        "st-notebook-details-action",
+      );
       this.makeNotebookOpenable(row, rule.id, stateSources[0]);
-    else {
+    } else {
       row.setAttribute("role", "group");
       if (!isNotebook) {
         const expanded = this.expandedRules.has(rule.id);
@@ -2004,22 +2349,19 @@ class MirrorsModal extends Modal {
     const paused = !!(rule.paused || state.paused);
     const pause = iconButton(
       controls,
-      "pause",
+      paused && !manualPending ? "play" : "pause",
       `${manualPending ? "Pause manual recognition" : paused ? "Resume automatic updates" : "Pause automatic updates"}: ${title}`,
       () => {
         if (paused && this.c.progress.stateBlocked && !manualPending) return new Notice(this.stateBlockedMessage());
         if (manualPending) safe(this.c.setNotebookPaused(state.source, true));
-        else if (rule.paused) safe(this.c.setSourcePaused(rule.id, false));
-        else safe(this.c.setNotebookPaused(state.source, !state.paused));
+        else if (paused) safe(this.c.resumeNotebook(state.source));
+        else safe(this.c.setNotebookPaused(state.source, true));
       },
       "st-source-pause",
     );
     pause.setAttribute("aria-pressed", String(paused));
     pause.dataset.notebookId = state.source;
-    if (rule.paused) {
-      pause.disabled = !manualPending;
-      if (!manualPending) pause.setAttribute("aria-label", `Resume automatic updates: ${base(rule.source)} to continue ${title}`);
-    }
+    if (rule.paused && !manualPending) pause.setAttribute("aria-label", `Resume ${title} only; keep ${base(rule.source)} paused`);
     if (this.c.progress.stateBlocked && state.paused && !manualPending) pause.disabled = true;
     this.renderRecognizeNow(controls, { source: state.source }, title, !rule.enabled);
     iconButton(
@@ -2034,7 +2376,7 @@ class MirrorsModal extends Modal {
   private openNotebookDetail(ruleId: string, source: string) {
     this.selectedRule = ruleId;
     this.selectedSource = source;
-    this.detailReturnScreen = "home";
+    this.detailReturnScreen = this.screen === "queue" ? "queue" : "home";
     this.screen = "detail";
     this.render();
   }
@@ -2157,6 +2499,22 @@ class MirrorsModal extends Modal {
     }
   }
   private openEditor(rule: FolderRule) {
+    this.returnToPicker = undefined;
+    if (this.screen === "browser" && this.browserFrom !== "edit") {
+      const { browserFrom, browserPath, browserRootPath, browserSelection, browserFocusPath, sourcePathDraft } = this;
+      const scroll = this.body.scrollTop;
+      this.returnToPicker = () => {
+        this.browserFrom = browserFrom;
+        this.browserPath = browserPath;
+        this.browserRootPath = browserRootPath;
+        this.browserSelection = browserSelection;
+        this.browserFocusPath = browserFocusPath;
+        this.sourcePathDraft = sourcePathDraft;
+        this.browserError = "";
+        this.screen = "browser";
+        this.render(scroll);
+      };
+    }
     this.editorRule = JSON.parse(JSON.stringify(rule));
     this.editorProfile =
       this.c.config.profiles.find((p) => p.id === rule.profileId) ??
@@ -2176,7 +2534,7 @@ class MirrorsModal extends Modal {
   private renderEditor() {
     const r = this.editorRule;
     if (!r) return;
-    const root = el(this.body, "section", undefined, "st-form");
+    const root = el(this.body, "section", undefined, "st-form st-form-layout");
     const settingsIssues = (this.c as Controller & { sharedSettingsIssues?: Array<{ ruleId: string; name: string; fields: string[]; reason: string }> }).sharedSettingsIssues?.filter((issue) => issue.ruleId === r.id) ?? [];
     if (settingsIssues.length) {
       const notice = el(root, "aside", undefined, "st-shared-settings-conflict st-conflict-form-note");
@@ -2184,11 +2542,12 @@ class MirrorsModal extends Modal {
       el(notice, "p", "Close this form, then resolve the conflict on the source row. This keeps the current form draft intact.", "st-caption");
     }
     const sourceSection = el(root, "section", undefined, "st-form-section st-source-section");
-    el(sourceSection, "h2", "Source", "st-section-heading");
+    sectionHeading(sourceSection, "Source", "folder");
     const sourceHeader = el(sourceSection, "header", undefined, "st-source-header");
-    el(sourceHeader, "p", base(r.source).replace(/\.note$/i, ""), "st-caption st-source-title");
+    el(sourceHeader, "p", base(r.source).replace(/\.note$/i, ""), "st-source-title");
     const source = el(sourceHeader, "div", undefined, "st-source-choice");
-    el(source, "p", this.sourceLabel(r.source), "st-caption st-source-path");
+    const sourcePath = this.sourceLabel(r.source);
+    el(source, "p", sourcePath, "st-caption st-source-path").title = sourcePath;
     btn(
       source,
       "Change",
@@ -2203,7 +2562,7 @@ class MirrorsModal extends Modal {
         this.screen = "browser";
         this.render();
       },
-      "st-button st-text-button",
+      "st-button st-text-button st-source-change",
     );
     const singleNotebookSource = r.source.toLowerCase().endsWith(".note");
     const sourceIncluded = r.enabled && !(singleNotebookSource && excluded(r.source, r.source, r.exclude));
@@ -2229,14 +2588,15 @@ class MirrorsModal extends Modal {
         (v) => (r.recursive = v),
       );
       const selection = el(whatToMirror, "div", undefined, "st-selection-choice");
-      el(selection, "p", "Choose which notebooks in this folder are included.", "st-caption");
+      el(selection, "p", "Included notebooks", "st-caption");
       btn(
         selection,
         "Select notebooks",
         () => this.openNotebookSelection(r),
         "st-button st-text-button",
       );
-      const exclusions = el(sourceSection, "div", undefined, "st-source-exclusions");
+      const exclusions = el(sourceSection, "details", undefined, "st-source-exclusions st-settings-disclosure");
+      el(exclusions, "summary", r.exclude.length ? `Exclusions (${r.exclude.length})` : "Exclusions");
       this.textarea(
         exclusions,
         "Excluded paths or patterns",
@@ -2245,11 +2605,12 @@ class MirrorsModal extends Modal {
         "One relative path or pattern per line, for example 25*.note",
       );
     }
-    const sharedMirrorField = el(sourceSection, "div", undefined, "st-shared-mirror-field");
+    const syncOptions = el(root, "details", undefined, "st-settings-disclosure st-source-sync-options");
+    el(syncOptions, "summary", "Sync and Digests");
+    const sharedMirrorField = el(syncOptions, "div", undefined, "st-shared-mirror-field");
     void this.renderSharedMirrors(sharedMirrorField, r);
 
-    const digestSection = el(root, "section", undefined, "st-form-section st-digest-settings");
-    el(digestSection, "h2", "Digests", "st-section-heading");
+    const digestSection = el(syncOptions, "section", undefined, "st-digest-settings");
     const digestRule = r as FolderRule & { digestCategoryName?: string };
     const hasDigestCategoryOverride = typeof digestRule.digestCategoryName === "string";
     this.toggle(
@@ -2275,14 +2636,14 @@ class MirrorsModal extends Modal {
     }
 
     const outputSection = el(root, "section", undefined, "st-form-section st-output-section");
-    el(outputSection, "h2", "Markdown", "st-section-heading");
+    sectionHeading(outputSection, "Markdown output", "file-text");
     const outputChoice = el(outputSection, "div", undefined, "st-output-choice");
     const outputFolderInput = this.text(
       outputChoice,
       "Output folder",
       r.output,
       (v) => (r.output = v),
-      `Transcripts stay under Supernote Transcripts. Plugin support data lives in ${this.supportFolderPath()}, which can sync with the vault and can be excluded from Search.`,
+      "Markdown transcripts are saved here inside the vault.",
     );
     const outputField = outputFolderInput.closest<HTMLElement>(".st-field");
     outputField?.classList.add("st-output-folder-field");
@@ -2303,7 +2664,7 @@ class MirrorsModal extends Modal {
       "st-button st-text-button",
     );
     const transcription = el(root, "section", undefined, "st-form-section st-recognition-section");
-    el(transcription, "h2", "Recognition", "st-section-heading");
+    sectionHeading(transcription, "Recognition", "scan-text");
     const ruleWithAutomatic = r as FolderRule & { autoRecognize?: boolean };
     this.toggle(
       transcription,
@@ -2425,12 +2786,10 @@ class MirrorsModal extends Modal {
       "st-button st-text-button",
     );
 
-    if (this.editorUsesGeneral) {
-      sourceOverrides.classList.add("st-inactive");
-      (Array.from(sourceOverrides.querySelectorAll("input, select, textarea, button")) as Array<HTMLInputElement | HTMLSelectElement | HTMLTextAreaElement | HTMLButtonElement>).forEach((control) => { control.disabled = true; });
-      instructions.classList.add("st-inactive");
-      (Array.from(instructions.querySelectorAll("input, select, textarea, button")) as Array<HTMLInputElement | HTMLSelectElement | HTMLTextAreaElement | HTMLButtonElement>).forEach((control) => { control.disabled = true; });
-    }
+    sourceOverrides.hidden = this.editorUsesGeneral;
+    instructions.hidden = this.editorUsesGeneral;
+    root.append(outputSection);
+    root.append(syncOptions);
 
     const sourceState = this.displayStore.notebooks[r.source];
     if (r.source.toLowerCase().endsWith(".note") && sourceState) {
@@ -2448,9 +2807,16 @@ class MirrorsModal extends Modal {
       () => this.removeRule(),
       "st-button st-danger",
     );
+    this.organizeFormRows(root, ".st-form-section > .st-check-row, .st-source-header > .st-check-row, .st-source-profile-mode > .st-check-row, .st-source-profile-overrides > .st-field, .st-source-scope > .st-check-row, .st-guidance-section > .st-field, .st-output-choice > .st-field, .st-digest-settings > :is(.st-field, .st-check-row)");
     const actions = el(this.footer, "div", undefined, "st-actions");
-    btn(actions, "Cancel", () => this.goHome(), "st-button st-text-button");
+    btn(actions, "Cancel", () => this.finishSourceEditor(), "st-button st-text-button");
     btn(actions, "Save", () => void this.saveRule(), "st-button st-primary");
+  }
+  private finishSourceEditor() {
+    const returnToPicker = this.returnToPicker;
+    this.returnToPicker = undefined;
+    if (returnToPicker) returnToPicker();
+    else this.goHome();
   }
   private sourceEditorDraftDirty() {
     const draft = this.editorRule;
@@ -2753,7 +3119,7 @@ class MirrorsModal extends Modal {
         else this.c.config.rules[i] = r;
         await this.saveConfigQueued();
         new Notice("Source saved");
-        this.goHome();
+        this.finishSourceEditor();
       } catch (e) {
         rollbackConfigEntry(this.c.config.rules, r.id, r, priorRule, priorRuleIndex);
         if (customProfileId)
@@ -2784,7 +3150,7 @@ class MirrorsModal extends Modal {
       const [removed] = this.c.config.rules.splice(i, 1);
       try {
         await this.saveConfigQueued();
-        this.goHome();
+        this.finishSourceEditor();
       } catch (error) {
         rollbackConfigEntry(this.c.config.rules, removed.id, undefined, removed, i);
         new Notice(err(error));
@@ -2811,7 +3177,7 @@ class MirrorsModal extends Modal {
       id: crypto.randomUUID(),
       enabled: true,
       source: path,
-      output: TRANSCRIPTS_ROOT,
+      output: (this.c.config as typeof this.c.config & { defaultOutput?: string }).defaultOutput ?? TRANSCRIPTS_ROOT,
       recursive: !path.toLowerCase().endsWith(".note"),
       exclude: [],
       profileId: p.id,
@@ -2865,7 +3231,7 @@ class MirrorsModal extends Modal {
         id: crypto.randomUUID(),
         enabled: true,
         source,
-        output: TRANSCRIPTS_ROOT,
+        output: (this.c.config as typeof this.c.config & { defaultOutput?: string }).defaultOutput ?? TRANSCRIPTS_ROOT,
         recursive: !source.toLowerCase().endsWith(".note"),
         exclude: [],
         profileId: profile.id,
@@ -2892,59 +3258,187 @@ class MirrorsModal extends Modal {
     });
     if (pending) await pending;
   }
-  private async renderBrowser() {
+  private async registerBrowserSource() {
+    if (this.browserFrom !== "add" || this.browserRegistering) return;
+    const selection = this.browserSelection ?? { path: this.browserPath, kind: "folder" as const };
+    const operationId = ++this.browserOperationId;
+    const register = this.c.registerSource;
+    if (!register) {
+      if (selection.kind === "file") this.addSource(selection.path);
+      else this.addSource(selection.path);
+      return;
+    }
+    this.browserRegistering = true;
+    this.browserError = "";
+    this.render();
+    try {
+      const result = await register.call(this.c, selection);
+      const rule = this.c.config.rules.find((item) => item.id === result.ruleId);
+      if (operationId !== this.browserOperationId || this.screen !== "browser" || this.browserFrom !== "add") {
+        new Notice(result.status === "added" ? "Source added. No pages were processed." : "Source is already covered by an existing configuration.");
+        return;
+      }
+      if (result.status === "added") {
+        this.browserRegistering = false;
+        this.screen = this.browserReturnScreen;
+        this.render();
+        new Notice("Source added. No pages were processed.");
+        return;
+      }
+      if (rule) {
+        this.browserRegistering = false;
+        this.openEditor(rule);
+        new Notice(result.status === "existing"
+          ? "This source already exists. You can configure it here."
+          : `This selection overlaps ${base(rule.source)}. Configure the existing source here.`);
+        return;
+      }
+      throw new Error("The matching source could not be found. Reopen Sources and try again.");
+    } catch (error) {
+      if (operationId !== this.browserOperationId || this.screen !== "browser" || this.browserFrom !== "add") {
+        new Notice(`Could not add source: ${err(error)}`);
+        return;
+      }
+      this.browserError = err(error);
+      this.browserRegistering = false;
+      if (this.screen === "browser") this.render();
+      else new Notice(`Could not add source: ${err(error)}`);
+    }
+  }
+  private async transcribeBrowserSelection() {
+    if (this.browserFrom !== "transcribe" || this.browserRegistering) return;
+    const selection = this.browserSelection ?? { path: this.browserPath, kind: "folder" as const };
+    const operationId = ++this.browserOperationId;
+    const transcribe = this.c.transcribeSelection;
+    if (!transcribe) {
+      this.browserError = "Transcription is unavailable in this runtime.";
+      this.render();
+      return;
+    }
+    this.browserRegistering = true;
+    this.browserError = "";
+    this.render();
+    try {
+      await transcribe.call(this.c, selection, this.transcriptionOptionsFor(selection));
+      if (operationId !== this.browserOperationId || this.screen !== "browser" || this.browserFrom !== "transcribe") {
+        new Notice("Transcription queued. Follow progress in Queue.");
+        return;
+      }
+      this.browserRegistering = false;
+      this.openQueue();
+    } catch (error) {
+      if (operationId !== this.browserOperationId || this.screen !== "browser" || this.browserFrom !== "transcribe") {
+        new Notice(`Could not start transcription: ${err(error)}`);
+        return;
+      }
+      this.browserError = err(error);
+      this.browserRegistering = false;
+      if (this.screen === "browser") this.render();
+    }
+  }
+  private selectionHasBoundOutput(selection: { path: string; kind: "file" | "folder" }) {
+    let selected: string;
+    try { selected = normalizeBrowserPath(selection.path); }
+    catch { return true; }
+    const key = (path: string) => {
+      const normalized = normalizeBrowserPath(path);
+      return /^[A-Za-z]:\//.test(normalized) ? normalized.toLocaleLowerCase() : normalized;
+    };
+    const selectedKey = key(selected);
+    const overlaps = (path: string) => {
+      try {
+        const source = key(path);
+        return selectedKey === source || selectedKey.startsWith(`${source}/`) || source.startsWith(`${selectedKey}/`);
+      } catch { return true; }
+    };
+    return this.c.config.rules.some(rule => overlaps(rule.source)) ||
+      Object.values(this.displayStore.notebooks).some(state => !!state.publishedHash && overlaps(state.source));
+  }
+  private transcriptionOptionsFor(selection: { path: string; kind: "file" | "folder" }): TranscriptionOptions {
+    const options = { ...this.transcriptionOptionsDraft };
+    if (selection.kind === "file") delete options.recursive;
+    if (this.selectionHasBoundOutput(selection)) delete options.output;
+    for (const key of Object.keys(options) as Array<keyof TranscriptionOptions>)
+      if (options[key] === undefined) delete options[key];
+    return options;
+  }
+  private updateTranscriptionOptions(patch: Partial<TranscriptionOptions>) {
+    for (const key of Object.keys(patch) as Array<keyof TranscriptionOptions>) {
+      const value = patch[key];
+      if (value === undefined) delete this.transcriptionOptionsDraft[key];
+      else this.transcriptionOptionsDraft[key] = value as never;
+    }
+  }
+  private async renderBrowser(scroll: number) {
     const token = ++this.browserToken;
     const root = el(this.body, "section", undefined, "st-browser");
+    const navigation = el(root, "div", undefined, "st-browser-navigation");
     if (this.isDesktop()) {
-      const breadcrumbs = el(root, "nav", undefined, "st-browser-breadcrumbs");
+      const breadcrumbs = el(navigation, "nav", undefined, "st-browser-breadcrumbs");
       breadcrumbs.setAttribute("aria-label", "Source folder path");
+      const glyph = el(breadcrumbs, "span", undefined, "st-source-icon");
+      glyph.setAttribute("aria-hidden", "true");
+      setIcon(glyph, "folder");
       const crumbs = browserBreadcrumbs(this.browserPath);
-      for (const [index, crumb] of crumbs.entries()) {
+      const visibleCrumbs = this.browserFrom === "edit" ? crumbs : crumbs.slice(-3);
+      for (const [index, crumb] of visibleCrumbs.entries()) {
         if (index) el(breadcrumbs, "span", "›", "st-browser-separator");
-        if (index === crumbs.length - 1) {
+        if (index === visibleCrumbs.length - 1) {
           const current = el(breadcrumbs, "span", crumb.label, "st-browser-current");
           current.setAttribute("aria-current", "location");
-        } else
-          btn(
+          current.title = this.browserPath;
+        } else {
+          const crumbButton = btn(
             breadcrumbs,
             crumb.label,
             () => {
               this.browserPath = crumb.path;
+              this.browserSelection = undefined;
+              this.browserFocusPath = "";
               this.browserError = "";
               this.render();
             },
             "st-browser-crumb",
           );
+          crumbButton.disabled = this.browserRegistering;
+        }
       }
-    } else el(root, "p", this.sourceLabel(this.browserPath), "st-breadcrumb");
-    el(
-      root,
-      "p",
-      this.browserFrom === "add"
-        ? "Open a folder to browse. Select a notebook row to configure it; Mirror actions add immediately with defaults."
-        : "Choose a folder or notebook, then Save on the previous screen to apply the source change.",
-      "st-caption st-browser-help",
-    );
+    } else {
+      const location = el(navigation, "nav", this.sourceLabel(this.browserPath), "st-browser-location");
+      location.setAttribute("aria-label", "Current source folder");
+    }
+    if (this.browserFrom === "edit")
+      el(root, "p", "Choose a folder or notebook, then save the source settings.", "st-caption st-browser-help");
+    const tools = el(root, "div", undefined, "st-browser-tools");
+    const options = el(tools, "div", undefined, "st-browser-options");
     if (this.isDesktop()) {
+      const pathTools = el(options, "details", undefined, "st-browser-path-tools");
+      pathTools.open = !!this.sourcePathDraft;
+      el(pathTools, "summary", "Enter a path");
+      const pathControls = el(pathTools, "div", undefined, "st-browser-typed-path");
       const path = this.text(
-        root,
+        pathControls,
         "Source path",
         this.sourcePathDraft,
         (v) => (this.sourcePathDraft = v),
-        "Enter a folder or .note path on this computer or in a synced folder.",
       );
-      path.placeholder = "C:/Notes/Supernote or /home/name/Notes/Supernote";
-      const pathActions = el(root, "div", undefined, "st-browser-path-actions");
-      const pathAction = btn(pathActions, "Open folder", () => {
+      path.placeholder = "Absolute folder or .note path";
+      path.disabled = this.browserRegistering;
+      const pathAction = btn(pathControls, "Open folder", () => {
         const value = this.sourcePathDraft.trim();
         if (!value) {
-          this.browserError = "Enter a folder or notebook path first.";
+          this.browserError = "Enter an absolute folder or notebook path first.";
           this.render();
           return;
         }
         if (value.toLowerCase().endsWith(".note")) {
-          if (this.browserFrom === "add") void this.quickAddSource(value);
-          else this.chooseFile(value);
+          if (this.browserFrom !== "edit") {
+            try {
+              this.browserSelection = { path: normalizeBrowserPath(value), kind: "file" };
+              this.browserError = "";
+              this.render();
+            } catch (error) { this.browserError = err(error); this.render(); }
+          } else this.chooseFile(value);
         } else this.browseTypedPath();
       }, "st-button st-text-button");
       const updatePathAction = () => {
@@ -2952,43 +3446,84 @@ class MirrorsModal extends Modal {
         setText(
           pathAction,
           isNotebook
-            ? this.browserFrom === "add" ? "Mirror notebook" : "Use notebook"
+            ? this.browserFrom !== "edit" ? "Select notebook" : "Use notebook"
             : "Open folder",
         );
       };
       path.addEventListener("input", updatePathAction);
       updatePathAction();
+      pathAction.disabled = this.browserRegistering;
     }
-    const actions = el(this.footer, "div", undefined, "st-actions");
-    if (this.browserFrom === "add")
-      el(actions, "small", "Uses your default recognition settings. Configure each source afterward.", "st-caption st-browser-action-note");
-    btn(
-      actions,
-      this.browserFrom === "add" ? "Mirror this folder" : "Choose this folder",
-      () => {
-        if (this.browserFrom === "add")
-          void this.quickAddSource(this.browserPath);
-        else this.chooseFolder();
-      },
-      "st-button st-primary",
-    );
-    if (
-      this.browserPath !== this.browserRootPath &&
-      !isBrowserRoot(this.browserPath)
-    )
-      btn(
-        root,
-        "Parent folder",
+    if (this.browserFrom === "transcribe") {
+      const selection = this.browserSelection ?? { path: this.browserPath, kind: "folder" as const };
+      const runOptions = renderRunOptions({
+        container: options,
+        selection,
+        draft: this.transcriptionOptionsDraft,
+        profiles: this.c.config.profiles,
+        promptLibrary: this.c.promptLibrary,
+        allowOutputOverride: !this.selectionHasBoundOutput(selection),
+        disabled: this.browserRegistering,
+        onChange: (patch) => this.updateTranscriptionOptions(patch),
+      });
+      runOptions.open = this.transcriptionOptionsOpen;
+      runOptions.addEventListener("toggle", () => {
+        if (runOptions.isConnected) this.transcriptionOptionsOpen = runOptions.open;
+      });
+    }
+    const actions = el(this.footer, "div", undefined, `st-actions${this.browserFrom !== "edit" ? " st-source-picker-footer" : ""}`);
+    if (this.browserFrom === "add") {
+      const target = this.browserSelection?.path ?? this.browserPath;
+      const label = el(actions, "small", `${this.browserSelection ? "Notebook" : "Folder"} · ${base(target)}`, "st-caption st-browser-action-note st-source-picker-target");
+      label.title = this.sourceLabel(target);
+      const add = btn(actions, this.browserRegistering ? "Adding source…" : "Add source", () => {
+        void this.registerBrowserSource();
+      }, "st-button st-primary st-source-picker-add");
+      const rootFolder = !this.browserSelection && isBrowserRoot(this.browserPath);
+      add.disabled = this.browserRegistering || rootFolder;
+      if (rootFolder) add.title = "Choose a folder below this root to add a source.";
+      add.dataset.sourceTarget = target;
+    } else if (this.browserFrom === "transcribe") {
+      const target = this.browserSelection?.path ?? this.browserPath;
+      const label = el(actions, "small", `${this.browserSelection ? "Notebook" : "Folder"} · ${base(target)}`, "st-caption st-browser-action-note st-source-picker-target");
+      label.title = this.sourceLabel(target);
+      const run = btn(actions, this.browserRegistering ? "Starting transcription…" : "Transcribe", () => {
+        void this.transcribeBrowserSelection();
+      }, "st-button st-primary st-source-picker-add st-source-picker-transcribe");
+      const rootFolder = !this.browserSelection && isBrowserRoot(this.browserPath);
+      run.disabled = this.browserRegistering || rootFolder;
+      if (rootFolder) run.title = "Choose a folder below this root to transcribe.";
+      run.dataset.sourceTarget = target;
+    } else {
+      btn(actions, "Choose this folder", () => this.chooseFolder(), "st-button st-primary");
+    }
+    const canGoParent = this.browserPath !== this.browserRootPath && !isBrowserRoot(this.browserPath);
+    if (canGoParent) {
+      const parentButton = btn(
+        tools,
+        "Up",
         () => {
+          const child = this.browserPath;
           this.browserPath = this.isDesktop()
             ? parentBrowserPath(this.browserPath)
             : this.parentSourcePath(this.browserPath);
+          this.browserFocusPath = child;
+          this.browserSelection = undefined;
           this.render();
         },
-        "st-button st-text-button",
+        "st-button st-text-button st-browser-parent",
       );
+      parentButton.disabled = this.browserRegistering;
+      parentButton.setAttribute("aria-label", "Up one folder");
+      tools.prepend(parentButton);
+    }
     const error = el(root, "p", this.browserError, "st-error");
-    const list = el(root, "div", undefined, "st-browser-list");
+    const list = el(root, "div", undefined, "st-browser-list st-browser-results");
+    list.setAttribute("role", "list");
+    list.setAttribute("aria-label", "Folders and notebooks");
+    list.setAttribute("aria-live", "polite");
+    list.setAttribute("aria-busy", "true");
+    el(list, "p", "Loading folders and notebooks…", "st-empty st-browser-loading");
     try {
       const fs = this.isDesktop()
         ? require("fs").promises
@@ -3032,6 +3567,8 @@ class MirrorsModal extends Modal {
         }),
       );
       if (token !== this.browserToken || this.screen !== "browser") return;
+      list.empty();
+      list.setAttribute("aria-busy", "false");
       const visible = mapped.filter(Boolean) as {
         name: string;
         path: string;
@@ -3045,7 +3582,6 @@ class MirrorsModal extends Modal {
       for (const entry of visible) {
         const directory = entry.type === "directory";
         const desktop = this.isDesktop();
-        const hasMirrorAction = this.browserFrom === "add";
         const parentRule = ruleFor(entry.path, this.c.config.rules);
         const directRule = this.c.config.rules.find((rule) => {
           try {
@@ -3064,68 +3600,103 @@ class MirrorsModal extends Modal {
             ? parentRule.recursive
             : parentRule.recursive || !relative.includes("/"));
         const mirroredBy = directRule ?? (parentIncludesEntry ? parentRule : undefined);
-        const row = hasMirrorAction
-          ? el(list, "div", undefined, "st-browser-entry-row")
-          : list;
+        const row = el(list, "div", undefined, "st-browser-entry-row");
+        row.setAttribute("role", "listitem");
+        row.classList.toggle("is-saved", !!directRule);
         const button = btn(
           row,
           "",
           () => {
-            if (!directory) return this.chooseFile(entry.path);
+            if (!directory) {
+              if (this.browserFrom !== "edit") {
+                this.browserSelection = { path: entry.path, kind: "file" };
+                this.browserFocusPath = entry.path;
+                this.browserError = "";
+                this.render();
+              } else this.chooseFile(entry.path);
+              return;
+            }
             this.browserPath = entry.path;
+            this.browserFocusPath = "";
+            this.browserSelection = undefined;
             this.browserError = "";
             this.render();
           },
-          desktop ? "st-browser-entry" : "st-browser-entry",
+          "st-browser-entry",
         );
         button.title = entry.path;
+        button.dataset.path = entry.path;
+        button.tabIndex = -1;
+        button.disabled = this.browserRegistering;
+        button.setAttribute("aria-label", directory
+          ? `Open folder ${entry.name}`
+          : `Select notebook ${entry.name}`);
+        if (!directory && this.browserFrom !== "edit")
+          button.setAttribute("aria-pressed", String(this.browserSelection?.path === entry.path));
         const glyph = el(button, "span", undefined, "st-source-icon");
         glyph.setAttribute("aria-hidden", "true");
         setIcon(glyph, directory ? "folder" : "file-text");
         if (desktop) {
           const copy = el(button, "span", undefined, "st-browser-entry-copy");
           el(copy, "span", entry.name.replace(/\.note$/i, ""), "st-browser-entry-name");
-          el(
-            copy,
-            "small",
-            directory
-              ? mirroredBy
-                ? `Folder · ${mirroredBy.source === entry.path ? "already mirrored" : `mirrored by ${base(mirroredBy.source)}`}`
-                : "Folder · browse or mirror"
-              : mirroredBy
-                ? `Supernote notebook · ${mirroredBy.source === entry.path ? "already mirrored" : `mirrored by ${base(mirroredBy.source)}`}`
-                : "Supernote notebook · select or mirror",
-            "st-browser-entry-status",
-          );
+          if (mirroredBy) {
+            const badge = directRule ? "Saved" : `In ${base(mirroredBy.source)}`;
+            el(copy, "small", badge, "st-browser-entry-status");
+            button.setAttribute("aria-description", directRule ? "Saved source" : badge);
+          }
         } else el(button, "span", entry.name.replace(/\.note$/i, ""));
         const arrow = el(button, "span", undefined, "st-entry-arrow");
         arrow.setAttribute("aria-hidden", "true");
-        setIcon(arrow, "chevron-right");
-        if (hasMirrorAction) {
-          const action = btn(
-            row,
-            mirroredBy ? "Configure" : "Mirror",
-            () => {
-              if (mirroredBy) {
-                this.openEditor(mirroredBy);
-                return;
-              }
-              void this.quickAddSource(entry.path);
-            },
-            `st-button st-browser-source-action ${mirroredBy ? "st-browser-configure" : "st-browser-mirror"}`,
-          );
-          if (!mirroredBy) setText(action, "Mirror");
-          else action.setAttribute("aria-current", "true");
-          action.title = mirroredBy
-            ? `Configure ${base(mirroredBy.source)}`
-            : `Add ${entry.name.replace(/\.note$/i, "")} as a mirror`;
+        setIcon(arrow, directory ? "chevron-right" : this.browserSelection?.path === entry.path ? "check" : "circle");
+        if (this.browserFrom !== "edit" && mirroredBy) {
+          const action = iconButton(row, "settings", `Configure ${base(mirroredBy.source)}`, () => {
+            this.browserFocusPath = entry.path;
+            this.openEditor(mirroredBy);
+          }, "st-browser-configure");
+          action.disabled = this.browserRegistering;
+          action.title = `Configure ${base(mirroredBy.source)}`;
         }
       }
       if (!visible.length)
-        el(list, "p", "No notebooks or folders here.", "st-empty");
+        el(list, "p", "No notebooks or folders here.", "st-empty st-browser-empty");
+      list.addEventListener("keydown", (event: KeyboardEvent) => {
+        if (this.browserRegistering) return;
+        const entries = Array.from(list.querySelectorAll("button.st-browser-entry")) as HTMLButtonElement[];
+        if (!entries.length) return;
+        const current = entries.indexOf(list.ownerDocument.activeElement as HTMLButtonElement);
+        let next = current;
+        if (event.key === "ArrowDown") next = Math.min(entries.length - 1, Math.max(0, current + 1));
+        else if (event.key === "ArrowUp") next = Math.max(0, current < 0 ? 0 : current - 1);
+        else if (event.key === "Home") next = 0;
+        else if (event.key === "End") next = entries.length - 1;
+        else if (event.key === "Escape" && this.browserPath !== this.browserRootPath && !isBrowserRoot(this.browserPath)) {
+          event.preventDefault();
+          const child = this.browserPath;
+          this.browserPath = this.isDesktop() ? parentBrowserPath(child) : this.parentSourcePath(child);
+          this.browserFocusPath = child;
+          this.browserSelection = undefined;
+          this.render();
+          return;
+        } else return;
+        event.preventDefault();
+        entries.forEach((entry, index) => { entry.tabIndex = index === next ? 0 : -1; });
+        entries[next].focus();
+      });
+      const buttons = Array.from(list.querySelectorAll("button.st-browser-entry")) as HTMLButtonElement[];
+      if (buttons.length) {
+        const focus = buttons.find((button) => button.dataset.path === this.browserFocusPath) ?? buttons[0];
+        buttons.forEach((button) => { button.tabIndex = button === focus ? 0 : -1; });
+        this.body.scrollTop = scroll;
+        focus.focus({ preventScroll: true });
+        this.browserFocusPath = "";
+      }
     } catch (e) {
-      if (token === this.browserToken && this.screen === "browser")
-        setText(error, err(e));
+      if (token === this.browserToken && this.screen === "browser") {
+        list.empty();
+        list.setAttribute("aria-busy", "false");
+        el(list, "p", err(e), "st-error st-browser-load-error");
+        btn(list, "Retry", () => { this.browserError = ""; this.render(); }, "st-button st-text-button st-browser-retry");
+      }
     }
   }
   private async renderOutputFolders() {
@@ -3170,13 +3741,14 @@ class MirrorsModal extends Modal {
       actions,
       "Cancel",
       () => {
-        this.screen = this.folderPickerPurpose === "support" ? "settings" : "editor";
+        this.screen = this.folderPickerPurpose === "output" ? "editor" : "settings";
         if (this.folderPickerPurpose === "support") this.settingsTab = "storage";
+        if (this.folderPickerPurpose === "default-output") this.settingsTab = "connection";
         this.render();
       },
       "st-button st-text-button",
     );
-    if (this.folderPickerPurpose === "output")
+    if (this.folderPickerPurpose !== "support")
       btn(actions, "Create", () => this.openOutputFolderCreate(), "st-button st-text-button st-create-folder-open");
     const choose = btn(
       actions,
@@ -3188,6 +3760,12 @@ class MirrorsModal extends Modal {
           if (!d) return;
           d.supportFolder = this.outputPickerPath;
           this.settingsTab = "storage";
+          this.screen = "settings";
+        } else if (this.folderPickerPurpose === "default-output") {
+          const d = this.settingsDraft;
+          if (!d) return;
+          d.defaultOutput = this.outputPickerPath;
+          this.settingsTab = "connection";
           this.screen = "settings";
         } else {
           if (!this.editorRule) return;
@@ -3264,7 +3842,7 @@ class MirrorsModal extends Modal {
     const path = [parentPath, name].filter(Boolean).join("/");
     try {
       validateDestination(path);
-      if (this.isOperationalDataPath(path)) throw new Error("The support folder is reserved for plugin data.");
+      if (this.isOperationalDataPath(path)) throw new Error("This folder is reserved for plugin data.");
       if (this.app.vault.getAbstractFileByPath(path))
         throw new Error("A file or folder with that name already exists here.");
       this.outputFolderCreateBusy = true;
@@ -3370,6 +3948,8 @@ class MirrorsModal extends Modal {
         this.browserError = "This is a notebook file. Use this path to select the notebook.";
       } else {
         this.browserPath = path;
+        this.browserSelection = undefined;
+        this.browserFocusPath = "";
         this.browserError = "";
       }
     } catch (error) {
@@ -3494,7 +4074,7 @@ class MirrorsModal extends Modal {
   private renderSettings() {
     const d = this.settingsDraft;
     if (!d) return;
-    const root = el(this.body, "section", undefined, "st-form");
+    const root = el(this.body, "section", undefined, "st-form st-form-layout st-settings-layout");
     const tabList = el(root, "nav", undefined, "st-view-tabs st-settings-tabs");
     tabList.setAttribute("role", "tablist");
     tabList.setAttribute("aria-label", "Settings sections");
@@ -3530,7 +4110,6 @@ class MirrorsModal extends Modal {
     const updatesPanel = addPanel("updates", "Updates");
     const storagePanel = addPanel("storage", "Storage");
     const connection = el(connectionPanel, "section", undefined, "st-settings-section st-settings-connection");
-    el(connection, "h2", "Connection", "st-section-heading");
     const controller = this.c as Controller & {
       provider?: "api" | "subscription";
       concurrency?: number;
@@ -3565,17 +4144,17 @@ class MirrorsModal extends Modal {
       },
       d.provider === "subscription"
         ? "Choose which account or key handles recognition. ChatGPT manages plan allowance; this plugin tracks local attempts and cannot show remaining quota."
-        : "Choose which account or key handles recognition.",
+        : undefined,
     );
     if (d.provider === "api") {
-      this.input(
+      const key = this.input(
         connection,
         "API key",
         d.apiKey,
         "password",
         (v) => (d.apiKey = v),
-        "Stored on this device",
       );
+      el(key.parentElement!, "small", this.c.apiKey ? "Saved on this device" : "No API key saved", "st-setting-description");
     } else {
       const status = controller.subscriptionStatus;
       const isDesktop = controller.platform === "desktop";
@@ -3781,8 +4360,29 @@ class MirrorsModal extends Modal {
         }
       }
     }
+    const defaultOutputInput = this.text(
+      connection,
+      "Default transcript folder",
+      d.defaultOutput,
+      (value) => { d.defaultOutput = value; },
+      "Used for new sources and unbound transcripts. Existing sources keep their saved transcript folders.",
+    );
+    const defaultOutputField = defaultOutputInput.closest<HTMLElement>(".st-field");
+    defaultOutputField?.classList.add("st-default-output-field");
+    const defaultOutputControls = el(defaultOutputField ?? connection, "div", undefined, "st-default-output-controls");
+    defaultOutputControls.append(defaultOutputInput);
+    btn(defaultOutputControls, "Choose folder", () => {
+      this.folderPickerPurpose = "default-output";
+      this.outputPickerPath = "";
+      this.outputFolderSearch = "";
+      this.browserError = "";
+      this.screen = "output-folders";
+      this.render();
+    }, "st-button st-text-button st-default-output-choose");
+    const usage = el(connectionPanel, "section", undefined, "st-form-section st-settings-section st-settings-costs");
+    el(usage, "h2", "Usage and costs", "st-section-heading");
+    btn(usage, "Review Costs", () => this.openCosts(), "st-button st-text-button st-settings-review-costs");
     const runBehavior = el(updatesPanel, "section", undefined, "st-form-section st-settings-section st-run-behavior");
-    el(runBehavior, "h2", "Updates", "st-section-heading");
     this.toggle(
       runBehavior,
       "AI recognition",
@@ -3803,14 +4403,20 @@ class MirrorsModal extends Modal {
     const general = d.profiles.find((p) => p.id === "general") ?? d.profiles[0];
     if (general) {
       const defaults = el(recognitionPanel, "section", undefined, "st-form-section st-settings-section st-recognition-defaults");
-      el(defaults, "h2", "Recognition", "st-section-heading");
-      el(defaults, "p", "Used by sources without custom recognition settings.", "st-caption st-section-help");
       this.modelPicker(defaults, "Default model", general.model, (v) => (general.model = v));
       this.qualitySlider(defaults, general.quality ?? "fast", (value) => { general.quality = value; });
-      this.text(defaults, "Responses API endpoint", general.endpoint, (v) => (general.endpoint = v), "Use the provider Responses API endpoint.");
+      const advanced = el(recognitionPanel, "details", undefined, "st-settings-disclosure");
+      advanced.open = this.settingsAdvancedOpen;
+      advanced.addEventListener("toggle", () => { if (advanced.isConnected) this.settingsAdvancedOpen = advanced.open; });
+      el(advanced, "summary", "Advanced recognition");
+      const advancedRows = el(advanced, "div", undefined, "st-settings-section");
+      this.text(advancedRows, "Responses API endpoint", general.endpoint, (v) => (general.endpoint = v));
+      const transientRetries = this.number(advancedRows, "Transient retries", d.transientRetries, 0, 5, (value) => { d.transientRetries = value; });
+      const retryField = transientRetries.closest<HTMLElement>(".st-field");
+      if (retryField) this.help(retryField, "Automatically retries temporary connection or service failures. Set to 0 to disable retries.", "Transient retries");
       const formattingEnabled = general.preserveFormatting ?? true;
       this.toggle(
-        defaults,
+        advancedRows,
         "Recognize handwriting formatting",
         formattingEnabled,
         (value) => {
@@ -3821,7 +4427,7 @@ class MirrorsModal extends Modal {
         "Recognizes marked headings, bold, strikethrough, highlights, underlines and clear hand-drawn tables while keeping paragraphs readable.",
       );
       const formattingGuide = this.textarea(
-        defaults,
+        advancedRows,
         "Formatting cues",
         general.formattingGuide ?? DEFAULT_FORMATTING_GUIDE,
         (value) => { general.formattingGuide = value; },
@@ -3830,9 +4436,14 @@ class MirrorsModal extends Modal {
       formattingGuide.maxLength = 10_000;
       formattingGuide.disabled = !formattingEnabled;
     }
-    const cleanupDefaults = el(recognitionPanel, "section", undefined, "st-form-section st-settings-section st-cleanup-defaults");
-    el(cleanupDefaults, "h2", "Document cleanup", "st-section-heading");
-    el(cleanupDefaults, "p", "Used for every cleanup run. Per-run instructions are added to this guidance.", "st-caption st-section-help");
+    const library = el(recognitionPanel, "section", undefined, "st-form-section st-settings-section st-settings-prompts");
+    el(library, "h2", "Prompts", "st-section-heading");
+    if (this.c.promptLibrary)
+      btn(library, "Open prompt library", () => { this.screen = "prompts"; this.render(); }, "st-button st-text-button st-prompt-library-open");
+    else
+      el(library, "p", "Saved prompt templates are unavailable.", "st-caption");
+    const cleanupDefaults = el(library, "details", undefined, "st-settings-disclosure st-cleanup-defaults");
+    el(cleanupDefaults, "summary", "Default cleanup instructions");
     const defaultCleanupPrompt = this.textarea(cleanupDefaults, "Default cleanup instructions", d.cleanupPrompt, (value) => { d.cleanupPrompt = value; });
     defaultCleanupPrompt.maxLength = 20000;
     const presentation = el(recognitionPanel, "section", undefined, "st-form-section st-settings-section st-settings-presentation");
@@ -3885,6 +4496,7 @@ class MirrorsModal extends Modal {
     );
     el(storage, "p", "Review saved recognition history and cached source data. Cleanup is always started manually.", "st-caption");
     btn(storage, "Review storage", () => this.openStorage(), "st-button st-text-button st-review-storage");
+    this.organizeFormRows(root, ".st-settings-section > .st-field, .st-settings-section > .st-check-row");
     const actions = el(this.footer, "div", undefined, "st-actions");
     btn(
       actions,
@@ -3905,21 +4517,27 @@ class MirrorsModal extends Modal {
             aiEnabled: boolean;
             provider: "api" | "subscription";
             concurrency: number;
+            transientRetries: number;
             storagePreferences?: () => { hideInExplorer: boolean; excludeFromSearch: boolean };
             setStoragePreferences?: (prefs: { hideInExplorer: boolean; excludeFromSearch: boolean }) => Promise<void>;
           };
           const supportFolder = d.supportFolder.trim().replace(/\\/g, "/").replace(/\/+$/, "");
+          const defaultOutput = d.defaultOutput.trim().replace(/\\/g, "/").replace(/\/+$/, "");
           try {
             validateDestination(supportFolder);
             const currentSupportFolder = this.supportFolderPath();
             if (this.isOperationalDataPath(supportFolder) && supportFolder.toLowerCase() !== currentSupportFolder.toLowerCase() && supportFolder.toLowerCase() !== "_supernote")
               throw new Error("Choose a folder outside reserved plugin data locations.");
+            validateDestination(defaultOutput);
+            if (this.isOperationalDataPath(defaultOutput))
+              throw new Error("Choose a transcript folder outside reserved plugin data locations.");
           } catch (error) {
-            new Notice(`Invalid support folder: ${err(error)}`);
+              new Notice(`Invalid folder setting: ${err(error)}`);
             this.setFormControlsDisabled(false);
             return;
           }
           d.supportFolder = supportFolder;
+          d.defaultOutput = defaultOutput;
           const currentStoragePreferences = controller.storagePreferences?.() ?? {
             hideInExplorer: true,
             excludeFromSearch: true,
@@ -3949,6 +4567,7 @@ class MirrorsModal extends Modal {
             autoEnabled: this.c.autoEnabled,
             provider: controller.provider,
             concurrency: controller.concurrency,
+            transientRetries: controller.transientRetries,
             profiles: this.c.config.profiles,
             intervalMinutes: this.c.config.intervalMinutes,
             showPageHeadings: this.c.showPageHeadings,
@@ -3956,23 +4575,37 @@ class MirrorsModal extends Modal {
             automaticCheck: (this.c.config as typeof this.c.config & { automaticCheck?: "new" | "recent" | "all" }).automaticCheck,
             automaticCheckRecentPages: (this.c.config as typeof this.c.config & { automaticCheckRecentPages?: number }).automaticCheckRecentPages,
             supportFolder: (this.c.config as typeof this.c.config & { supportFolder?: string }).supportFolder,
+            defaultOutput: (this.c.config as typeof this.c.config & { defaultOutput?: string }).defaultOutput,
           };
+          const editedCleanup = d.cleanupPrompt !== this.settingsCleanupPromptBaseline;
+          const currentCleanup = previous.cleanupPrompt ?? DEFAULT_CLEANUP_PROMPT;
+          const proposedCleanup = d.cleanupPrompt.trim() || undefined;
+          if (editedCleanup && currentCleanup !== this.settingsCleanupPromptBaseline &&
+              currentCleanup !== (proposedCleanup ?? DEFAULT_CLEANUP_PROMPT)) {
+            new Notice("The default cleanup instructions changed while Settings were open. Reopen Settings to review the new default.");
+            this.setFormControlsDisabled(false);
+            return;
+          }
+          const nextCleanup = editedCleanup ? proposedCleanup : previous.cleanupPrompt;
           const appliedProfiles = JSON.stringify(nextProfiles);
           this.c.apiKey = d.apiKey;
           controller.aiEnabled = d.aiEnabled;
           this.c.autoEnabled = d.autoEnabled;
           controller.provider = d.provider;
           controller.concurrency = d.concurrency;
+          controller.transientRetries = d.transientRetries;
           this.c.config.profiles = nextProfiles;
           this.c.config.intervalMinutes = d.intervalMinutes;
           this.c.showPageHeadings = d.showPageHeadings;
           const configWithCleanup = this.c.config as typeof this.c.config & { cleanupPrompt?: string };
-          configWithCleanup.cleanupPrompt = d.cleanupPrompt.trim() ? d.cleanupPrompt : undefined;
+          configWithCleanup.cleanupPrompt = nextCleanup;
           const automaticConfig = this.c.config as typeof this.c.config & { automaticCheck?: "new" | "recent" | "all"; automaticCheckRecentPages?: number };
           automaticConfig.automaticCheck = d.automaticCheck === "new" ? undefined : d.automaticCheck;
           automaticConfig.automaticCheckRecentPages = d.automaticCheckRecentPages === 5 ? undefined : d.automaticCheckRecentPages;
           const storageConfig = this.c.config as typeof this.c.config & { supportFolder?: string };
           storageConfig.supportFolder = supportFolder === "_supernote" ? undefined : supportFolder;
+          const outputConfig = this.c.config as typeof this.c.config & { defaultOutput?: string };
+          outputConfig.defaultOutput = defaultOutput === TRANSCRIPTS_ROOT ? undefined : defaultOutput;
           let configSaved = false;
           try {
             await this.saveConfigQueued();
@@ -3994,13 +4627,14 @@ class MirrorsModal extends Modal {
             if (this.c.autoEnabled === d.autoEnabled) this.c.autoEnabled = previous.autoEnabled;
             if (controller.provider === d.provider) controller.provider = previous.provider;
             if (controller.concurrency === d.concurrency) controller.concurrency = previous.concurrency;
+            if (controller.transientRetries === d.transientRetries) controller.transientRetries = previous.transientRetries;
             if (JSON.stringify(this.c.config.profiles) === appliedProfiles)
               this.c.config.profiles = previous.profiles;
             if (this.c.config.intervalMinutes === d.intervalMinutes)
               this.c.config.intervalMinutes = previous.intervalMinutes;
             if (this.c.showPageHeadings === d.showPageHeadings)
               this.c.showPageHeadings = previous.showPageHeadings;
-            if (configWithCleanup.cleanupPrompt === (d.cleanupPrompt.trim() ? d.cleanupPrompt : undefined))
+            if (configWithCleanup.cleanupPrompt === nextCleanup)
               configWithCleanup.cleanupPrompt = previous.cleanupPrompt;
             if (automaticConfig.automaticCheck === (d.automaticCheck === "new" ? undefined : d.automaticCheck))
               automaticConfig.automaticCheck = previous.automaticCheck;
@@ -4008,6 +4642,8 @@ class MirrorsModal extends Modal {
               automaticConfig.automaticCheckRecentPages = previous.automaticCheckRecentPages;
             if (storageConfig.supportFolder === (supportFolder === "_supernote" ? undefined : supportFolder))
               storageConfig.supportFolder = previous.supportFolder;
+            if (outputConfig.defaultOutput === (defaultOutput === TRANSCRIPTS_ROOT ? undefined : defaultOutput))
+              outputConfig.defaultOutput = previous.defaultOutput;
             new Notice(err(error));
           } finally {
             this.setFormControlsDisabled(false);
@@ -4017,6 +4653,25 @@ class MirrorsModal extends Modal {
       },
       "st-button st-primary",
     );
+  }
+  private organizeFormRows(root: HTMLElement, rows: string) {
+    for (const row of Array.from(root.querySelectorAll<HTMLElement>(rows))) {
+      const title = row.querySelector(":scope > label, :scope > span");
+      if (!title) continue;
+      const controls = Array.from(row.children);
+      row.classList.remove("st-field");
+      row.classList.add("st-setting-row");
+      const info = el(row, "div", undefined, "st-setting-info");
+      const label = el(info, "div", undefined, "st-setting-label");
+      const control = el(row, "div", undefined, "st-setting-control");
+      label.append(title);
+      for (const child of controls) {
+        if (child === title) continue;
+        if (child.classList.contains("st-help-button")) label.append(child);
+        else if (child.matches(".st-help-text, .st-setting-description")) info.append(child);
+        else control.append(child);
+      }
+    }
   }
   private openStorage() {
     this.storageRequest++;
@@ -4600,25 +5255,33 @@ class MirrorsModal extends Modal {
     }
     if (!states.some((s) => s.source === this.selectedSource))
       this.selectedSource = states[0].source;
-    const select = el(this.body, "label", undefined, "st-field");
-    el(select, "span", "Notebook");
-    const choose = el(select, "select") as HTMLSelectElement;
-    for (const s of states) {
-      const op = el(choose, "option", shortPath(s.source)) as HTMLOptionElement;
-      op.value = s.source;
+    const state = this.displayStore.notebooks[this.selectedSource];
+    const name = (source: string) => base(source).replace(/\.note$/i, "");
+    if (states.length === 1) {
+      sectionHeading(this.body, name(state.source), "book-open");
+    } else {
+      const select = el(this.body, "label", undefined, "st-field st-detail-select");
+      el(select, "span", "Notebook");
+      const choose = el(select, "select") as HTMLSelectElement;
+      for (const s of states) {
+        const label = name(s.source);
+        const duplicates = states.some(other => other.source !== s.source && name(other.source).toLowerCase() === label.toLowerCase());
+        const parent = duplicates ? this.sourceLabel(s.source.slice(0, s.source.lastIndexOf("/"))) : "";
+        const op = el(choose, "option", parent ? `${label} · ${parent}` : label) as HTMLOptionElement;
+        op.value = s.source;
+      }
+      choose.value = this.selectedSource;
+      choose.addEventListener("change", () => {
+        this.selectedSource = choose.value;
+        this.render();
+      });
     }
-    choose.value = this.selectedSource;
-    choose.addEventListener("change", () => {
-      this.selectedSource = choose.value;
-      this.render();
-    });
     this.detailLive = el(this.body, "section", undefined, "st-detail-live");
     this.pageIssuesLive = el(this.body, "section", undefined, "st-page-issues");
     this.refreshPageIssues(this.displayStore.notebooks[this.selectedSource]);
     this.refreshDetail();
     this.renderReconciliationSummary(this.body, this.selectedSource);
     const controls = el(this.body, "section", undefined, "st-detail-controls");
-    const state = this.displayStore.notebooks[this.selectedSource];
     btn(
       this.footer,
       "Open transcript",
@@ -4819,7 +5482,6 @@ class MirrorsModal extends Modal {
   private renderPageReconciliation() {
     const state = this.displayStore.notebooks[this.reconciliationSource];
     const root = el(this.body, "section", undefined, "st-page-reconciliation");
-    el(root, "h2", "Review page changes", "st-section-heading");
     if (!state) {
       el(root, "p", "This notebook is no longer available.", "st-caption");
       btn(this.footer, "Back to notebook", () => this.goBack(), "st-button st-primary");
@@ -4982,15 +5644,21 @@ class MirrorsModal extends Modal {
     const updateActions = el(updateGroup, "div", undefined, "st-document-action-toolbar st-document-action-buttons st-detail-action-grid");
     const controller = this.c as RecognitionNowController;
     const task = this.manualTaskState({ source: state.source });
+    const requestUpdate = state.oneTime
+      ? controller.transcribeSelection && (() => controller.transcribeSelection!({ path: state.source, kind: "file" }))
+      : controller.requestRecognitionNow && (() => controller.requestRecognitionNow!({ source: state.source }));
+    const scoped = !!state.oneTime || this.c.store.queue.some(item => item.source === state.source && item.run);
+    const paused = !!state.paused || (scoped && this.c.queueView.paused.includes(state.source));
+    const needsResume = scoped && paused;
     const checkUpdate = btn(
       updateActions,
       task.active ? "Recognizing…" : task.queued || task.busy ? "Queued" : "Check & update",
       () => {
-        if (!controller.requestRecognitionNow || task.active || task.queued || task.busy || this.c.progress.stateBlocked) return;
+        if (!requestUpdate || task.active || task.queued || task.busy || needsResume || this.c.progress.stateBlocked) return;
         this.recognitionNowBusy.add(task.key);
         checkUpdate.disabled = true;
         setText(checkUpdate, "Queueing…");
-        void controller.requestRecognitionNow({ source: state.source }).then(() => {
+        void requestUpdate().then(() => {
           if (this.screen === "detail" && this.selectedSource === state.source) this.render();
         }).catch((error) => {
           new Notice(`Could not queue notebook update: ${err(error)}`);
@@ -5001,16 +5669,16 @@ class MirrorsModal extends Modal {
       },
       "st-button st-primary st-check-update-action",
     );
-    checkUpdate.disabled = !controller.requestRecognitionNow || task.active || task.queued || task.busy || !!this.c.progress.stateBlocked;
+    checkUpdate.disabled = !requestUpdate || task.active || task.queued || task.busy || needsResume || !!this.c.progress.stateBlocked;
     if (this.c.progress.stateBlocked) checkUpdate.title = this.stateBlockedMessage();
     const rule = this.c.config.rules.find((item) => item.id === state.ruleId);
     const manualActive = this.manualActive(state.source);
-    const pause = btn(updateActions, manualActive || !state.paused ? "Pause recognition" : "Resume recognition", () => {
+    const pause = btn(updateActions, manualActive || !paused ? "Pause recognition" : "Resume recognition", () => {
       const pending = this.actionGate.run(`detail-pause:${state.source}`, async () => {
         pause.disabled = true;
         try {
-          if (this.manualActive(state.source)) await this.c.setNotebookPaused(state.source, true);
-          else await this.c.setNotebookPaused(state.source, !state.paused);
+          if (manualActive || !paused) await this.c.setNotebookPaused(state.source, true);
+          else await this.c.resumeNotebook(state.source);
           if (this.screen === "detail" && this.selectedSource === state.source) this.render();
         } catch (error) {
           new Notice(`Could not change recognition pause: ${err(error)}`);
@@ -5019,15 +5687,15 @@ class MirrorsModal extends Modal {
       });
       if (pending) safe(pending);
     }, "st-button st-pause-recognition-action");
-    pause.setAttribute("aria-pressed", String(manualActive || !!state.paused));
-    pause.disabled = !!this.c.progress.stateBlocked && !!state.paused && !manualActive;
+    pause.setAttribute("aria-pressed", String(manualActive || paused));
+    pause.disabled = !!this.c.progress.stateBlocked && paused && !manualActive;
     if (rule?.paused) pause.title = "Folder automatic updates are paused; Check & update runs this notebook only.";
     if (this.canForceUpdate(state)) {
       const reason = this.forceUpdateReason(state, "This notebook needs attention before its next update.");
       if (reason) el(updateGroup, "p", reason, "st-caption st-attention-reason");
       btn(updateActions, "Force update", () => this.openForceUpdate(state.source), "st-button st-text-button st-force-update-action");
     }
-    btn(updateActions, "Exclude notebook", () => this.openExcludeConfirmation(state.source), "st-button st-danger st-exclude-open");
+    if (!state.oneTime) btn(updateActions, "Exclude notebook", () => this.openExcludeConfirmation(state.source), "st-button st-danger st-exclude-open");
 
     const toolsGroup = el(controls, "section", undefined, "st-document-action-group st-notebook-tools");
     el(toolsGroup, "h2", "Notebook tools", "st-section-heading");
@@ -5054,7 +5722,7 @@ class MirrorsModal extends Modal {
   private savedModelFor(source: string) {
     const state = this.displayStore.notebooks[source];
     const rule = this.c.config.rules.find((item) => item.id === state?.ruleId);
-    const profile = this.c.config.profiles.find((item) => item.id === rule?.profileId) ?? this.c.config.profiles.find((item) => item.id === "general");
+    const profile = this.c.config.profiles.find((item) => item.id === (rule?.profileId ?? state?.oneTime?.profileId)) ?? this.c.config.profiles.find((item) => item.id === "general");
     return profile?.model ?? this.c.config.profiles[0]?.model ?? MODEL_OPTIONS[0];
   }
   private defaultCopyPath(state: Controller["store"]["notebooks"][string]) {
@@ -5078,6 +5746,7 @@ class MirrorsModal extends Modal {
       this.cleanupSaveCopy = false;
       this.cleanupCopyPath = this.defaultCopyPath(this.displayStore.notebooks[source]);
       this.cleanupExtraInstructions = "";
+      this.cleanupPrompt = undefined;
       this.cleanupRemovePageComments = false;
     } else {
       this.reprocessRange = "";
@@ -5118,6 +5787,7 @@ class MirrorsModal extends Modal {
         model: this.cleanupModel,
         extraInstructions: this.cleanupExtraInstructions,
         removePageComments: this.cleanupSaveCopy && this.cleanupRemovePageComments,
+        prompt: this.cleanupPrompt,
       });
       const parts = [`${estimate.pages} page${estimate.pages === 1 ? "" : "s"}`, `${estimate.requests} request${estimate.requests === 1 ? "" : "s"}`];
       if (this.c.provider === "subscription") {
@@ -5130,11 +5800,11 @@ class MirrorsModal extends Modal {
   }
   private renderCleanupWorkflow() {
     const state = this.displayStore.notebooks[this.actionSource];
-    const root = el(this.body, "section", undefined, "st-form st-action-workflow st-cleanup-workflow") as HTMLElement;
+    const root = el(this.body, "section", undefined, "st-form st-form-layout st-action-workflow st-cleanup-workflow") as HTMLElement;
     if (!state) {
       el(root, "p", "This notebook is no longer available.", "st-caption st-attention-reason");
     } else {
-      el(root, "p", "Clean formatting and transcription errors across the document while preserving your wording.", "st-caption");
+      el(root, "p", "Correct formatting and transcription errors while preserving your wording.", "st-caption");
       this.modelPicker(root, "Cleanup model", this.cleanupModel, (model) => {
         this.cleanupModel = model;
         const estimate = root.querySelector(".st-cleanup-estimate") as HTMLElement | null;
@@ -5152,6 +5822,17 @@ class MirrorsModal extends Modal {
         "Added to the saved default cleanup instructions for this run only.",
       );
       extraInstructions.addClass("st-cleanup-instructions");
+      const cleanupPrompt = el(root, "div", undefined, "st-cleanup-prompt");
+      renderPromptRevisionSelect({
+        container: cleanupPrompt,
+        scope: "cleanup",
+        controls: this.c.promptLibrary,
+        value: this.cleanupPrompt,
+        onChange: (prompt) => {
+          this.cleanupPrompt = prompt;
+          updateEstimate();
+        },
+      });
       el(root, "p", this.cleanupEstimateText(state), "st-caption st-queue-estimate st-cleanup-estimate");
       const copyToggle = this.toggle(root, "Save cleaned text as a separate copy", this.cleanupSaveCopy, (value) => {
         this.cleanupSaveCopy = value;
@@ -5160,11 +5841,12 @@ class MirrorsModal extends Modal {
         destinationBlock.hidden = value;
         setText(copyConsequence, value ? "Leaves the original transcript unchanged." : "Replaces this transcript and backs up the previous version.");
         setText(destination, value ? this.cleanupCopyPath.trim() || "Enter a copy path." : state.output);
+        removePageCommentsRow.hidden = !value;
         removePageComments.disabled = !value || this.cleanupBusySource === state.source;
         if (!value) removePageComments.checked = false;
         updateEstimate();
         updateRunState();
-      }, "The original transcript stays unchanged when you save a copy.");
+      });
       copyToggle.dataset.testid = "cleanup-save-copy";
       const copyConsequence = el(root, "p", this.cleanupSaveCopy ? "Leaves the original transcript unchanged." : "Replaces this transcript and backs up the previous version.", "st-caption st-cleanup-replace-note");
       const copyField = this.input(root, "Copy path", this.cleanupCopyPath, "text", (value) => {
@@ -5182,7 +5864,9 @@ class MirrorsModal extends Modal {
       const removePageComments = this.toggle(root, "Remove page comments from the cleaned copy", this.cleanupRemovePageComments, (value) => {
         this.cleanupRemovePageComments = value && this.cleanupSaveCopy;
         updateEstimate();
-      }, "Available only when you save cleaned text as a separate copy.");
+      });
+      const removePageCommentsRow = removePageComments.closest<HTMLElement>(".st-check-row")!;
+      removePageCommentsRow.hidden = !this.cleanupSaveCopy;
       removePageComments.disabled = !this.cleanupSaveCopy || this.cleanupBusySource === state.source;
       const updateEstimate = () => {
         const estimate = root.querySelector<HTMLElement>(".st-cleanup-estimate");
@@ -5213,6 +5897,7 @@ class MirrorsModal extends Modal {
       const actions = el(this.footer, "div", undefined, "st-actions");
       btn(actions, "Cancel", () => this.goBack(), "st-button st-text-button");
     }
+    this.organizeFormRows(root, ":scope > .st-field, :scope > .st-check-row");
   }
   private async loadReprocessPreview(source: string) {
     const request = ++this.reprocessPreviewRequest;
@@ -5300,13 +5985,12 @@ class MirrorsModal extends Modal {
   }
   private renderReprocessWorkflow() {
     const state = this.displayStore.notebooks[this.actionSource];
-    const root = el(this.body, "section", undefined, "st-form st-action-workflow st-reprocess-workflow") as HTMLElement;
+    const root = el(this.body, "section", undefined, "st-form st-form-layout st-action-workflow st-reprocess-workflow") as HTMLElement;
     if (!state) {
       el(root, "p", "This notebook is no longer available.", "st-caption st-attention-reason");
     } else {
       const maxPage = Math.max(0, ...state.desired.map((page) => page.number), ...this.reprocessPreview.map((page) => page.number));
       const pageSize = this.isDesktop() && this.modalEl.getBoundingClientRect().width > 700 ? 9 : 6;
-      el(root, "p", "Select pages to re-recognize. Requests may use provider credit.", "st-caption");
       el(root, "p", maxPage ? `Available pages: 1–${maxPage}. Type a range or select cards below.` : "Available page range is not known yet.", "st-caption st-page-range-help");
       const pages = this.input(root, "Pages", this.reprocessRange, "text", (value) => {
         this.reprocessRange = value;
@@ -5458,6 +6142,7 @@ class MirrorsModal extends Modal {
       const actions = el(this.footer, "div", undefined, "st-actions");
       btn(actions, "Cancel", () => this.goBack(), "st-button st-text-button");
     }
+    this.organizeFormRows(root, ":scope > .st-field, :scope > .st-check-row");
   }
   private async runDocumentCleanup(source: string) {
     if (this.cleanupBusySource) return;
@@ -5479,6 +6164,7 @@ class MirrorsModal extends Modal {
         model: this.cleanupModel,
         saveCopy: this.cleanupSaveCopy,
         extraInstructions: this.cleanupExtraInstructions,
+        prompt: this.cleanupPrompt,
         removePageComments: this.cleanupSaveCopy && this.cleanupRemovePageComments,
         ...(this.cleanupSaveCopy ? { copyPath: this.cleanupCopyPath.trim() } : {}),
       });
@@ -5650,7 +6336,6 @@ class MirrorsModal extends Modal {
   private renderRecovery() {
     const state = this.displayStore.notebooks[this.selectedSource];
     const root = el(this.body, "section", undefined, "st-recovery");
-    el(root, "h2", "Resolve edited transcript", "st-section-heading");
     if (this.c.progress.stateBlocked)
       this.renderStateBlockedNotice(root);
     if (
@@ -6001,7 +6686,7 @@ class MirrorsModal extends Modal {
     max: number,
     change: (n: number) => void,
   ) {
-    return this.input(
+    const input = this.input(
       parent,
       label,
       String(value),
@@ -6010,8 +6695,11 @@ class MirrorsModal extends Modal {
         const n = Number(v);
         if (Number.isInteger(n) && n >= min && n <= max) change(n);
       },
-      `${min}–${max}`,
     );
+    input.min = String(min);
+    input.max = String(max);
+    input.step = "1";
+    return input;
   }
   private currencyInput(
     parent: HTMLElement,
@@ -6076,7 +6764,9 @@ class ImageModal extends Modal {
     this.modalEl.addClass("st-preview-modal");
   }
   onOpen() {
-    el(this.contentEl, "h2", "Preview");
+    const title = el(this.contentEl, "h2", "Preview");
+    title.id = `st-preview-${crypto.randomUUID()}`;
+    this.modalEl.setAttribute("aria-labelledby", title.id);
     const image = this.contentEl.createEl("img", {
       attr: { src: this.src, alt: "Rendered notebook page" },
     });

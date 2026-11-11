@@ -1,15 +1,18 @@
+import { validPromptReference } from "./prompt-library.mjs";
+
 /** Readable provenance is optional for historical results; never invent dates. */
 export function validRecognition(value) {
   return !!value && ["api", "subscription"].includes(value.provider) &&
     typeof value.model === "string" && !!value.model.trim() && value.model.length <= 200 &&
     !/[\u0000-\u001f]/.test(value.model) && ["fast", "balanced", "careful"].includes(value.quality) &&
     typeof value.recognizedAt === "string" && Number.isFinite(Date.parse(value.recognizedAt)) &&
-    [value.promptHash, value.glossaryHash].every(x => typeof x === "string" && /^[a-f0-9]{64}$/.test(x));
+    [value.promptHash, value.glossaryHash].every(x => typeof x === "string" && /^[a-f0-9]{64}$/.test(x)) &&
+    (value.promptRevision === undefined || validPromptReference(value.promptRevision));
 }
 export function recognitionFields(value) {
   if (!validRecognition(value)) throw Error("Invalid page recognition metadata.");
-  const { provider, model, quality, recognizedAt, promptHash, glossaryHash } = value;
-  return { provider, model, quality, recognizedAt, promptHash, glossaryHash };
+  const { provider, model, quality, recognizedAt, promptHash, glossaryHash, promptRevision } = value;
+  return { provider, model, quality, recognizedAt, promptHash, glossaryHash, ...(promptRevision ? { promptRevision } : {}) };
 }
 /** Provisional OCR never enters the successful AI cache or pending-page decisions. */
 export function pageTextLayer(notebook, page) {

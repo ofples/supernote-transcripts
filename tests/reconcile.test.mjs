@@ -1,5 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { parseManualSections } from "../src/manual-sections.mjs";
+import { CONTINUE_PAGE_TEXT } from "../src/prompts.mjs";
 import {
   validateSource,
   validateDestination,
@@ -123,6 +125,22 @@ test("partial mirror is truthful and keeps old text for edited page", () => {
   assert.match(text, /1 page\(s\) awaiting/);
   assert.match(text, /previous/);
   assert.match(text, /this page has changed/);
+});
+test("heading-free continuation keeps manual section boundaries on standalone lines", () => {
+  const section = "<!-- supernote-manual:start:protected:name:Review -->\nProtected text.\n<!-- supernote-manual:end:protected -->";
+  const build = (first, second) => buildMarkdown({
+    output: "x.md",
+    desired: [{ id: "a", number: 1, fingerprint: "first" }, { id: "b", number: 2, fingerprint: "second" }],
+    pages: { a: saved("first", first), b: saved("second", `${CONTINUE_PAGE_TEXT}\n${second}`) },
+  }, false);
+
+  for (const text of [build(`First.\n\n${section}`, "Second."), build("First.", `${section}\n\nSecond.`)]) {
+    const sections = parseManualSections(text);
+    assert.deepEqual(sections.map(({ id, name }) => ({ id, name })), [{ id: "protected", name: "Review" }]);
+    assert.equal(text.slice(sections[0].from, sections[0].to).trimEnd(), section);
+    assert.match(text, /^<!-- supernote-page:b number:2 -->$/m);
+  }
+  assert.match(build("First", "and second."), /First <!-- supernote-page:b number:2 --> and second\./);
 });
 test("edited page failure and skip retain old text and explicit current-page notices",()=>{
   for(const status of ["failed","skipped"]){

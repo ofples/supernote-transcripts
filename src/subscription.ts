@@ -325,7 +325,7 @@ export class ChatGPTSession {
     let r;
     try { r = await this.native(RESOURCE + "/responses", "POST", body, { Authorization: "Bearer " + token, "Content-Type": "application/json" }); }
     catch { throw new RecognitionFailure("transport", "The ChatGPT connection ended before this page's response could be confirmed. Retry this page explicitly or skip it; no automatic request retry."); }
-    if (r.status !== 200) throw providerFailure(r.status, r.json);
+    if (r.status !== 200) throw providerFailure(r.status, r.json, r.headers);
     return completedText(r.text);
   }
   async disconnect() {

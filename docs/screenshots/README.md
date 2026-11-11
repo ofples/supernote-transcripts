@@ -1,6 +1,6 @@
 # Interface examples
 
-The plugin screens below use synthetic fixtures. The notebook labels, paths and OCR excerpts are synthetic; no personal notebook contents, account data, tokens, settings profiles, or reading positions are included. Fixture screenshots establish layout only, not live-device or provider acceptance.
+The plugin screens below are workflow examples from before the 0.17 layout update. Notebook labels, paths and OCR excerpts are synthetic.
 
 ## Bridge confirmation on Nomad
 

@@ -1,4 +1,5 @@
 const MARKER = /<!--[ \t]*supernote-page:([^\s]+)[ \t]+number:(\d+)[ \t]*-->/g;
+const DOCUMENT_MARKER = /<!--[ \t]*(?:supernote|transcript)-page:([^\s]+)[ \t]+number:(\d+)[ \t]*-->/g;
 const PAGE_LINK_PREFIXES = [
   "obsidian://nomad-transcripts-page-link?token=",
   "obsidian:nomad-transcripts-page-link?token=",
@@ -52,13 +53,14 @@ function codeRanges(source) {
 }
 
 /** Parse generated page comments without treating code examples as navigation. */
-export function parsePageMarkers(source) {
+export function parsePageMarkers(source, includeDocumentMarkers = false) {
   if (typeof source !== "string" || source.length > 20_000_000) return [];
   const ignored = codeRanges(source);
   const markers = [];
-  MARKER.lastIndex = 0;
+  const pattern = includeDocumentMarkers ? DOCUMENT_MARKER : MARKER;
+  pattern.lastIndex = 0;
   let ignoredIndex = 0, scannedTo = 0, line = 0;
-  for (let match; (match = MARKER.exec(source));) {
+  for (let match; (match = pattern.exec(source));) {
     const from = match.index;
     const to = from + match[0].length;
     while (ignoredIndex < ignored.length && ignored[ignoredIndex][1] <= from) ignoredIndex++;

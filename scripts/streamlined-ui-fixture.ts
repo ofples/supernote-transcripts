@@ -47,6 +47,7 @@ export default class StreamlinedUIFixture {
     };
     const store: any = {
       version: 1, notebooks: states, history: [],
+      sourceIssues: { "research-source": { source: `${research}/Unavailable.note`, reason: "Source could not be listed. Check its location and availability, then choose Update.", observedAt: "2026-10-15T00:00:00.000Z" } },
       queue: [
         { source: paths.waitingA, force: false, priority: 1 },
         { source: paths.working, force: false, priority: 0 },
@@ -63,9 +64,38 @@ export default class StreamlinedUIFixture {
     };
     const listeners = new Set<() => void>();
     const emit = () => listeners.forEach((listener) => listener());
+    const promptSnapshot: any = { revisions: [
+      { id: "cleanup-default", name: "Fixture cleanup", scope: "cleanup", text: "Preserve the original meaning.", revision: 1, createdAt: "2026-10-01T00:00:00.000Z" },
+      { id: "cleanup-exact", name: "Exact cleanup run", scope: "cleanup", text: "Keep every quoted section verbatim.", revision: 2, createdAt: "2026-10-02T00:00:00.000Z" },
+      { id: "recognition-default", name: "Fixture recognition", scope: "recognition", text: "Read the handwriting accurately.", revision: 1, createdAt: "2026-10-01T00:00:00.000Z" },
+      { id: "recognition-exact", name: "Exact fixture run", scope: "recognition", text: "Use the exact fixture instructions.", revision: 2, createdAt: "2026-10-02T00:00:00.000Z" },
+    ], defaults: { cleanup: { id: "cleanup-default", revision: 1 }, recognition: { id: "recognition-default", revision: 1 } } };
+    const promptLibrary: any = {
+      getSnapshot: () => copy(promptSnapshot),
+      async save(draft: any, expectedRevision: number) { promptSnapshot.revisions.push({ ...draft, revision: expectedRevision + 1, createdAt: "2026-10-02T00:00:00.000Z" }); },
+      async duplicate(ref: any, name: string) {
+        const saved = promptSnapshot.revisions.find((revision: any) => revision.id === ref.id && revision.revision === ref.revision);
+        if (!saved) throw Error("Fixture prompt revision is unavailable.");
+        promptSnapshot.revisions.push({ ...saved, id: crypto.randomUUID(), name, revision: 1 });
+      },
+      async setDefault(scope: string, ref?: any) {
+        if (ref) promptSnapshot.defaults[scope] = copy(ref);
+        else delete promptSnapshot.defaults[scope];
+        if (scope === "cleanup") {
+          const saved = ref && promptSnapshot.revisions.find((revision: any) => revision.id === ref.id && revision.revision === ref.revision);
+          config.cleanupPrompt = saved?.text;
+        }
+      },
+    };
     let storagePrefs = { hideInExplorer: true, excludeFromSearch: true };
     const counters: any = {
       saveConfig: 0, saveCostSettings: 0, update: 0, pause: 0, resume: 0,
+      sourceRegistrations: [] as Array<{ path: string; kind: "file" | "folder"; status: string }>,
+      transcriptionSelections: [] as Array<{ path: string; kind: "file" | "folder"; options?: any }>,
+      cleanupEstimates: [] as Array<{ source: string; options: any }>,
+      cleanupRuns: [] as Array<{ source: string; options: any }>,
+      reprocessRuns: [] as Array<{ source: string; range: string; outdatedOnly: boolean }>,
+      openedOutputs: [] as string[],
       recognitionNow: [] as Array<{ source?: string; ruleId?: string }>,
       prioritize: [] as string[], sourcePause: [] as { id: string; paused: boolean }[],
       notebookPause: [] as { source: string; paused: boolean }[], retry: [] as string[],
@@ -80,6 +110,7 @@ export default class StreamlinedUIFixture {
     const actionOrder = () => [...store.queue].sort((a: any, b: any) => (b.priority ?? 0) - (a.priority ?? 0));
     const controller: any = {
       platform: FIXTURE_PLATFORM,
+      promptLibrary,
       provider: "api",
       concurrency: FIXTURE_PLATFORM === "desktop" ? 4 : 1,
       showPageHeadings: false,
@@ -194,6 +225,17 @@ export default class StreamlinedUIFixture {
         if (store.notebooks[source]) store.notebooks[source].paused = paused;
         emit();
       },
+      resumeNotebook: async (source: string) => {
+        counters.notebookPause.push({ source, paused: false });
+        if (store.notebooks[source]) store.notebooks[source].paused = false;
+        emit();
+      },
+      resumeSourceFolder: async (id: string) => {
+        counters.sourcePause.push({ id, paused: false });
+        const rule = config.rules.find((item: any) => item.id === id);
+        if (rule) rule.paused = false;
+        emit();
+      },
       requestRecognitionNow: async (target: { source?: string; ruleId?: string }) => {
         counters.recognitionNow.push(copy(target));
         let source = target.source;
@@ -215,6 +257,41 @@ export default class StreamlinedUIFixture {
       },
       excludeNotebook: async () => { throw new Error("Excluded in synthetic fixture."); },
       update: async () => { counters.update++; throw new Error("Synthetic fixture blocks all recognition."); },
+      registerSource: async (selection: { path: string; kind: "file" | "folder" }) => {
+        const path = selection.path.replace(/\\/g, "/").replace(/\/+$/, "");
+        const exact = config.rules.find((rule: any) => rule.source.replace(/\\/g, "/").replace(/\/+$/, "") === path);
+        if (exact) {
+          counters.sourceRegistrations.push({ ...selection, status: "existing" });
+          return { status: "existing", ruleId: exact.id };
+        }
+        const owner = config.rules.find((rule: any) => path.startsWith(`${rule.source.replace(/\\/g, "/").replace(/\/+$/, "")}/`));
+        if (owner) {
+          counters.sourceRegistrations.push({ ...selection, status: "overlap" });
+          return { status: "overlap", ruleId: owner.id };
+        }
+        const rule = { id: `added-${config.rules.length}`, enabled: true, source: path,
+          output: "Fixture Output/Added", recursive: selection.kind === "folder", exclude: [], profileId: general.id, autoRecognize: false };
+        config.rules.push(rule);
+        counters.sourceRegistrations.push({ ...selection, status: "added" });
+        emit();
+        return { status: "added", ruleId: rule.id };
+      },
+      transcribeSelection: async (selection: { path: string; kind: "file" | "folder" }, options?: any) => {
+        counters.transcriptionSelections.push({ ...copy(selection), options: copy(options ?? {}) });
+      },
+      cleanupEstimate: (source: string, options: any) => {
+        counters.cleanupEstimates.push({ source, options: copy(options) });
+        return { pages: 6, requests: 1, usd: 0.001, provisional: false };
+      },
+      cleanupDocument: async (source: string, options: any) => { counters.cleanupRuns.push({ source, options: copy(options) }); },
+      pageSelectionPreview: async (source: string, start: number, count: number) =>
+        store.notebooks[source].desired.slice(start - 1, start - 1 + count).map((page: any) => ({
+          number: page.number, text: `Fixture page ${page.number}`, origin: "recognized",
+        })),
+      reprocessEstimate: (_source: string, range: string) => range ? { pages: 1, requests: 1, usd: 0.001, provisional: false } : undefined,
+      reprocessPages: async (source: string, range: string, outdatedOnly: boolean) => {
+        counters.reprocessRuns.push({ source, range, outdatedOnly });
+      },
       pause() { counters.pause++; controller.progress.paused = true; controller.progress.running = false; emit(); },
       resume: async () => { counters.resume++; controller.progress.paused = false; controller.progress.running = false; emit(); },
       retry: async () => { counters.retry.push("all"); emit(); },
@@ -223,7 +300,7 @@ export default class StreamlinedUIFixture {
       skipPage: async (source: string, pageId: string) => { counters.skipPage.push({ source, pageId }); const issue = store.notebooks[source]?.pageIssues?.[pageId]; if (issue) issue.status = "skipped"; emit(); },
       preview: async () => { throw new Error("Preview disabled in the synthetic fixture."); },
       manual: async () => { throw new Error("Recognition disabled in the synthetic fixture."); },
-      openOutput: async () => { throw new Error("Vault access disabled in the synthetic fixture."); },
+      openOutput: async (path: string) => { counters.openedOutputs.push(path); },
     };
     const mockFolders: Record<string, { folders: string[]; files: string[] }> = {
       "": { folders: ["Fixture Output", "Reference"], files: [] },
@@ -231,9 +308,15 @@ export default class StreamlinedUIFixture {
       "Reference": { folders: [], files: ["Reference/Fixture glossary.md"] },
     };
     const mockEntries = (path: string) => {
+      if ((window as any).__streamlinedListingFailure === path) throw new Error("Synthetic folder is unavailable.");
       const normalized = path.replace(/\\/g, "/").replace(/\/$/, "");
       const names: Record<string, Array<{ name: string; kind: "directory" | "file" }>> = {
-        [root]: [{ name: "Journal", kind: "directory" }, { name: "Research", kind: "directory" }],
+        "/storage/emulated/0/Note": [{ name: "UX Fixture", kind: "directory" }],
+        "/storage/emulated/0/Note/UX Fixture": [{ name: "Notes", kind: "directory" }],
+        [root]: [{ name: "Archive", kind: "directory" }, { name: "Extra", kind: "directory" }, { name: "Journal", kind: "directory" }, { name: "Loose", kind: "directory" }, { name: "Research", kind: "directory" }, { name: "Unavailable", kind: "directory" }, { name: "Root notebook.note", kind: "file" }],
+        [`${root}/Archive`]: [],
+        [`${root}/Extra`]: [{ name: "New fixture notebook.note", kind: "file" }],
+        [`${root}/Loose`]: [{ name: "Loose notebook.note", kind: "file" }],
         [journal]: [{ name: "Reflection.note", kind: "file" }, { name: "Weekly.note", kind: "file" }],
         [research]: [{ name: "Reflection.note", kind: "file" }, { name: "Paused.note", kind: "file" }, { name: "Failed.note", kind: "file" }],
         [`${root}/Journal`]: [{ name: "Reflection.note", kind: "file" }, { name: "Weekly.note", kind: "file" }],
@@ -242,10 +325,12 @@ export default class StreamlinedUIFixture {
       return (names[normalized] ?? []).map((item) => ({ name: item.name, isDirectory: () => item.kind === "directory", isFile: () => item.kind === "file" }));
     };
     const adapter: any = {
-      basePath: FIXTURE_PLATFORM === "desktop" ? "C:/UX Fixture Vault" : root,
+      basePath: FIXTURE_PLATFORM === "desktop" ? "C:/UX Fixture" : root,
       async list(path: string) { return copy(mockFolders[path.replace(/^\//, "")] ?? { folders: [], files: [] }); },
       fs: { async readdir(path: string) { return mockEntries(path); }, async stat(path: string) { return { type: path.toLowerCase().endsWith(".note") ? "file" : "directory" }; } },
+      getFullPath(path: string) { return `C:/UX Fixture/${path}`; },
     };
+    const workspaceEvents = new Map<string, (...args: any[]) => void>();
     const app: any = {
       vault: {
         adapter,
@@ -265,23 +350,30 @@ export default class StreamlinedUIFixture {
         },
       },
       commands: { executeCommandById: () => false },
+      workspace: { on: (name: string, callback: (...args: any[]) => void) => { workspaceEvents.set(name, callback); return {}; } },
     };
     const commands = new Map<string, { callback: () => void }>();
+    const statusBarItem = document.createElement("div");
     const registered: Array<() => void> = [];
+    let settingTab: any;
     const plugin: any = {
       app,
       register(disposer: () => void) { registered.push(disposer); },
-      addSettingTab() {},
+      registerEvent() {},
+      addSettingTab(tab: any) { settingTab = tab; },
       addCommand(command: any) { commands.set(command.id, command); },
       addRibbonIcon() {},
+      addStatusBarItem() { return statusBarItem; },
     };
     (window as any).__bootStreamlinedFixture = async () => {
+      (window as any).require = (name: string) => name === "fs" ? { promises: adapter.fs } : name === "process" ? { cwd: () => root } : undefined;
       installUI(plugin as Plugin, controller);
       commands.get("open")?.callback();
-      (window as any).__streamlinedFixture = { controller, commands, paths, registered, platform: FIXTURE_PLATFORM, app };
+      (window as any).__streamlinedFixture = { controller, commands, paths, registered, platform: FIXTURE_PLATFORM, app, workspaceEvents, workspaceEventNames: [...workspaceEvents.keys()], statusBarItem, get settingTab() { return settingTab; } };
       return (window as any).__streamlinedFixture;
     };
     (window as any).__streamlinedFixtureNotices = [];
+    (window as any).__streamlinedListingFailure = "";
   }
 }
 

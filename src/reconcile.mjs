@@ -136,6 +136,7 @@ export function recognizeRename(descriptors, notebooks) {
 }
 export function buildMarkdown(notebook, showPageHeadings = true) {
   const name = notebook.output.split("/").pop().replace(/\.md$/i, "");
+  const pageMarker = notebook.documentFormat ? "transcript-page" : "supernote-page";
   const incomplete = notebook.desired.filter(
     (p) => notebook.pages[p.id]?.fingerprint !== p.fingerprint,
   ).length;
@@ -164,7 +165,7 @@ export function buildMarkdown(notebook, showPageHeadings = true) {
           !row.body || !owner.body || row.stale || previous.stale) continue;
       const nextFirst = row.body.split("\n", 1)[0];
       if (unsafeContinuationBoundary(owner.body, row.body)) continue;
-      const boundary = ` <!-- supernote-page:${encodeURIComponent(row.p.id)} number:${row.p.number} --> `;
+      const boundary = ` <!-- ${pageMarker}:${encodeURIComponent(row.p.id)} number:${row.p.number} --> `;
       owner.body = `${owner.body}${boundary}${nextFirst}` + row.body.slice(nextFirst.length);
       row.body = "";
       row.omitMarker = true;
@@ -175,7 +176,7 @@ export function buildMarkdown(notebook, showPageHeadings = true) {
     (incomplete ? `> ${incomplete} page(s) awaiting recognition or an updated transcription.${notebook.desired.some(p => displayedPageText(notebook,p).provisional) ? " Device OCR is shown provisionally where available." : ""}\n\n` : "") +
     pageRows.map(({ p, body, stale, omitMarker }) => {
       if (omitMarker) return "";
-      const marker = showPageHeadings ? `## Page ${p.number}` : `<!-- supernote-page:${encodeURIComponent(p.id)} number:${p.number} -->`;
+      const marker = showPageHeadings ? `## Page ${p.number}` : `<!-- ${pageMarker}:${encodeURIComponent(p.id)} number:${p.number} -->`;
       return `${marker}\n\n${body}${stale}\n`;
     }).filter(Boolean).join("\n");
 }
@@ -203,6 +204,8 @@ function unsafeContinuationBoundary(previous, next) {
   const quote = /^>/;
   const rule = /^(?:-{3,}|\*{3,}|_{3,})$/;
   const fenceLine = /^(?:`{3,}|~{3,})/;
+  const manualMarker = /^<!--[ \t]*supernote-manual:(?:start|end):[^\s]+[ \t]*-->$/;
+  if (manualMarker.test(before) || manualMarker.test(first)) return true;
   return heading.test(before) || fenceLine.test(before) || table.test(before) || quote.test(before) || rule.test(before) ||
     heading.test(first) || fenceLine.test(first) || table.test(first) || quote.test(first) || rule.test(first) || list.test(first);
 }

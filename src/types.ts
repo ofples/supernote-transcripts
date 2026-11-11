@@ -49,6 +49,8 @@ export interface FolderRule {
 }
 export interface ConfigV1 {
   version: 1;
+  /** Vault-relative default for newly configured sources and one-time jobs. */
+  defaultOutput?: string;
   /** Shared vault-relative support-data folder; ordinary Markdown locator carries changes. */
   supportFolder?: string;
   /** Last storage-layout revision accepted on this device. */
@@ -63,6 +65,41 @@ export interface ConfigV1 {
   showPageHeadings?: boolean;
   /** Default semantic instructions used by whole-document cleanup. */
   cleanupPrompt?: string;
+  promptLibrary?: PromptRevision[];
+  promptDefaults?: Partial<Record<PromptScope, { ref: PromptRef; previousText?: string }>>;
+  /** Last agreed portable defaults; device-specific execution state stays local. */
+  sharedPreferencesBaseline?: {
+    profile: Pick<Profile, "model" | "endpoint" | "prompt" | "glossaries" | "quality" | "preserveFormatting" | "formattingGuide">;
+    cleanupPrompt?: string;
+    showPageHeadings: boolean;
+  };
+  sharedPreferencesRevision?: string;
+  sharedPreferencesAncestors?: string[];
+  sharedPreferencesPending?: boolean;
+}
+export interface SourceSelection {
+  path: string;
+  kind: "file" | "folder";
+}
+export interface TranscriptionOptions {
+  recursive?: boolean;
+  output?: string;
+  profileId?: string;
+  prompt?: PromptRef;
+}
+export interface RecognitionRun {
+  profile: Profile;
+  prompt?: PromptRef;
+}
+export interface SourceRegistration {
+  ruleId: string;
+  status: "added" | "existing" | "overlap";
+}
+export interface PromptLibraryControls {
+  getSnapshot(): { revisions: readonly PromptRevision[]; defaults: Partial<Record<PromptScope, PromptRef>> };
+  save(draft: Pick<PromptRevision, "id" | "name" | "scope" | "text">, expectedRevision: number): Promise<void>;
+  duplicate(ref: PromptRef, name: string): Promise<void>;
+  setDefault(scope: PromptScope, ref?: PromptRef): Promise<void>;
 }
 export interface SourceEntry {
   path: string;
@@ -74,6 +111,10 @@ export interface SourceEntry {
   mtime: number;
   /** Adapter-specific freshness token, including desktop ctime and inode. */
   revision?: string;
+  /** Explicit local run, outside the configured mirrors. */
+  oneTime?: true;
+  documentFormat?: string;
+  run?: RecognitionRun;
 }
 export interface PageDescriptor {
   id: string;
@@ -105,6 +146,8 @@ export interface OpenNotebook {
   close(): void;
 }
 export interface ReadOnlySource {
+  supportsDocument?(path: string): boolean;
+  documentFormat?(path: string): string | undefined;
   list(
     folder: string,
     recursive: boolean,
@@ -140,6 +183,7 @@ export interface RecognitionMetadata {
   recognizedAt: string;
   promptHash: string;
   glossaryHash: string;
+  promptRevision?: PromptRef;
 }
 export interface DeviceOcrPage { fingerprint: string; text: string }
 export interface CleanedPage { fingerprint: string; baseText: string; text: string }
@@ -163,6 +207,7 @@ export interface DocumentCleanup {
   provider: "api" | "subscription";
   basePages: PageDescriptor[];
   stale?: boolean;
+  promptRevision?: PromptRef;
 }
 export interface PageIssue {
   fingerprint: string;
@@ -174,11 +219,16 @@ export interface PageIssue {
   /** Failed explicit reprocessing retained an earlier same-fingerprint result. */
   force?: boolean;
   updatedAt: string;
+  run?: RecognitionRun;
 }
 export interface NotebookState {
   id: string;
   source: string;
   ruleId: string;
+  /** Device-local binding for explicit runs outside the saved source rules. */
+  oneTime?: { profileId: string };
+  /** Omitted for native Supernote notebooks and legacy saved state. */
+  documentFormat?: string;
   output: string;
   revision: string;
   order: string[];
@@ -216,6 +266,7 @@ export interface NotebookState {
   /** Old failures did not retain a reliable page ID. Explicit notebook retry only. */
   legacyPageFailure?: string;
   executionIssue?: { scope: "source" | "batch"; reason: string; recipe?: string; code?: string };
+  retryRun?: RecognitionRun;
 }
 export interface QueueTask {
   source: string;
@@ -225,6 +276,8 @@ export interface QueueTask {
   priority?: number;
   modified?: number;
   pageIds?: string[];
+  /** Explicit run settings retained for an intentional resume. */
+  run?: RecognitionRun;
 }
 export interface QueueView {
   working?: { source: string; number?: number; total?: number; stage: string };
@@ -241,6 +294,7 @@ export interface Store {
   version: 1;
   notebooks: Record<string, NotebookState>;
   queue: QueueTask[];
+  sourceIssues?: Record<string, { source: string; reason: string; observedAt: string }>;
   lastChecked?: string;
   history: string[];
 }
@@ -275,10 +329,14 @@ export interface QueueEstimate {
 }
 export interface Controller {
   readonly sharedSettingsIssues?: { ruleId: string; name: string; fields: string[]; reason: string }[];
+  readonly globalPreferencesIssue?: { fields: string[]; reason: string };
   refreshSharedSettings?(): Promise<void>;
   resolveSharedSettings?(ruleId: string, choice: "local" | "remote"): Promise<void>;
+  resolveSharedPreferences?(choice: "local" | "remote"): Promise<void>;
   readonly platform: "desktop" | "nomad";
   concurrency: number;
+  /** Device-local retries after confirmed transient provider failures; zero disables them. */
+  transientRetries: number;
   provider: "api" | "subscription";
   showPageHeadings: boolean;
   readonly subscriptionStatus: { connected: boolean; status: string; email?: string };
@@ -311,6 +369,9 @@ export interface Controller {
   setStoragePreferences?(preferences:{hideInExplorer:boolean;excludeFromSearch:boolean}):Promise<void>;
   subscribe(listener: () => void): () => void;
   update(): Promise<void>;
+  registerSource?(selection: SourceSelection): Promise<SourceRegistration>;
+  transcribeSelection?(selection: SourceSelection, options?: TranscriptionOptions): Promise<void>;
+  readonly promptLibrary?: PromptLibraryControls;
   requestRecognitionNow(target: { source?: string; ruleId?: string }): Promise<void>;
   pause(): void;
   resume(): Promise<void>;
@@ -322,12 +383,14 @@ export interface Controller {
   forceUpdateEstimate?(source:string,reRecognizeAll?:boolean):QueueEstimate;
   setSourcePaused(ruleId: string, paused: boolean): Promise<void>;
   setNotebookPaused(source: string, paused: boolean): Promise<void>;
+  resumeSourceFolder(ruleId: string): Promise<void>;
+  resumeNotebook(source: string): Promise<void>;
   preview(path: string, page: number): Promise<string>;
   manual(path: string, range: string, force?: boolean): Promise<void>;
   reprocessPages(source: string, range: string, outdatedOnly?: boolean): Promise<void>;
   reprocessEstimate?(source: string, range: string, outdatedOnly?: boolean): QueueEstimate;
-  cleanupEstimate(source: string, options?: { model?: string; extraInstructions?: string; removePageComments?: boolean }): QueueEstimate;
-  cleanupDocument(source: string, options?: { saveCopy?: boolean; copyPath?: string; model?: string; extraInstructions?: string; removePageComments?: boolean }): Promise<void>;
+  cleanupEstimate(source: string, options?: { model?: string; extraInstructions?: string; removePageComments?: boolean; prompt?: PromptRef }): QueueEstimate;
+  cleanupDocument(source: string, options?: { saveCopy?: boolean; copyPath?: string; model?: string; extraInstructions?: string; removePageComments?: boolean; prompt?: PromptRef }): Promise<void>;
   pageSelectionPreview?(source: string, start?: number, count?: number): Promise<{ number: number; text: string; origin: "device-ocr" | "recognized" | "empty" }[]>;
   lastVersion?(source: string): Promise<{ path: string; createdAt: string } | undefined>;
   restoreLastVersion?(source: string): Promise<void>;
@@ -340,3 +403,4 @@ export interface Controller {
   resolveTranscriptConflict(source: string, action: "replace" | "keep", expectedCurrent: string, expectedRevision?: string): Promise<{ backup?: string; output: string }>;
 }
 import type { CostSettings, CostSnapshot } from "./cost";
+import type { PromptRef, PromptRevision, PromptScope } from "./prompt-library.mjs";

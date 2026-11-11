@@ -8,7 +8,9 @@ Generated Markdown transcripts live under `Supernote Transcripts/` by default. P
 
 The support folder starts with an underscore so Obsidian Sync can sync it. Obsidian Sync excludes dot-prefixed folders (apart from the configuration folder), as described in its [hidden files and folders settings](https://obsidian.md/help/sync/settings). Keep each device’s Obsidian configuration profile separate; plugin data, source paths, queues and credentials remain local where specified below.
 
-Settings are grouped into **Connection**, **Recognition**, **Updates**, and **Storage** tabs. In Storage, choose the support folder and whether it appears in File Explorer or native Search and Quick Switcher. Visibility preferences are device-local; the support folder location follows the shared vault locator. The existing **$** button still opens Costs.
+Settings are grouped into **Connection**, **Recognition**, **Updates**, and **Storage** tabs. **Connection** holds the provider and **Default transcript folder**; **Recognition** holds the default profile and prompt library; **Updates** holds AI recognition, automatic catch-up, and check behavior; **Storage** holds the support folder and its visibility choices. In Storage, choose whether support files appear in File Explorer or native Search and Quick Switcher. Visibility preferences are device-local; the support folder location follows the shared vault locator. The existing **$** button still opens Costs.
+
+The **Default transcript folder** is in **Connection**. It applies to newly added sources and one-time selections whose output is not already bound. Changing it does not move or rebind existing transcripts. From the **Sources** view or Settings, **Add source** opens the source browser. Choose a `.note` file or folder and use the **Add source** footer action to save it; adding a source does not start recognition. The source can be configured afterward from its row.
 
 Changing the support folder moves saved recognition, references and history; it does not run AI again. Use a new or empty ordinary vault folder, separate from transcripts and original notebooks. Hidden dot folders cannot travel through Obsidian Sync. Update the plugin on every device before changing this location. The small `_supernote-storage.md` file tells other devices where support data moved; keep it in the vault and sync it. It follows the same visibility/exclusion switches as the support folder. If references use `.txt` or other non-Markdown files, enable syncing those file types too.
 
@@ -18,13 +20,19 @@ Update Transcripts on every device that runs recognition before reorganizing the
 
 This changes paths only. Recognition caches, edited page text, published hashes, per-notebook shared identities, and the last agreed shared-settings baseline are preserved. A moved local output or glossary path is treated as a pending shared-settings change and goes through the normal conflict-aware sync flow. Consolidating a folder records exclusions for existing notebooks left out of that selection, while retaining their transcripts and cached results; notebooks added to the folder later are not part of that exclusion snapshot and can be included by recursive scanning.
 
-## Add a notebook
+## Add a source and run it
 
-1. Run **Supernote Transcripts: Open mirrors** from Obsidian’s command palette.
-2. Choose **Add source** and select a `.note` file or folder. A **Mirror** shortcut saves a source with defaults; open its settings afterward to review them.
-3. Choose the Markdown destination. In the folder picker, use **Find** to narrow the folder list. **Create** opens a name prompt; confirm a valid name to create it, or cancel to return to the picker. For folder sources, select which notebooks to include and review exclusions before saving.
-4. Review the recognition model, quality, prompt and optional glossary. Save the source.
-5. Leave automatic catch-up off while learning the workflow. When ready, select **Update** to start an explicit run.
+Use **Add source** to save a file or folder as a reusable source. The browser shows folders and notebooks together; open a folder to navigate, or select a notebook to make it the footer target. **Add source** saves the selected source with current defaults and does not send pages for recognition. You can open the source row afterward to review or change its recognition settings, output folder, folder recursion and exclusions.
+
+To run a saved scope immediately, select **Update** in Sources or run **Update mirrors** from the command palette. Update checks the configured sources with the current settings, reuses unchanged saved recognition, and queues work that needs processing. If the worker is paused, the button says **Resume**; while work is active, it offers **Pause**. With AI recognition off, the button says **Check now** and performs a local check without sending recognition requests. Automatic catch-up is a separate setting and can remain off.
+
+For a one-time file or folder run, choose **Transcribe file or folder** from the command palette or the **Transcribe this notebook / Transcribe this folder** action in the desktop file menu. AI recognition must be on. In the browser, choose the file or navigate to the folder and select **Transcribe**. A selection covered by a saved source uses that source’s scope, exclusions and saved output binding, with only the chosen run profile or prompt overrides. An unconfigured selection becomes a durable one-time job using the current defaults and selected run options. The picker opens **Queue** after submitting the job. Under **One-time transcriptions**, choose **Open transcript** to read a saved result or **Details** for cleanup, selected-page re-recognition, or a later scoped update.
+
+The desktop status-bar item **Transcripts · …** opens **Transcript activity**. It shows checking or updating counts, pause/current/attention status, recent outcomes, and unresolved source or page issues from saved state. Choose an issue to open its existing source or page recovery controls. These issues remain available after Obsidian restarts. Queue remains the place to inspect detailed active and waiting work.
+
+New sources use the **Default transcript folder** unless their source settings specify another destination. In the transcription picker, expand **Run options** to select a recognition profile or a **Recognition prompt** revision for that run. **Use profile instructions** uses the prompt of the applicable profile. For a folder, **Folder contents** offers **Use source default**, **Include subfolders**, or **Only this folder**. The one-time **Transcript folder** field is available for selections without a saved output binding. These choices apply to the selected run and leave the saved source settings in place.
+
+Saved prompt templates are managed with **Open prompt library** under Recognition settings. Choose the **Recognition** or **Cleanup** category and select a saved revision. Each revision is immutable: editing saves a new revision, while **Duplicate selected revision** starts a separate prompt history. Choose **Use as recognition default** or **Use as cleanup default** for future requests, or **Reset default** to restore the previous inline instructions. You can select a specific recognition revision in **Run options** for one transcription, or a cleanup revision in the **Cleanup prompt** field for one cleanup run. Changing a prompt affects future requests and does not re-recognize saved pages automatically.
 
 Under **Settings → Updates**, choose what automatic catch-up checks on this device: **New pages** detects added pages and page-order changes, **Recent edits** also checks the last 5 pages by default (configurable from 1 to 100), and **All changes** scans every page. These defaults stay local to the device. A source can inherit the default or set its own check mode and recent-page count; source overrides sync with source settings. New-page checks cannot detect changed ink on older pages. If page IDs are missing or ambiguous, the plugin asks for a manual update. Manual **Update** always checks full content and reuses unchanged cached recognition.
 
@@ -94,6 +102,8 @@ In Careful mode, Queue shows the page currently being prepared and labels a neig
 
 Recognition may consume paid API usage or subscription capacity. Before enabling a provider, confirm its billing terms and configure any available local request and dollar limits. Estimates use prior comparable pages when available; with little history, estimates are provisional and rely on token assumptions. Estimates are not bills or guaranteed caps. API reservations and subscription attempt counters are local plugin accounting; they do not show the provider account’s remaining quota or replace provider-side limits.
 
+In **Settings → Recognition**, **Transient retries** controls automatic retries after a provider confirms a temporary overload, rate limit, or server error. The setting is local to this device, defaults to 2 retries, and accepts 0–5; choose 0 to disable them. Retries use a bounded delay and honor `Retry-After` up to two minutes; if the provider asks for longer, wait and retry the page manually. Each request attempt is reserved and recorded separately, so local request and spending limits apply to retries too. Authentication, account quota, invalid model or request, interrupted or otherwise uncertain requests, and local save failures are not retried automatically.
+
 A cautious first run:
 
 - Keep the global worker paused while configuring.
@@ -122,7 +132,7 @@ On Nomad, the local file server may stream from the beginning even when only a l
 
 Queue keeps the overall progress summary compact. Tap the **Working now** card or its caret to expand current-stage and page details; page progress remains visible while the card is collapsed. The **?** beside the eligible-work estimate opens its explanation. **Needs attention** stays visible below the active and waiting work. Review and Force update actions appear together beneath a source’s progress when available. The existing notebook details/action icon is also the entry point for notebook actions.
 
-Failed pages remain visible for review and are not retried automatically. Use **Retry** when you want another attempt; **Skip** leaves a page out until you choose to retry it. Uncertain interrupted attempts can count against configured ceilings because a provider may have received the request even if no result returned.
+Failed pages remain visible for review. Confirmed transient provider failures may retry automatically according to **Transient retries**; other failures require **Retry** when you want another attempt. **Skip** leaves a page out until you choose to retry it. Uncertain interrupted attempts can count against configured ceilings because a provider may have received the request even if no result returned.
 
 ## Maintain a transcript
 
@@ -165,6 +175,18 @@ By default, cleanup replaces the current generated transcript after preserving t
 The default cleanup instructions are configurable in plugin settings. Optional instructions entered for one cleanup run are added to that default. **Remove page comments** is available only when saving a separate copy; the mirrored transcript retains its page references. An in-place cleanup keeps those comments and automatically saves the previous transcript version first.
 
 If the transcript or notebook changes while cleanup is running, the paid result is kept in History so you can review it without sending another request. Check the cleaned text against the original handwriting before relying on it. Expand **Previous cleanup details** to see the model, quality, date, and whether the source text has changed since that cleanup.
+
+To add text that should stay separate from handwriting recognition, open a page body in a generated transcript and choose **Insert manual section** from the editor context menu or command palette. The action is available only in a plugin managed transcript and outside frontmatter or page boundaries. It inserts a protected block at the cursor or around selected text; type or paste the satsang text between its markers. Cleanup hides the block contents from the model and restores them verbatim on the same page. If a changed page needs an edit comparison, its manual section remains in your saved edits until you choose how to resolve that page. Updates stop and preserve the transcript if the source notebook removed a page that owns a manual section.
+
+You can also add a block by hand with matching standalone markers:
+
+```markdown
+<!-- supernote-manual:start:my-section -->
+Your manual text.
+<!-- supernote-manual:end:my-section -->
+```
+
+Keep each ID unique in the document and keep the start and end markers together. Cleanup stops and preserves the current transcript if it finds a malformed block or if a returned cleanup omits, duplicates, moves to another page, or reorders a protected block.
 
 ![Synthetic Cleanup workflow with per-run model choice, estimate and History details](screenshots/cleanup-workflow-desktop.png)
 
