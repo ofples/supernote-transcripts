@@ -4497,3 +4497,98 @@ test("archived notebooks follow support relocation while ordinary transcript des
   assert.equal(f.files.get(state.output),"archived transcript");assert.equal(JSON.stringify(state.pages),pages);
   assert.doesNotThrow(()=>f.plugin.assertStateReady());
 });
+test("moved notebook reuses results from its earlier identity and adopts its transcript in the chosen folder", async () => {
+  const f = fixture(2);
+  sharing(f, "nomad");
+  await f.plugin.update();
+  const paid = f.calls.length;
+  assert.ok(paid > 0);
+  const deviceText = f.files.get("Mirror/a.md");
+  // Another device's rule produced Reflection/a.md; this desktop starts fresh
+  // under a different source identity and its default output folder.
+  f.files.set("Reflection", "folder");
+  f.app.vault.adapter.rename("Mirror/a.md", "Reflection/a.md");
+  f.plugin.store.notebooks = {};
+  f.plugin.store.history = [];
+  f.plugin.config.rules[0].sharedId = "desktop-rule";
+  f.plugin.config.rules[0].output = "Supernote Transcripts";
+  await f.plugin.update();
+  assert.equal(f.calls.length, paid, "identical pages must not be recognized again");
+  assert.equal(f.plugin.store.notebooks[source].output, "Supernote Transcripts/a.md");
+  f.plugin.config.rules[0].output = "Reflection";
+  await f.plugin.update();
+  const state = f.plugin.store.notebooks[source];
+  assert.equal(f.calls.length, paid);
+  assert.equal(state.error, undefined);
+  assert.equal(state.status, "current");
+  assert.equal(state.output, "Reflection/a.md");
+  assert.equal(f.files.has("Supernote Transcripts/a.md"), false);
+  assert.deepEqual(parsePageMarkers(f.files.get("Reflection/a.md")).map(m => m.pageId), ["native:1", "native:2"]);
+  const backup = f.plugin.store.history.find(path => path.endsWith("-replaced-transcript.md"));
+  assert.ok(backup?.startsWith("_supernote/History/"));
+  assert.equal(f.files.get(backup), deviceText);
+});
+test("an unrelated note at the chosen destination is never replaced", async () => {
+  const f = fixture(2);
+  await f.plugin.update();
+  f.files.set("Moved", "folder");
+  f.files.set("Moved/a.md", "My own note");
+  f.plugin.config.rules[0].output = "Moved";
+  await f.plugin.update();
+  const state = f.plugin.store.notebooks[source];
+  assert.match(state.error ?? "", /not a transcript of this notebook/);
+  assert.equal(f.files.get("Moved/a.md"), "My own note");
+  assert.equal(state.output, "Mirror/a.md");
+  assert.ok(f.files.has("Mirror/a.md"));
+});
+test("a new notebook adopts its own transcript already at its destination instead of reporting a manual edit", async () => {
+  const f = fixture(2);
+  sharing(f, "nomad");
+  await f.plugin.update();
+  const paid = f.calls.length, deviceText = f.files.get("Mirror/a.md");
+  // The same notebook now arrives from a different source identity whose
+  // destination already holds the transcript generated elsewhere.
+  f.plugin.store.notebooks = {};
+  f.plugin.store.history = [];
+  f.plugin.config.rules[0].sharedId = "desktop-rule";
+  await f.plugin.update();
+  const state = f.plugin.store.notebooks[source];
+  assert.equal(state.error, undefined);
+  assert.equal(state.status, "current");
+  assert.equal(state.output, "Mirror/a.md");
+  assert.equal(f.calls.length, paid);
+  assert.deepEqual(parsePageMarkers(f.files.get("Mirror/a.md")).map(m => m.pageId), ["native:1", "native:2"]);
+  const backup = f.plugin.store.history.find(path => path.endsWith("-replaced-transcript.md"));
+  assert.equal(f.files.get(backup), deviceText);
+});
+test("a new notebook never adopts another notebook's transcript at its destination", async () => {
+  const f = fixture(2);
+  await f.plugin.update();
+  const foreign = f.files.get("Mirror/a.md").replace(/native%3A(\d)/g, "native%3Aother$1");
+  f.files.set("Mirror/a.md", foreign);
+  f.plugin.store.notebooks = {};
+  await f.plugin.update();
+  assert.match(f.plugin.store.notebooks[source].error ?? "", /manually edited or has no ownership record/);
+  assert.equal(f.files.get("Mirror/a.md"), foreign);
+});
+test("a claimed transcript stays untouched until its notebook publishes, and an edited one is no longer replaced", async () => {
+  const f = fixture(2);
+  sharing(f, "nomad");
+  await f.plugin.update();
+  const original = f.files.get("Mirror/a.md");
+  f.plugin.store.notebooks = {};
+  f.plugin.store.history = [];
+  f.plugin.config.rules[0].sharedId = "desktop-rule";
+  const publish = f.plugin.publish.bind(f.plugin);
+  f.plugin.publish = async () => { throw new Error("publish interrupted"); };
+  await f.plugin.update();
+  assert.equal(f.files.get("Mirror/a.md"), original, "a run that cannot publish leaves the claimed file alone");
+  assert.deepEqual(f.plugin.store.history, []);
+  f.plugin.publish = publish;
+  const edited = original + "\nMy note\n";
+  f.files.set("Mirror/a.md", edited);
+  await f.plugin.update();
+  const state = f.plugin.store.notebooks[source];
+  assert.equal(f.files.get(f.plugin.store.history.find(path => path.endsWith("-replaced-transcript.md"))), edited, "edits are kept in the backup");
+  assert.equal(state.status, "current");
+});

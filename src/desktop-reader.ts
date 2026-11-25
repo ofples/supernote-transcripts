@@ -8,7 +8,10 @@ import type { NotebookCheckOptions, OpenNotebook, ReadOnlySource } from "./types
 /** Only read operations are exposed to this adapter. Node is loaded when the
  * desktop source is constructed, so mobile plugin loading does not load fs. */
 export interface DesktopReadFS {
-  lstat(path: string): Promise<Stats>;
+  /** Follows symbolic links, so linked notebooks and folders are read as their targets. */
+  stat(path: string): Promise<Stats>;
+  /** Canonical path, used to recognise a folder reached through several links. */
+  realpath?(path: string): Promise<string>;
   readdir(path: string): Promise<string[]>;
   open(path: string, flags: "r"): Promise<FileHandle>;
 }
@@ -29,7 +32,12 @@ export function normalizeDesktopSource(value: string): string {
   return clean === "" ? "/" : /^[A-Za-z]:$/.test(clean) ? clean + "/" : clean;
 }
 
-const revisionOf = (s: Stats) => `${s.mtimeMs}:${s.size}:${s.ctimeMs}:${s.ino}`;
+/** Content identity only. The change time (ctime) is deliberately excluded:
+ * file providers such as Google Drive for desktop update metadata when a file
+ * is read, which would report every read as a concurrent edit and make every
+ * check look like a new revision. Replacement writes change mtime, size or
+ * inode; page fingerprints still detect content changes after opening. */
+const revisionOf = (s: Stats) => `${s.mtimeMs}:${s.size}:${s.ino}`;
 const MAX_BLOCK = 64 * 1024 * 1024;
 
 /** Reads only the requested length-prefixed blocks. No notebook-sized buffer
@@ -98,6 +106,8 @@ export class DesktopRangeFile implements ByteSource {
   }
 }
 
+const UNREADABLE_LINK = new Set(["ENOENT", "ELOOP", "ENOTDIR", "EACCES", "EPERM"]);
+
 export class DesktopReadOnlySource implements ReadOnlySource {
   constructor(
     private fs: DesktopReadFS = require("fs").promises,
@@ -107,7 +117,7 @@ export class DesktopReadOnlySource implements ReadOnlySource {
   async list(folder: string, recursive: boolean, exclude: string[]) {
     const root = normalizeDesktopSource(folder);
     const out: { path: string; size: number; mtime: number }[] = [];
-    const rootStat = await this.fs.lstat(root);
+    const rootStat = await this.fs.stat(root);
     if (rootStat.isFile()) {
       if (!root.toLowerCase().endsWith(".note"))
         throw new Error("Selected source is not a notebook or folder.");
@@ -116,19 +126,46 @@ export class DesktopReadOnlySource implements ReadOnlySource {
     }
     if (!rootStat.isDirectory())
       throw new Error("Selected source has an unsupported filesystem type.");
+    // Linked folders are followed; a folder reached twice (a link cycle or two
+    // links to one target) is scanned once so no notebook is listed twice.
+    // Canonical paths are exact on every platform; without them fall back to
+    // dev:ino, which is skipped when the filesystem reports no usable inode.
+    const identity = async (path: string, stat: Stats): Promise<string | undefined> => {
+      if (this.fs.realpath) {
+        try { return await this.fs.realpath(path); } catch { return undefined; }
+      }
+      return Number.isSafeInteger(stat.ino) && stat.ino > 0 ? `${stat.dev}:${stat.ino}` : undefined;
+    };
+    const visited = new Set<string>();
+    const rootKey = await identity(root, rootStat);
+    if (rootKey) visited.add(rootKey);
     const walk = async (path: string, relative: string, depth: number) => {
       if (depth > 64) throw new Error("Source nesting exceeds the safe scan depth.");
-      for (const name of await this.fs.readdir(path)) {
+      // Sorted so a folder reachable through several links is always listed
+      // under the same path, keeping notebook identities stable between runs.
+      for (const name of [...await this.fs.readdir(path)].sort()) {
         if (!name || /[/\\\u0000-\u001f]/.test(name) || name === "." || name === "..")
           throw new Error("Invalid source directory entry.");
         if (name.startsWith(".")) continue;
         const rel = relative ? relative + "/" + name : name;
         if (excludedRelative(rel, exclude)) continue;
         const next = path.replace(/\/+$/, "") + "/" + name;
-        const stat = await this.fs.lstat(next);
-        if (stat.isSymbolicLink()) continue;
+        let stat: Stats;
+        try { stat = await this.fs.stat(next); }
+        catch (error) {
+          // A dangling, looping or unreadable link has no notebook to read and
+          // must not fail the whole scan; any other failure is real.
+          if (UNREADABLE_LINK.has((error as NodeJS.ErrnoException)?.code ?? "")) continue;
+          throw error;
+        }
         if (stat.isDirectory()) {
-          if (recursive) await walk(next, rel, depth + 1);
+          if (!recursive) continue;
+          const key = await identity(next, stat);
+          if (key) {
+            if (visited.has(key)) continue;
+            visited.add(key);
+          }
+          await walk(next, rel, depth + 1);
         } else if (stat.isFile() && name.toLowerCase().endsWith(".note")) {
           out.push({ path: next, size: stat.size, mtime: stat.mtimeMs });
         }
@@ -139,7 +176,7 @@ export class DesktopReadOnlySource implements ReadOnlySource {
   }
 
   async revision(path: string) {
-    const stat = await this.fs.lstat(normalizeDesktopSource(path));
+    const stat = await this.fs.stat(normalizeDesktopSource(path));
     if (!stat.isFile()) throw new Error("Selected source is not a regular notebook.");
     return revisionOf(stat);
   }
@@ -155,7 +192,7 @@ export class DesktopReadOnlySource implements ReadOnlySource {
     path = normalizeDesktopSource(path);
     if (!path.toLowerCase().endsWith(".note"))
       throw new Error("Selected source is not a notebook.");
-    const stat = await this.fs.lstat(path);
+    const stat = await this.fs.stat(path);
     if (!stat.isFile()) throw new Error("Selected source is not a regular notebook.");
     const revision = revisionOf(stat);
     let pass = "Reading notebook";

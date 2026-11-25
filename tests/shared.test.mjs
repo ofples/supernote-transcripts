@@ -224,3 +224,31 @@ test("devices can use different lease durations without treating each other's cl
   f.setTime(3_050);
   assert(await b.acquire(notebookId));
 });
+test("a moved notebook can opt in to reuse identical page results from its earlier identity", async () => {
+  const io = memoryIO();
+  io.list = async (path) => ({
+    files: [...io.files.keys()].filter((p) => p.startsWith(path + "/") && !p.slice(path.length + 1).includes("/")),
+    folders: [...io.folders].filter((p) => p.startsWith(path + "/") && !p.slice(path.length + 1).includes("/")),
+  });
+  const f = fixture(io), device = f.make("nomad"), desktop = f.make("desktop");
+  const earlier = await notebookIdentity("device-rule", "Reflection/a.note");
+  const moved = { ...query, notebookId: await notebookIdentity("desktop-rule", "a.note") };
+  await device.saveResult({ ...query, notebookId: earlier }, "Paid once");
+  // Default lookups stay scoped to the notebook's own identity.
+  assert.equal((await desktop.findResult(moved)).chosen, undefined);
+  const reused = await desktop.findResult(moved, { otherNotebooks: true });
+  assert.equal(reused.chosen.text, "Paid once");
+  assert.equal(reused.chosen.notebookId, earlier);
+  for (const change of [{ pageId: "native:2" }, { fingerprint: "edited" }, { recipe: await sharedHash("changed recipe") }])
+    assert.equal((await desktop.findResult({ ...moved, ...change }, { otherNotebooks: true })).chosen, undefined);
+  // A tampered record in another identity is never reused, and its damage is
+  // not reported as this notebook's.
+  const [path] = [...io.files.keys()].filter((p) => p.includes(earlier) && p.includes("/results/"));
+  io.files.set(path, io.files.get(path).replace("Paid once", "Forged text"));
+  const tampered = await desktop.findResult(moved, { otherNotebooks: true });
+  assert.equal(tampered.chosen, undefined);
+  assert.equal(tampered.invalidRecords, 0);
+  // A result under the notebook's own identity wins without scanning others.
+  await desktop.saveResult(moved, "Own result");
+  assert.equal((await desktop.findResult(moved, { otherNotebooks: true })).chosen.text, "Own result");
+});
