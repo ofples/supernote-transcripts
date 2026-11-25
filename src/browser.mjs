@@ -96,3 +96,19 @@ export function browserEntryType(entry, fallbackType) {
   if (name.toLowerCase().endsWith(".note")) return "file";
   return undefined;
 }
+
+/**
+ * Desktop directory entries describe a symbolic link itself, not its target,
+ * so linked folders (for example macOS "~/Google Drive", which links into
+ * ~/Library/CloudStorage) would be hidden. Follow a link with `stat` and
+ * describe the target instead. Dangling links stay hidden.
+ */
+export async function resolveBrowserEntry(entry, path, stat) {
+  if (typeof entry?.isSymbolicLink !== "function" || !entry.isSymbolicLink()) return entry;
+  try {
+    const target = await stat(path);
+    return { name: entry.name, isDirectory: () => target.isDirectory(), isFile: () => target.isFile() };
+  } catch {
+    return undefined;
+  }
+}

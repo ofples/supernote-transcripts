@@ -15,6 +15,7 @@ import {
   joinBrowserPath,
   normalizeBrowserPath,
   parentBrowserPath,
+  resolveBrowserEntry,
 } from "./browser.mjs";
 import { availableModalHeight } from "./viewport.mjs";
 import { DEFAULT_CLEANUP_PROMPT } from "./cleanup.mjs";
@@ -3391,10 +3392,9 @@ class MirrorsModal extends Modal {
       glyph.setAttribute("aria-hidden", "true");
       setIcon(glyph, "folder");
       const crumbs = browserBreadcrumbs(this.browserPath);
-      const visibleCrumbs = this.browserFrom === "edit" ? crumbs : crumbs.slice(-3);
-      for (const [index, crumb] of visibleCrumbs.entries()) {
+      for (const [index, crumb] of crumbs.entries()) {
         if (index) el(breadcrumbs, "span", "›", "st-browser-separator");
-        if (index === visibleCrumbs.length - 1) {
+        if (index === crumbs.length - 1) {
           const current = el(breadcrumbs, "span", crumb.label, "st-browser-current");
           current.setAttribute("aria-current", "location");
           current.title = this.browserPath;
@@ -3554,6 +3554,7 @@ class MirrorsModal extends Modal {
             type?: string;
             isDirectory?: () => boolean;
             isFile?: () => boolean;
+            isSymbolicLink?: () => boolean;
           }
       )[];
       const mapped = await Promise.all(
@@ -3572,7 +3573,9 @@ class MirrorsModal extends Modal {
               /* Unknown non-note entries are hidden. */
             }
           }
-          const entryType = browserEntryType(item, type);
+          const resolved = this.isDesktop() ? await resolveBrowserEntry(item, path, (p: string) => fs.stat(p)) : item;
+          if (!resolved) return null;
+          const entryType = browserEntryType(resolved, type);
           if (!entryType) return null;
           return { name, path, type: entryType };
         }),
@@ -3949,7 +3952,7 @@ class MirrorsModal extends Modal {
       }
     }
     const source =
-      preferredSource ?? this.c.config.rules.find((rule) => rule.enabled)?.source;
+      preferredSource ?? this.c.config.rules.find((rule) => rule.enabled && !rule.paused)?.source;
     return initialBrowserPath(source ? [source] : [], vaultPath);
   }
   private browseTypedPath() {

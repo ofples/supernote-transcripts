@@ -60,3 +60,19 @@ test("desktop browser uses Dirent methods and only lists folders or regular .not
   assert.equal(browserEntryType(entry("link.note", false, false)), undefined);
   assert.equal(browserEntryType(entry(".hidden.note", false, true)), undefined);
 });
+
+test("desktop browser shows linked folders and notebooks by their targets and hides dangling links", async () => {
+  const { resolveBrowserEntry } = await import("../src/browser.mjs");
+  const link = (name) => ({ name, isDirectory: () => false, isFile: () => false, isSymbolicLink: () => true });
+  const stats = {
+    "/Users/me/Google Drive": { isDirectory: () => true, isFile: () => false },
+    "/Users/me/linked.note": { isDirectory: () => false, isFile: () => true },
+  };
+  const stat = async (path) => { if (!stats[path]) throw Object.assign(Error("missing"), { code: "ENOENT" }); return stats[path]; };
+  assert.equal(browserEntryType(await resolveBrowserEntry(link("Google Drive"), "/Users/me/Google Drive", stat)), "directory");
+  assert.equal(browserEntryType(await resolveBrowserEntry(link("linked.note"), "/Users/me/linked.note", stat)), "file");
+  assert.equal(await resolveBrowserEntry(link("gone"), "/Users/me/gone", stat), undefined);
+  const plain = { name: "Notes", isDirectory: () => true, isFile: () => false, isSymbolicLink: () => false };
+  assert.equal(await resolveBrowserEntry(plain, "/Users/me/Notes", stat), plain);
+  assert.equal(await resolveBrowserEntry("Notes", "/x/Notes", stat), "Notes");
+});
